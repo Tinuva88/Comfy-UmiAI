@@ -25,7 +25,7 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 1.  Navigate to your `ComfyUI/custom_nodes/` folder.
 2.  Clone this repository:
     ```bash
-    git clone https://github.com/Tinuva88/ComfyUI-UmiAI.git
+    git clone https://github.com/Tinuva88/Comfy-UmiAI
     ```
 3.  **⚠️ IMPORTANT:** Rename the folder to `ComfyUI-UmiAI` if it isn't already.
     * ❌ `ComfyUI-UmiAI v1.0` (Spaces break the Python import!)
