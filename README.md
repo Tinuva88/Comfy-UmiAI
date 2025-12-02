@@ -59,17 +59,19 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 
 ## ⚡ Syntax Cheat Sheet
 
-| Feature | Syntax | Example |
-| :--- | :--- | :--- |
-| **Load LoRA** | `<lora:name:str>` | `<lora:pixel_art:0.8>` |
-| **Random Choice** | `{a\|b\|c}` | `{Red\|Blue\|Green}` |
-| **Variables** | `$var={opts}` | `$hair={Red\|Blue}` |
-| **Use Variable** | `$var` | `A photo of $hair hair.` |
-| **Logic Gate** | `[if Key : A \| B]` | `[if Cyberpunk : Techwear \| Armor]` |
-| **Danbooru** | `char:name` | `char:frieren` |
-| **Sequential** | `{~a\|b\|c}` | `{~Front\|Side\|Back}` |
-| **Set Size** | `@@w=X, h=Y@@` | `@@width=1024, height=1536@@` |
-| **Comments** | `//` or `#` | `// This is a comment` |
+| Feature | Syntax | Example 1 | Example 2 |
+| :--- | :--- | :--- | :--- |
+| **Load LoRA** | `<lora:name:str>` | `<lora:pixel_art:0.8>` | `<lora:tifa_lockhart:1>` |
+| **Random Choice** | `{a\|b\|c}` | `{Red\|Blue\|Green}` | `{Girl\|Boy\|Nonbinary}` |
+| **Random Weights** | `{#%a\|#%b\|#%c}` | `{25%Red\|15%Blue\|60%Green}` | `{75%Girl\|115%Boy\|35%Nonbinary}` |
+| **Choose X of Y** | `{x-y$$a\|b\|c}` | `{0-2$$Hat\|Scarf\|Belt}` | `{1-3$$Swimming\|Flying\|Jumping}` |
+| **Variables** | `$var={opts}` | `$hair={Red\|Blue\|Green}` | `$char1={Tifa\|Aerith\|Zelda}` |
+| **Use Variable** | `$var` | `A photo of $hair hair.` | `$char1 hugging $char2` |
+| **Danbooru** | `char:name` | `char:zelda` | `char:tifa_lockhart` |
+| **Sequential** | `{~a\|b\|c}` | `{~Front\|Side\|Back}` | `{~Seed1\|Seed2\|Seed3}` |
+| **Logic Gate** | `[if Key : A \| B]` | `[if Cyberpunk : Techwear \| Armor]` |  |
+| **Set Size** | `@@w=X, h=Y@@` | `@@width=1024, height=1536@@` | |
+| **Comments** | `//` or `#` | `// This is a comment` | |
 
 ---
 
@@ -153,9 +155,7 @@ A-Rank Party - Silk Outfit:
 
 ---
 
-## 🚀 Example Workflow: The "Context-Aware" Character
-
-Copy this prompt into the node to test Logic, Variables, and internal LoRA loading.
+## 🚀 Example Workflows:
 
 ```text
 // 1. Define Variables & Style
@@ -170,10 +170,24 @@ $view={~Portrait|Landscape}
 (Masterpiece), A $view of a warrior, female.
 
 // 4. Context Logic (Outfit changes based on Genre variable)
-She is wearing [if Fantasy: plate armor | [if Cyberpunk: tech jacket]].
+She is wearing [if Fantasy: plate armor | if Cyberpunk: tech jacket].
 
 The background is a $genre landscape.
 **watermark, text, blurry, nsfw**
+```
+
+Here's a prompt I like to use all the time:
+```text
+$char1={__RandomGirls__}
+$char2={__RandomGirls__}
+$color1={__Colors__}
+$color2={__Colors__}
+$color3={__Colors__}
+$color4={__Colors__}
+
+A fullbody illustration of two girls standing together at a fashion show in the style of __ArtistNames__. $char1 is wearing __RandomOutfit__ with a primary color of $color1 and a secondary color of $color2. $char2 is wearing __RandomOutfit__ with a primary color of $color3 and a secondary color of $color4. {Both girls are __SharedPose__|The girls are holding hands and smiling while __MiscPose__}.
+
+The background is __Background__.
 ```
 
 ---
