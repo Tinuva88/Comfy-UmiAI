@@ -433,7 +433,8 @@ class DynamicPromptReplacer:
 class ConditionalReplacer:
     def __init__(self):
         # Syntax: [if Trigger : True | False]
-        self.regex = re.compile(r'\[if\s+(.*?)\s*:\s*(.*?)(?:\s*\|\s*(.*?))?\]', re.IGNORECASE | re.DOTALL)
+        # FIX: Changed (.*?) to ([^\[\]]*?) to strictly match inner-most tags first.
+        self.regex = re.compile(r'\[if\s+([^\[\]]+?)\s*:\s*([^\[\]]*?)(?:\s*\|\s*([^\[\]]*?))?\]', re.IGNORECASE | re.DOTALL)
 
     def replace(self, prompt):
         while True:
