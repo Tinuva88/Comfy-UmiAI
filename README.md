@@ -158,22 +158,38 @@ A-Rank Party - Silk Outfit:
 ## 🚀 Example Workflows:
 
 ```text
-// 1. Define Variables & Style
-$genre={High Fantasy|Cyberpunk}
-$view={~Portrait|Landscape}
+// 1. COMPOUND VARIABLES
+// We pack multiple "Keys" into one choice.
+// Key 1: The visible text ("Fire").
+// Key 2: The Logic Trigger for the LoRA ("**L1**").
+// Key 3: The Logic Trigger for the Description ("**D1**").
+$theme = {Fire **L1** **D1**|Ice **L2** **D2**}
 
-// 2. Logic: Set LoRA and Resolution based on Genre/View
-[if Cyberpunk: <lora:cyberpunk_v3:0.8>][if Fantasy: <lora:rpg_tools:1.0>]
-[if Portrait: @@width=1024, height=1536@@][if Landscape: @@width=1536, height=1024@@]
+$mood = {Happy|Angry}
+@@width=768, height=768@@
 
-// 3. Main Prompt
-(Masterpiece), A $view of a warrior, female.
+// 2. MAIN PROMPT
+(Masterpiece), <char:hatsune miku>, 
+// $theme prints "Fire **L1** **D1**". 
+// The "**...**" parts will be invisible in the final output.
+$theme.clean theme. 
 
-// 4. Context Logic (Outfit changes based on Genre variable)
-She is wearing [if Fantasy: plate armor | if Cyberpunk: tech jacket].
+// 3. LOGIC (Using Unique Keys)
+// Check L1 (Fire Lora) - It won't see D1, so no collision.
+[if L1: <lora:fire_element_v1:0.8>]
+[if L2: <lora:ice_concept:1.0>]
 
-The background is a $genre landscape.
-**watermark, text, blurry, nsfw**
+// Check D1 (Fire Desc) - It won't see L1.
+[if D1: [if Happy: warm lighting | burning flames]]
+[if D2: frozen crystal textures], 
+
+highlighted in __2$$colors__.
+
+// 4. ESCAPING
+Artist signature: __#artist__
+
+// 5. NEGATIVE PROMPT
+**worst quality, lowres**
 ```
 
 Here's a prompt I like to use all the time:
