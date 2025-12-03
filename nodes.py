@@ -194,6 +194,7 @@ class TagSelector:
         self.selected_options = options.get('selected_options', {})
         self.verbose = options.get('verbose', False)
         self.cache_files = options.get('cache_files', True)
+        self.global_seed = options.get('seed', 0)  # Store the global seed for sequential access
         self.seeded_values = {}
         self.processing_stack = set()
         self.resolved_seeds = {}
@@ -306,6 +307,13 @@ class TagSelector:
         self.previously_selected_tags[tag] += 1
         parsed_tag = parse_tag(tag)
         
+        # Check for Sequential Flag (~)
+        sequential = False
+        if parsed_tag.startswith('~'):
+            sequential = True
+            parsed_tag = parsed_tag[1:]  # Remove the ~ for file loading
+
+        # Handle $$ wildcard ranges
         if '$$' in parsed_tag and not parsed_tag.startswith('#'):
             range_part, file_part = parsed_tag.split('$$', 1)
             if any(c.isdigit() for c in range_part) or '-' in range_part:
@@ -319,6 +327,14 @@ class TagSelector:
                 return self.get_tag_choice(parsed_tag, tags)
 
         tags = self.tag_loader.load_tags(parsed_tag, self.verbose, self.cache_files)
+        
+        # Handle Sequential Logic
+        if sequential and isinstance(tags, list) and tags:
+            selected = tags[self.global_seed % len(tags)]
+            if '#' in selected: selected = selected.split('#')[0].strip()
+            # Recursively resolve any wildcards in the selected line, using global seed for consistency
+            return self.resolve_wildcard_recursively(selected, self.global_seed)
+
         if groups: return self.get_tag_group_choice(parsed_tag, groups, tags)
         if tags: return self.get_tag_choice(parsed_tag, tags)
         
@@ -882,7 +898,8 @@ class UmiAIWildcardNode:
         # CORE PROCESSING
         # ==============================================================================
         random.seed(seed)
-        options = {'verbose': False, 'cache_files': autorefresh == "No", 'ignore_paths': True}
+        # Pass seed to options for Sequential handling
+        options = {'verbose': False, 'cache_files': autorefresh == "No", 'ignore_paths': True, 'seed': seed}
 
         tag_loader = TagLoader(self.wildcards_path, options)
         tag_selector = TagSelector(tag_loader, options)
