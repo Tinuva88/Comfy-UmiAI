@@ -6,12 +6,18 @@ import glob
 import json
 import csv
 import requests
+import fnmatch  # <--- NEW IMPORT
 from collections import Counter
 import folder_paths
 import comfy.sd
 import comfy.utils
 import torch 
 from safetensors import safe_open 
+
+# ==============================================================================
+# GLOBAL CACHE (Enables Refreshing)
+# ==============================================================================
+GLOBAL_CACHE = {}
 
 # ==============================================================================
 # OPTIONAL IMPORTS (LLM & Downloader)
@@ -56,6 +62,7 @@ def get_index(items, item):
         return None
 
 def parse_tag(tag):
+    if tag is None: return ""
     tag = tag.replace("__", "").replace('<', '').replace('>', '').strip()
     if tag.startswith('#'):
         return tag
@@ -123,9 +130,16 @@ class TagLoader:
         self.wildcard_location = wildcard_path
         self.loaded_tags = {}
         self.yaml_entries = {}
+        # Options
         self.ignore_paths = options.get('ignore_paths', True)
         self.verbose = options.get('verbose', False)
+        self.force_refresh = options.get('force_refresh', False)
         
+        # If refreshing, clear the global cache
+        if self.force_refresh:
+            GLOBAL_CACHE.clear()
+            if self.verbose: print("[UmiAI] Cache cleared. Refreshing files...")
+
         self.all_txt_files = glob.glob(os.path.join(self.wildcard_location, '**/*.txt'), recursive=True)
         self.all_yaml_files = glob.glob(os.path.join(self.wildcard_location, '**/*.yaml'), recursive=True)
         self.all_csv_files = glob.glob(os.path.join(self.wildcard_location, '**/*.csv'), recursive=True)
@@ -155,10 +169,49 @@ class TagLoader:
             'suffixes': entry_data.get('Suffix', []),
             'tags': [x.lower().strip() for x in entry_data.get('Tags', [])]
         }
+    
+    def flatten_hierarchical_yaml(self, data, prefix=""):
+        """Recursively flattens nested dictionaries into slash-separated keys."""
+        results = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                clean_key = str(k).strip()
+                new_prefix = f"{prefix}/{clean_key}" if prefix else clean_key
+                results.update(self.flatten_hierarchical_yaml(v, new_prefix))
+        elif isinstance(data, list):
+            # We found a leaf list (prompts)
+            clean_list = [str(x) for x in data if x is not None]
+            results[prefix] = clean_list
+        elif data is not None:
+            # Single value leaf
+            results[prefix] = [str(data)]
+        return results
+
+    def is_umi_format(self, data):
+        """
+        Heuristic: Checks if the YAML structure matches Umi/Flat format.
+        Looks for keys: 'Prompts', 'Description', 'Tags', 'Prefix', 'Suffix'
+        in the first dictionary value found.
+        """
+        if not isinstance(data, dict):
+            return False
+            
+        umi_keys = {'prompts', 'description', 'tags', 'prefix', 'suffix'}
+        
+        # Check the first few items to see if they follow Umi Structure
+        for k, v in data.items():
+            if isinstance(v, dict):
+                inner_keys = {str(ik).lower() for ik in v.keys()}
+                if not inner_keys.isdisjoint(umi_keys):
+                    return True
+        return False
 
     def load_tags(self, file_path, verbose=False, cache_files=True):
-        if cache_files and self.loaded_tags.get(file_path):
-            return self.loaded_tags.get(file_path)
+        # 1. Check Global Cache
+        cache_key = f"{file_path}"
+        if cache_files and not self.force_refresh:
+            if cache_key in GLOBAL_CACHE:
+                return GLOBAL_CACHE[cache_key]
 
         is_csv = file_path.endswith('.csv')
         
@@ -177,21 +230,26 @@ class TagLoader:
 
         key = ALL_KEY if file_path == ALL_KEY else (os.path.basename(file_path.lower()) if self.ignore_paths else file_path)
 
+        # --- CSV Handling ---
         if real_path and real_path.endswith('.csv'):
              with open(real_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-                self.loaded_tags[key] = rows
+                GLOBAL_CACHE[cache_key] = rows
                 return rows
 
+        # --- TXT Handling ---
         if real_path and real_path.endswith('.txt'):
             with open(real_path, encoding="utf8") as file:
-                self.loaded_tags[key] = read_file_lines(file)
-                return self.loaded_tags[key]
+                lines = read_file_lines(file)
+                GLOBAL_CACHE[cache_key] = lines
+                return lines
 
+        # --- YAML Handling (ALL FILES) ---
         if key is ALL_KEY:
             files = glob.glob(os.path.join(self.wildcard_location, '**/*.yaml'), recursive=True)
             output = {}
+            
             for fp in files:
                 if os.path.basename(fp) == 'globals.yaml': continue
                 with open(fp, encoding="utf8") as file:
@@ -199,33 +257,81 @@ class TagLoader:
                     try:
                         data = yaml.safe_load(file)
                         if isinstance(data, dict):
-                            for title, entry in data.items():
-                                if isinstance(entry, dict):
-                                    processed_entry = self.process_yaml_entry(title, entry)
-                                    if processed_entry['tags']:
-                                        output[title] = set(processed_entry['tags'])
-                                        self.yaml_entries[title] = processed_entry
+                            
+                            # AUTO-DETECT FORMAT PER FILE
+                            if self.is_umi_format(data):
+                                # Umi (Flat) Logic
+                                for title, entry in data.items():
+                                    if isinstance(entry, dict):
+                                        processed_entry = self.process_yaml_entry(title, entry)
+                                        if processed_entry['tags']:
+                                            output[title] = set(processed_entry['tags'])
+                                            self.yaml_entries[title] = processed_entry
+                                    elif isinstance(entry, list):
+                                        output[title] = entry
+                            else:
+                                # Nested (Hierarchical) Logic
+                                flattened = self.flatten_hierarchical_yaml(data)
+                                output.update(flattened)
+
                     except Exception as e:
                         if verbose: print(f'Error parsing YAML {fp}: {e}')
-            self.loaded_tags[key] = output
+            
+            GLOBAL_CACHE[cache_key] = output
+            return output
 
+        # --- YAML Handling (Specific File) ---
         if real_path and real_path.endswith('.yaml'):
             with open(real_path, encoding="utf8") as file:
                 self.files.append(f"{file_path}.yaml")
                 try:
                     data = yaml.safe_load(file)
                     output = {}
-                    for title, entry in data.items():
-                        if isinstance(entry, dict):
-                            processed_entry = self.process_yaml_entry(title, entry)
-                            if processed_entry['tags']:
-                                output[title] = set(processed_entry['tags'])
-                                self.yaml_entries[title] = processed_entry
-                    self.loaded_tags[key] = output
+                    
+                    # AUTO-DETECT FORMAT
+                    if self.is_umi_format(data):
+                        # Umi
+                        for title, entry in data.items():
+                            if isinstance(entry, dict):
+                                processed_entry = self.process_yaml_entry(title, entry)
+                                if processed_entry['tags']:
+                                    output[title] = set(processed_entry['tags'])
+                                    self.yaml_entries[title] = processed_entry
+                    else:
+                        # Nested
+                        output = self.flatten_hierarchical_yaml(data)
+                                    
+                    GLOBAL_CACHE[cache_key] = output
+                    return output
                 except Exception as e:
                     if verbose: print(f'Error parsing YAML {real_path}: {e}')
 
-        return self.loaded_tags.get(key, [])
+        # Try to find key in ALL_KEY logic if not found directly
+        if ALL_KEY in GLOBAL_CACHE:
+            all_data = GLOBAL_CACHE[ALL_KEY]
+            if file_path in all_data:
+                return all_data[file_path]
+
+        # Force load all if specific file not found (allows virtual keys from nested yamls)
+        if not GLOBAL_CACHE.get(ALL_KEY):
+             self.load_tags(ALL_KEY, verbose, cache_files)
+             all_data = GLOBAL_CACHE.get(ALL_KEY, {})
+             if file_path in all_data:
+                 return all_data[file_path]
+        else:
+             all_data = GLOBAL_CACHE.get(ALL_KEY, {})
+             if file_path in all_data:
+                 return all_data[file_path]
+
+        return []
+
+    def get_glob_matches(self, pattern):
+        # Ensure ALL tags are loaded to perform a global search
+        all_tags = self.load_tags(ALL_KEY, self.verbose, self.force_refresh)
+        if not all_tags: return []
+        
+        # Use fnmatch to filter keys based on the glob pattern
+        return fnmatch.filter(all_tags.keys(), pattern)
 
     def get_entry_details(self, title):
         return self.yaml_entries.get(title)
@@ -244,7 +350,7 @@ class TagSelector:
         self.resolved_seeds = {}
         self.selected_entries = {}
         self.scoped_negatives = []
-        self.variables = {} # NEW: Aware of variables
+        self.variables = {} 
 
     def update_variables(self, variables):
         self.variables = variables
@@ -336,13 +442,11 @@ class TagSelector:
     def get_tag_group_choice(self, parsed_tag, groups, tags):
         if not isinstance(tags, dict): return ""
         
-        # NEW: Resolve variables inside tag groups immediately
-        # This handles <[$char][outfit]> where $char needs to become 'rin_tohsaka'
+        # Resolve variables inside tag groups immediately
         resolved_groups = []
         for g in groups:
             clean_g = g.strip()
             if clean_g.startswith('$') and clean_g[1:] in self.variables:
-                # Variable found! Use its value
                 val = self.variables[clean_g[1:]]
                 resolved_groups.append(val)
             else:
@@ -354,6 +458,9 @@ class TagSelector:
 
         candidates = []
         for title, tag_set in tags.items():
+            if not isinstance(tag_set, (set, list)): continue # Skip incompatible types
+            if isinstance(tag_set, list): tag_set = set(tag_set)
+            
             if not pos_groups.issubset(tag_set): continue
             if not neg_groups.isdisjoint(tag_set): continue
             if any_groups:
@@ -386,6 +493,15 @@ class TagSelector:
         self.previously_selected_tags[tag] += 1
         parsed_tag = parse_tag(tag)
         
+        # --- WILDCARD WILDCARDS LOGIC (GLOB MATCHING) ---
+        if '*' in parsed_tag or '?' in parsed_tag:
+            matches = self.tag_loader.get_glob_matches(parsed_tag)
+            if matches:
+                # Randomly pick one of the matching keys and resolve it
+                selected_key = random.choice(matches)
+                return self.select(selected_key, groups)
+            # If no matches, fall through to try normal loading (unlikely to work, but safe)
+
         sequential = False
         if parsed_tag.startswith('~'):
             sequential = True
@@ -467,7 +583,7 @@ class TagReplacer:
         if selected is not None:
             if isinstance(selected, str) and '#' in selected:
                 selected = selected.split('#')[0].strip()
-            return selected
+            return str(selected) # Ensure it's a string
             
         return matches.group(0)
 
@@ -545,7 +661,8 @@ class DynamicPromptReplacer:
         return random.choice(variants)
 
     def replace(self, template):
-        if not template: return None
+        # FIX: Return empty string instead of None to prevent crash in subsequent processors
+        if not template: return ""
         return self.re_combinations.sub(self.replace_combinations, template)
 
 class ConditionalReplacer:
@@ -1067,7 +1184,14 @@ class UmiAIWildcardNode:
         # CORE PROCESSING
         # ==============================================================================
         random.seed(seed)
-        options = {'verbose': False, 'cache_files': autorefresh == "No", 'ignore_paths': True, 'seed': seed}
+        
+        options = {
+            'verbose': False, 
+            'cache_files': True, # We handle caching manually now via force_refresh
+            'ignore_paths': True, 
+            'seed': seed,
+            'force_refresh': (autorefresh == "Yes")
+        }
 
         tag_loader = TagLoader(self.wildcards_path, options)
         tag_selector = TagSelector(tag_loader, options)
