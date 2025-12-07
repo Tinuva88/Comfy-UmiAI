@@ -22,7 +22,7 @@ from aiohttp import web
 # GLOBAL CACHE
 # ==============================================================================
 GLOBAL_CACHE = {}
-# Performance Fix: Persist the card index across generations
+# Persist the card index across generations
 GLOBAL_INDEX = {'built': False, 'files': set(), 'entries': {}} 
 
 # ==============================================================================
@@ -125,13 +125,55 @@ def process_wildcard_range(tag, lines):
             selected = selected.split('#')[0].strip()
         return selected
 
+def get_all_wildcard_paths():
+    """
+    Returns a list of all valid wildcard directory paths.
+    Checks:
+    1. Internal UmiAI/wildcards
+    2. ComfyUI/wildcards (Root)
+    3. ComfyUI/models/wildcards
+    """
+    paths = set()
+    
+    # 1. Internal Umi Folder
+    internal_path = os.path.join(os.path.dirname(__file__), "wildcards")
+    if os.path.exists(internal_path):
+        paths.add(internal_path)
+    
+    # 2. ComfyUI/wildcards (Root)
+    root_wildcards = os.path.join(folder_paths.base_path, "wildcards")
+    if os.path.exists(root_wildcards):
+        paths.add(root_wildcards)
+
+    # 3. ComfyUI/models/wildcards
+    models_wildcards = os.path.join(folder_paths.models_dir, "wildcards")
+    if os.path.exists(models_wildcards):
+        paths.add(models_wildcards)
+
+    # 4. Check for 'wildcards' type in folder_paths (external extensions)
+    try:
+        ext_paths = folder_paths.get_folder_paths("wildcards")
+        if ext_paths:
+            for p in ext_paths:
+                if os.path.exists(p):
+                    paths.add(p)
+    except:
+        pass
+    
+    return list(paths)
+
 # ==============================================================================
 # CORE CLASSES
 # ==============================================================================
 
 class TagLoader:
-    def __init__(self, wildcard_path, options):
-        self.wildcard_location = wildcard_path
+    def __init__(self, wildcard_paths, options):
+        # Allow passing a single string or a list
+        if isinstance(wildcard_paths, str):
+            self.wildcard_locations = [wildcard_paths]
+        else:
+            self.wildcard_locations = wildcard_paths
+
         self.loaded_tags = {}
         self.yaml_entries = {}
         self.files_index = set() 
@@ -151,20 +193,26 @@ class TagLoader:
         self.yaml_lookup = {}
         self.csv_lookup = {}
         
-        for root, dirs, files in os.walk(self.wildcard_location):
-            for file in files:
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, self.wildcard_location)
-                # Normalize slashes for consistency across OS
-                key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+        for location in self.wildcard_locations:
+            if not os.path.exists(location):
+                continue
                 
-                name_lower = file.lower()
-                if name_lower.endswith('.txt'):
-                    self.txt_lookup[key.lower()] = full_path
-                elif name_lower.endswith('.yaml'):
-                    self.yaml_lookup[key.lower()] = full_path
-                elif name_lower.endswith('.csv'):
-                    self.csv_lookup[key.lower()] = full_path
+            for root, dirs, files in os.walk(location):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    # Rel path must be relative to the *current* root location being scanned
+                    rel_path = os.path.relpath(full_path, location)
+                    
+                    # Normalize slashes for consistency across OS
+                    key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+                    
+                    name_lower = file.lower()
+                    if name_lower.endswith('.txt'):
+                        self.txt_lookup[key.lower()] = full_path
+                    elif name_lower.endswith('.yaml'):
+                        self.yaml_lookup[key.lower()] = full_path
+                    elif name_lower.endswith('.csv'):
+                        self.csv_lookup[key.lower()] = full_path
 
     def build_index(self):
         # OPTIMIZATION: Check if we already did this work globally
@@ -222,16 +270,22 @@ class TagLoader:
         GLOBAL_INDEX['built'] = True
 
     def load_globals(self):
-        global_path = os.path.join(self.wildcard_location, 'globals.yaml')
-        if os.path.exists(global_path):
-            try:
-                with open(global_path, 'r', encoding='utf-8') as f:
-                    data = yaml.safe_load(f)
-                    if isinstance(data, dict):
-                        return {str(k): str(v) for k, v in data.items()}
-            except Exception as e:
-                print(f"[UmiAI] Error loading globals.yaml: {e}")
-        return {}
+        """Loads globals.yaml from ALL detected paths and merges them."""
+        merged_globals = {}
+        
+        for location in self.wildcard_locations:
+            global_path = os.path.join(location, 'globals.yaml')
+            if os.path.exists(global_path):
+                try:
+                    with open(global_path, 'r', encoding='utf-8') as f:
+                        data = yaml.safe_load(f)
+                        if isinstance(data, dict):
+                            # Update dictionary (later paths overwrite earlier ones)
+                            merged_globals.update({str(k): str(v) for k, v in data.items()})
+                except Exception as e:
+                    print(f"[UmiAI] Error loading globals.yaml at {global_path}: {e}")
+                    
+        return merged_globals
 
     def process_yaml_entry(self, title, entry_data):
         return {
@@ -1050,10 +1104,6 @@ class NegativePromptGenerator:
 class UmiAIWildcardNode:
     def __init__(self):
         self.loaded = False
-        self.wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
-        if not os.path.exists(self.wildcards_path):
-            os.makedirs(self.wildcards_path, exist_ok=True)
-        
         self.llm_path = os.path.join(folder_paths.models_dir, "llm")
         if not os.path.exists(self.llm_path):
             os.makedirs(self.llm_path, exist_ok=True)
@@ -1238,7 +1288,10 @@ class UmiAIWildcardNode:
             'ignore_paths': True
         }
 
-        tag_loader = TagLoader(self.wildcards_path, options)
+        # Fix: Get all paths instead of just the internal one
+        all_wildcard_paths = get_all_wildcard_paths()
+        tag_loader = TagLoader(all_wildcard_paths, options)
+        
         tag_selector = TagSelector(tag_loader, options)
         neg_gen = NegativePromptGenerator()
         
@@ -1316,9 +1369,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {"UmiAIWildcardNode": "UmiAI Wildcard Processor"}
 
 @server.PromptServer.instance.routes.get("/umiapp/wildcards")
 async def get_wildcards(request):
-    wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
+    all_paths = get_all_wildcard_paths()
     options = {'ignore_paths': True, 'verbose': False}
-    loader = TagLoader(wildcards_path, options)
+    loader = TagLoader(all_paths, options)
     loader.build_index()
     
     # 1. Get Wildcards
@@ -1343,9 +1396,9 @@ async def refresh_wildcards(request):
     GLOBAL_INDEX['files'] = set()
     GLOBAL_INDEX['entries'] = {}
     
-    wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
+    all_paths = get_all_wildcard_paths()
     options = {'ignore_paths': True, 'verbose': False}
-    loader = TagLoader(wildcards_path, options)
+    loader = TagLoader(all_paths, options)
     loader.build_index() # Rebuild immediately
     
     wildcards = sorted(list(loader.files_index))
