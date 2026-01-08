@@ -27,11 +27,21 @@ from PIL import Image
 import server
 from aiohttp import web
 
+# Import shared utilities
+from .shared_utils import (
+    escape_unweighted_colons, parse_wildcard_weight, get_all_wildcard_paths, log_prompt_to_history,
+    LogicEvaluator, DynamicPromptReplacer, VariableReplacer, NegativePromptGenerator,
+    ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase
+)
+
 # ==============================================================================
 # GLOBAL CACHE & SETUP
 # ==============================================================================
 GLOBAL_CACHE = {}
-GLOBAL_INDEX = {'built': False, 'files': set(), 'entries': {}, 'tags': set()} 
+GLOBAL_INDEX = {'built': False, 'files': set(), 'entries': {}, 'tags': set()}
+
+# Fix 12: File modification time cache to skip rescanning unchanged files
+FILE_MTIME_CACHE = {}
 
 # LRU CACHE
 LORA_MEMORY_CACHE = OrderedDict()
@@ -211,7 +221,11 @@ def read_file_lines(file):
             continue
         if '#' in line:
             line = line.split('#')[0].strip()
-        lines.append(line)
+
+        # Parse using shared utility function
+        parsed = parse_wildcard_weight(line)
+        lines.append(parsed)
+
     return lines
 
 def parse_wildcard_range(range_str, num_variants):
@@ -260,49 +274,20 @@ def process_wildcard_range(tag, lines, rng):
             selected = selected.split('#')[0].strip()
         return selected
 
-def get_all_wildcard_paths():
-    paths = set()
-    internal_path = os.path.join(os.path.dirname(__file__), "wildcards")
-    if os.path.exists(internal_path):
-        paths.add(internal_path)
-    
-    root_wildcards = os.path.join(folder_paths.base_path, "wildcards")
-    if os.path.exists(root_wildcards):
-        paths.add(root_wildcards)
-
-    models_wildcards = os.path.join(folder_paths.models_dir, "wildcards")
-    if os.path.exists(models_wildcards):
-        paths.add(models_wildcards)
-
-    try:
-        ext_paths = folder_paths.get_folder_paths("wildcards")
-        if ext_paths:
-            for p in ext_paths:
-                if os.path.exists(p):
-                    paths.add(p)
-    except:
-        pass
-    
-    return list(paths)
-
 # ==============================================================================
 # CORE CLASSES
 # ==============================================================================
 
-class TagLoader:
+class TagLoader(TagLoaderBase):
     def __init__(self, wildcard_paths, options):
-        if isinstance(wildcard_paths, str):
-            self.wildcard_locations = [wildcard_paths]
-        else:
-            self.wildcard_locations = wildcard_paths
+        super().__init__(wildcard_paths, options)
+        # Full version uses wildcard_locations (alias for wildcard_paths)
+        self.wildcard_locations = self.wildcard_paths
 
         self.loaded_tags = {}
         self.yaml_entries = {}
-        self.files_index = set()
-        self.umi_tags = set()
         self.index_built = False
         self.ignore_paths = options.get('ignore_paths', True)
-        self.verbose = options.get('verbose', False)
         
         self.txt_lookup = {}
         self.yaml_lookup = {}
@@ -333,6 +318,21 @@ class TagLoader:
                     elif name_lower.endswith('.csv'):
                         self.csv_lookup[key.lower()] = full_path
 
+    def load_prompt_file(self, file_key):
+        """Phase 6: Load entire .txt file content as a prompt (no parsing)"""
+        key_lower = file_key.lower()
+        if key_lower in self.txt_lookup:
+            full_path = self.txt_lookup[key_lower]
+            try:
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                return content
+            except Exception as e:
+                if self.verbose:
+                    print(f"[UmiAI] Error reading prompt file {full_path}: {e}")
+                return None
+        return None
+
     def build_index(self):
         if GLOBAL_INDEX['built']:
             self.files_index = GLOBAL_INDEX['files']
@@ -359,21 +359,17 @@ class TagLoader:
             try:
                 with open(full_path, encoding="utf8") as f:
                     data = yaml.safe_load(f)
-                    
-                    if self.is_umi_format(data):
-                         for k, v in data.items():
-                             new_index.add(k)
-                             if isinstance(v, dict):
-                                 processed = self.process_yaml_entry(k, v)
-                                 if processed['tags']:
-                                     new_entries[k.lower()] = processed
-                                     for t in processed['tags']:
-                                         new_tags.add(t)
-                    else:
-                        flat_data = self.flatten_hierarchical_yaml(data)
-                        for k in flat_data.keys():
-                            combined = f"{file_key}/{k}"
-                            new_index.add(combined)
+
+                    # Phase 7: Unified YAML format - always process entries with tags
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            new_index.add(k)
+                            if isinstance(v, dict):
+                                processed = self.process_yaml_entry(k, v)
+                                if processed['tags']:
+                                    new_entries[k.lower()] = processed
+                                    for t in processed['tags']:
+                                        new_tags.add(t)
             except Exception as e:
                 pass
 
@@ -397,8 +393,14 @@ class TagLoader:
                         data = yaml.safe_load(f)
                         if isinstance(data, dict):
                             merged_globals.update({str(k): str(v) for k, v in data.items()})
+                except yaml.YAMLError as e:
+                    print(f"[UmiAI] ERROR: Malformed globals.yaml at {global_path}: {e}")
+                    print(f"[UmiAI] Global variables from this file will not be loaded. Please fix YAML syntax.")
+                except UnicodeDecodeError as e:
+                    print(f"[UmiAI] ERROR: Encoding issue in globals.yaml at {global_path}: {e}")
+                    print(f"[UmiAI] File must be UTF-8 encoded.")
                 except Exception as e:
-                    print(f"[UmiAI] Error loading globals.yaml at {global_path}: {e}")
+                    print(f"[UmiAI] WARNING: Error loading globals.yaml at {global_path}: {e}")
         return merged_globals
 
     def process_yaml_entry(self, title, entry_data):
@@ -411,51 +413,52 @@ class TagLoader:
             'tags': [x.lower().strip() for x in entry_data.get('Tags', [])]
         }
     
-    def flatten_hierarchical_yaml(self, data, prefix=""):
-        results = {}
-        if isinstance(data, dict):
-            for k, v in data.items():
-                clean_key = str(k).strip()
-                new_prefix = f"{prefix}/{clean_key}" if prefix else clean_key
-                results.update(self.flatten_hierarchical_yaml(v, new_prefix))
-        elif isinstance(data, list):
-            clean_list = [str(x) for x in data if x is not None]
-            results[prefix] = clean_list
-        elif data is not None:
-            results[prefix] = [str(data)]
-        return results
-
-    def is_umi_format(self, data):
-        if not isinstance(data, dict):
-            return False
-        for key, value in data.items():
-            if isinstance(value, dict):
-                keys_lower = {k.lower() for k in value.keys()}
-                if 'prompts' in keys_lower:
-                    return True
-        return False
+    # Phase 7: Removed is_umi_format() and flatten_hierarchical_yaml()
+    # Now using unified YAML format with tag-based selection
 
     def load_tags(self, requested_tag, verbose=False):
         if requested_tag == ALL_KEY:
-            self.build_index() 
+            self.build_index()
+            if verbose:
+                print(f"[UmiAI] load_tags(ALL_KEY) returning {len(self.yaml_entries)} YAML entries")
             return self.yaml_entries
 
+        # Fix 12: Check modification time before using cached data
         if requested_tag in GLOBAL_CACHE:
-            return GLOBAL_CACHE[requested_tag]
-        
+            cached_path = FILE_MTIME_CACHE.get(requested_tag, {}).get('path')
+            if cached_path and os.path.exists(cached_path):
+                current_mtime = os.path.getmtime(cached_path)
+                cached_mtime = FILE_MTIME_CACHE.get(requested_tag, {}).get('mtime', 0)
+                if current_mtime == cached_mtime:
+                    return GLOBAL_CACHE[requested_tag]
+                else:
+                    # File has been modified, invalidate cache
+                    if verbose:
+                        print(f"[UmiAI] File '{requested_tag}' modified, reloading...")
+
         lower_tag = requested_tag.lower()
-        
+
         if lower_tag in self.txt_lookup:
-            with open(self.txt_lookup[lower_tag], encoding="utf8") as f:
+            file_path = self.txt_lookup[lower_tag]
+            with open(file_path, encoding="utf8") as f:
                 lines = read_file_lines(f)
                 GLOBAL_CACHE[requested_tag] = lines
+                FILE_MTIME_CACHE[requested_tag] = {
+                    'path': file_path,
+                    'mtime': os.path.getmtime(file_path)
+                }
                 return lines
-        
+
         if lower_tag in self.csv_lookup:
-            with open(self.csv_lookup[lower_tag], 'r', encoding='utf-8') as f:
+            file_path = self.csv_lookup[lower_tag]
+            with open(file_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
                 GLOBAL_CACHE[requested_tag] = rows
+                FILE_MTIME_CACHE[requested_tag] = {
+                    'path': file_path,
+                    'mtime': os.path.getmtime(file_path)
+                }
                 return rows
 
         parts = lower_tag.split('/')
@@ -477,35 +480,36 @@ class TagLoader:
             with open(found_file, encoding="utf8") as file:
                 try:
                     data = yaml.safe_load(file)
-                    
-                    if self.is_umi_format(data):
+
+                    # Phase 7: Unified YAML format - always process entries with tags
+                    if isinstance(data, dict):
                         for title, entry in data.items():
                             if isinstance(entry, dict):
                                 processed = self.process_yaml_entry(title, entry)
+                                # Store in yaml_entries index if it has tags
                                 if processed['tags']:
                                     self.yaml_entries[title.lower()] = processed
 
+                        # If a specific key was requested (key_suffix), return its prompts
                         if key_suffix:
-                             for k, v in data.items():
-                                 if k.lower() == key_suffix:
-                                     processed = self.process_yaml_entry(k, v)
-                                     GLOBAL_CACHE[requested_tag] = processed['prompts']
-                                     return processed['prompts']
-                        return []
-
-                    else:
-                        flat_data = self.flatten_hierarchical_yaml(data)
-                        if key_suffix:
-                            for k, v in flat_data.items():
+                            for k, v in data.items():
                                 if k.lower() == key_suffix:
-                                    GLOBAL_CACHE[requested_tag] = v
-                                    return v
+                                    processed = self.process_yaml_entry(k, v)
+                                    GLOBAL_CACHE[requested_tag] = processed['prompts']
+                                    FILE_MTIME_CACHE[requested_tag] = {
+                                        'path': found_file,
+                                        'mtime': os.path.getmtime(found_file)
+                                    }
+                                    return processed['prompts']
                             return []
-                        else:
-                            all_values = []
-                            for v in flat_data.values():
-                                all_values.extend(v)
-                            return all_values
+
+                        # No specific key - return all prompts from all entries
+                        all_prompts = []
+                        for entry in data.values():
+                            if isinstance(entry, dict):
+                                processed = self.process_yaml_entry('', entry)
+                                all_prompts.extend(processed['prompts'])
+                        return all_prompts
 
                 except Exception as e:
                     if verbose: print(f'Error parsing YAML {found_file}: {e}')
@@ -521,23 +525,17 @@ class TagLoader:
             return self.yaml_entries[title.lower()]
         return self.yaml_entries.get(title)
 
-class TagSelector:
+class TagSelector(TagSelectorBase):
     def __init__(self, tag_loader, options):
-        self.tag_loader = tag_loader
+        super().__init__(tag_loader, options)
         self.previously_selected_tags = {}
         self.used_values = {}
         self.selected_options = options.get('selected_options', {})
-        self.verbose = options.get('verbose', False)
-        self.global_seed = options.get('seed', 0)
+        self.global_seed = self.seed
         
-        self.rng = random.Random(self.global_seed)
-        
-        self.seeded_values = {}
         self.processing_stack = set()
         self.resolved_seeds = {}
-        self.selected_entries = {}
-        self.scoped_negatives = []
-        self.variables = {} 
+        self.selected_entries = {} 
 
     def update_variables(self, variables):
         self.variables = variables
@@ -548,6 +546,28 @@ class TagSelector:
         self.processing_stack.clear()
         self.selected_entries.clear()
         self.scoped_negatives = []
+
+    def _weighted_choice(self, items):
+        """Fix 13: Weighted random selection for lists with weights"""
+        # Check if items have weights
+        has_weights = all(isinstance(item, dict) and 'weight' in item for item in items)
+
+        if not has_weights:
+            # Fall back to normal choice for strings or unweighted dicts
+            return self.rng.choice(items)
+
+        # Weighted selection
+        weights = [item.get('weight', 1.0) for item in items]
+        total_weight = sum(weights)
+        rand_val = self.rng.random() * total_weight
+        cumsum = 0
+
+        for item in items:
+            cumsum += item.get('weight', 1.0)
+            if rand_val <= cumsum:
+                return item
+
+        return items[-1]  # Fallback
 
     def process_scoped_negative(self, text):
         if not isinstance(text, str):
@@ -561,16 +581,48 @@ class TagSelector:
             return positive
         return text
 
-    def get_tag_choice(self, parsed_tag, tags):
+    def get_tag_choice(self, parsed_tag, tags, logic_filter=None):
         if isinstance(tags, list) and len(tags) > 0 and isinstance(tags[0], dict):
-            row = self.rng.choice(tags)
-            vars_out = []
-            for k, v in row.items():
-                vars_out.append(f"${k.strip()}={v.strip()}")
-            return " ".join(vars_out)
+            # Check if it's a CSV file (has non-tag/weight keys)
+            first_entry = tags[0]
+            if not ('value' in first_entry or 'weight' in first_entry or 'tags' in first_entry):
+                # This is CSV data
+                row = self.rng.choice(tags)
+                # CSV variable injection: directly inject columns into variables dict
+                for k, v in row.items():
+                    var_name = f"${k.strip()}"
+                    if var_name not in self.variables:
+                        self.variables[var_name] = v.strip()
+                # Also return the old format for backwards compatibility
+                vars_out = []
+                for k, v in row.items():
+                    vars_out.append(f"${k.strip()}={v.strip()}")
+                return " ".join(vars_out)
 
         if not isinstance(tags, list):
             return ""
+
+        # Phase 5: Filter entries by logic expression if provided
+        if logic_filter:
+            from .nodes_lite import LogicEvaluator  # Import shared evaluator
+            evaluator = LogicEvaluator(logic_filter, self.variables)
+            filtered_tags = []
+            for tag in tags:
+                if isinstance(tag, dict):
+                    # Build tag context from entry tags
+                    tag_dict = {t.lower(): True for t in tag.get('tags', [])}
+                    if evaluator.evaluate(tag_dict):
+                        filtered_tags.append(tag)
+                else:
+                    # String tag - can't filter
+                    filtered_tags.append(tag)
+
+            if not filtered_tags:
+                if self.verbose:
+                    print(f"[UmiAI] WARNING: No entries in '{parsed_tag}' matched logic '{logic_filter}'.")
+                return f"[NO_MATCHES: {logic_filter} in {parsed_tag}]"
+
+            tags = filtered_tags
         
         seed_match = re.match(r'#([0-9|]+)\$\$(.*)', parsed_tag)
         if seed_match:
@@ -582,8 +634,9 @@ class TagSelector:
                 return self.resolve_wildcard_recursively(selected, chosen_seed)
             
             unused = [t for t in tags if t not in self.used_values]
-            selected = self.rng.choice(unused) if unused else self.rng.choice(tags)
-            
+            # Fix 13: Use weighted choice if tags have weights
+            selected = self._weighted_choice(unused) if unused else self._weighted_choice(tags)
+
             self.seeded_values[chosen_seed] = selected
             self.used_values[selected] = True
             return self.resolve_wildcard_recursively(selected, chosen_seed)
@@ -593,18 +646,27 @@ class TagSelector:
             selected = tags[0]
         else:
             unused = [t for t in tags if t not in self.used_values]
-            selected = self.rng.choice(unused) if unused else self.rng.choice(tags)
+            # Fix 13: Use weighted choice if tags have weights
+            selected = self._weighted_choice(unused) if unused else self._weighted_choice(tags)
 
         if selected:
-            self.used_values[selected] = True
-            entry_details = self.tag_loader.get_entry_details(selected)
+            # Fix 13: Extract value if selected is a weighted dict
+            if isinstance(selected, dict) and 'value' in selected:
+                selected_key = selected['value']
+            else:
+                selected_key = selected
+
+            self.used_values[selected_key] = True
+            entry_details = self.tag_loader.get_entry_details(selected_key)
             if entry_details:
                 self.selected_entries[parsed_tag] = entry_details
                 if entry_details['prompts']:
-                    selected = self.rng.choice(entry_details['prompts'])
-            if isinstance(selected, str) and '#' in selected:
-                selected = selected.split('#')[0].strip()
-            selected = self.process_scoped_negative(selected)
+                    selected_key = self.rng.choice(entry_details['prompts'])
+            if isinstance(selected_key, str) and '#' in selected_key:
+                selected_key = selected_key.split('#')[0].strip()
+            selected_key = self.process_scoped_negative(selected_key)
+
+            return selected_key
 
         return selected
 
@@ -679,7 +741,12 @@ class TagSelector:
                 if entry_details['prompts']:
                     return self.resolve_wildcard_recursively(self.rng.choice(entry_details['prompts']), seed_id)
             return self.resolve_wildcard_recursively(selected_title, seed_id)
-        return ""
+
+        # Fix 11: Better error messages - show which logic expression failed to match
+        logic_expr = " ".join(str(g) for g in groups)
+        if self.verbose:
+            print(f"[UmiAI] WARNING: No YAML entries matched tag logic '{logic_expr}' in '{parsed_tag}'.")
+        return f"[NO_MATCHES: {logic_expr}]"
 
     def select(self, tag, groups=None):
         self.previously_selected_tags.setdefault(tag, 0)
@@ -697,7 +764,10 @@ class TagSelector:
                     result = self.select(selected_key, groups)
                     if result and str(result).strip():
                         return result
-            return ""
+            # Fix 11: Better error messages - indicate glob pattern found no matches
+            if self.verbose:
+                print(f"[UmiAI] WARNING: Glob pattern '{parsed_tag}' matched no wildcard files.")
+            return f"[GLOB_NO_MATCHES: {parsed_tag}]"
 
         sequential = False
         if parsed_tag.startswith('~'):
@@ -712,7 +782,24 @@ class TagSelector:
                     return process_wildcard_range(parsed_tag, tags, self.rng)
 
         if parsed_tag.startswith('#'):
-            tags = self.tag_loader.load_tags(parsed_tag.split('$$')[1], self.verbose)
+            # Tag-based selection: #tag or #seed$$tag
+            if '$$' in parsed_tag:
+                # Has seed: #seed$$tag
+                tags = self.tag_loader.load_tags(parsed_tag.split('$$')[1], self.verbose)
+            else:
+                # Just tag: #tag - load all YAML entries for tag filtering
+                tag_name = parsed_tag[1:]  # Remove the # prefix
+                tags = self.tag_loader.load_tags(ALL_KEY, self.verbose)
+
+                if self.verbose:
+                    print(f"[UmiAI] Tag search for '{tag_name}': found {len(tags) if isinstance(tags, dict) else 0} YAML entries")
+                    if isinstance(tags, dict):
+                        matching = [title for title, entry in tags.items() if tag_name.lower() in [t.lower() for t in entry.get('tags', [])]]
+                        print(f"[UmiAI] Entries with tag '{tag_name}': {matching}")
+
+                # Filter by tag and convert to format expected by get_tag_group_choice
+                if isinstance(tags, dict):
+                    return self.get_tag_group_choice(parsed_tag, [tag_name], tags)
             if isinstance(tags, list):
                 return self.get_tag_choice(parsed_tag, tags)
 
@@ -735,8 +822,11 @@ class TagSelector:
             return self.get_tag_group_choice(parsed_tag, groups, tags)
         if tags:
             return self.get_tag_choice(parsed_tag, tags)
-        
-        return None 
+
+        # Fix 11: Better error messages - provide helpful feedback for missing wildcards
+        if self.verbose:
+            print(f"[UmiAI] WARNING: Wildcard '{parsed_tag}' not found or is empty.")
+        return f"[WILDCARD_NOT_FOUND: {parsed_tag}]" 
 
     def get_prefixes_and_suffixes(self):
         prefixes, suffixes, neg_p, neg_s = [], [], [], []
@@ -854,13 +944,11 @@ class LLMReplacer:
             return self.regex.sub(_process_llm_tag, prompt)
         return prompt
 
-class TagReplacer:
+class TagReplacer(TagReplacerBase):
     def __init__(self, tag_selector):
-        self.tag_selector = tag_selector
+        super().__init__(tag_selector)
         self.wildcard_regex = re.compile(r'(__|<)(.*?)(__|>)')
         self.opts_regexp = re.compile(r'(?<=\[)(.*?)(?=\])')
-        self.clean_regex = re.compile(r'\[clean:(.*?)\]', re.IGNORECASE)
-        self.shuffle_regex = re.compile(r'\[shuffle:(.*?)\]', re.IGNORECASE)
 
     def replace_wildcard(self, matches):
         if not matches or len(matches.groups()) != 3:
@@ -868,7 +956,12 @@ class TagReplacer:
         match = matches.group(2)
         if not match:
             return ""
-        
+
+        # Phase 6: Support @filename to load full prompt file
+        if match.startswith('@'):
+            filename = match[1:]
+            return self.get_prompt_file_content(filename)
+
         if ':' in match:
             scope, opts = match.split(':', 1)
             global_opts = self.opts_regexp.findall(opts)
@@ -890,219 +983,44 @@ class TagReplacer:
             
         return matches.group(0)
 
-    def replace_functions(self, prompt):
-        def _shuffle(match):
-            content = match.group(1)
-            items = [x.strip() for x in content.split(',')]
-            self.tag_selector.rng.shuffle(items)
-            return ", ".join(items)
-        
-        def _clean(match):
-            content = match.group(1)
-            content = re.sub(r'\s+', ' ', content)
-            content = re.sub(r',\s*,', ',', content)
-            content = content.replace(' ,', ',')
-            return content.strip(', ')
-
-        p = self.shuffle_regex.sub(_shuffle, prompt)
-        p = self.clean_regex.sub(_clean, p)
-        return p
-
     def replace(self, prompt):
+        # Escape mechanism: Replace \__ and \< with placeholders to preserve literal syntax
+        ESCAPED_WILDCARD = "___ESCAPED_WILDCARD___"
+        ESCAPED_ANGLE = "___ESCAPED_ANGLE___"
+
+        prompt = prompt.replace(r'\__', ESCAPED_WILDCARD)
+        prompt = prompt.replace(r'\<', ESCAPED_ANGLE)
+
+        # Reset cycle detection for new replacement session
+        self.replacement_history = []
+
         p = self.wildcard_regex.sub(self.replace_wildcard, prompt)
         count = 0
-        while p != prompt and count < 10:
+        max_iterations = 10
+
+        while p != prompt and count < max_iterations:
+            # Cycle detection: check if we've seen this exact prompt before
+            if p in self.replacement_history:
+                print(f"[UmiAI] WARNING: Cycle detected in wildcard replacement. Breaking loop to prevent infinite recursion.")
+                print(f"[UmiAI] Problematic prompt fragment: {p[:100]}...")
+                break
+
+            self.replacement_history.append(prompt)
             prompt = p
             p = self.wildcard_regex.sub(self.replace_wildcard, prompt)
             count += 1
+
+        # Warn if we hit the iteration limit
+        if count >= max_iterations:
+            print(f"[UmiAI] WARNING: Reached maximum wildcard replacement iterations ({max_iterations}). Possible nested wildcards.")
+
         p = self.replace_functions(p)
+
+        # Restore escaped syntax
+        p = p.replace(ESCAPED_WILDCARD, '__')
+        p = p.replace(ESCAPED_ANGLE, '<')
+
         return p
-
-class DynamicPromptReplacer:
-    def __init__(self, seed):
-        self.re_combinations = re.compile(r"\{([^{}]*)\}")
-        self.seed = seed
-        self.rng = random.Random(seed)
-
-    def replace_combinations(self, match):
-        if not match:
-            return ""
-        content = match.group(1)
-        
-        if content.startswith('~'):
-            content = content[1:]
-            if '$$' in content: 
-                 pass 
-            else:
-                variants = [s.strip() for s in content.split("|")]
-                if not variants:
-                    return ""
-                return variants[self.seed % len(variants)]
-
-        if '%' in content and '$$' not in content:
-            parts = content.split('%', 1)
-            try:
-                chance = float(parts[0])
-                options = parts[1].split('|')
-                if self.rng.random() * 100 < chance:
-                    return options[0]
-                elif len(options) > 1:
-                    return self.rng.choice(options[1:])
-                else:
-                    return ""
-            except ValueError:
-                pass 
-
-        if '$$' in content:
-            range_str, variants_str = content.split('$$', 1)
-            variants = [s.strip() for s in variants_str.split("|")]
-            low, high = parse_wildcard_range(range_str, len(variants))
-            count = self.rng.randint(low, high)
-            if count <= 0:
-                return ""
-            selected = self.rng.sample(variants, min(count, len(variants)))
-            return ", ".join(selected)
-
-        variants = [s.strip() for s in content.split("|")]
-        if not variants:
-            return ""
-        return self.rng.choice(variants)
-
-    def replace(self, template):
-        if not template:
-            return ""
-        return self.re_combinations.sub(self.replace_combinations, template)
-
-class ConditionalReplacer:
-    def __init__(self):
-        self.regex = re.compile(
-            r'\[if\s+([^:|\]]+?)\s*:\s*((?:(?!\[if).)*?)(?:\s*\|\s*((?:(?!\[if).)*?))?\]', 
-            re.IGNORECASE | re.DOTALL
-        )
-
-    def evaluate_logic(self, condition, context, variables=None):
-        if variables is None: variables = {}
-        
-        ops = {'AND': 'and', 'OR': 'or', 'NOT': 'not', 'XOR': '!='}
-        tokens = re.split(r'(\(|\)|\bAND\b|\bOR\b|\bNOT\b|\bXOR\b)', condition, flags=re.IGNORECASE)
-        expression = []
-        
-        for token in tokens:
-            token = token.strip()
-            if not token: continue
-            upper_token = token.upper()
-            if upper_token in ops:
-                expression.append(ops[upper_token])
-            elif token in ('(', ')'):
-                expression.append(token)
-            else:
-                if '=' in token:
-                    left, right = token.split('=', 1)
-                    left = left.strip()
-                    right = right.strip()
-                    
-                    if left.startswith('$'):
-                        var_name = left[1:]
-                        left_val = str(variables.get(var_name, "")).lower()
-                    else:
-                        left_val = left.lower()
-                    
-                    expression.append(str(left_val == right.lower()))
-                
-                elif token.startswith('$'):
-                    var_name = token[1:]
-                    val = variables.get(var_name, False)
-                    is_true = bool(val) and str(val).lower() not in ['false', '0', 'no']
-                    expression.append(str(is_true))
-                    
-                else:
-                    # FIX 1: Use regex word boundaries (\b) to prevent partial matching 
-                    # (e.g., preventing "fruit" from matching inside "fruitless")
-                    pattern = r'\b' + re.escape(token.lower()) + r'\b'
-                    exists = re.search(pattern, context.lower()) is not None
-                    expression.append(str(exists))
-        
-        try:
-            return eval(" ".join(expression), {"__builtins__": None}, {})
-        except:
-            return False
-
-    def replace(self, prompt, variables=None):
-        if variables is None: variables = {}
-        while True:
-            match = self.regex.search(prompt)
-            if not match: break
-            
-            full_tag = match.group(0)
-            condition = match.group(1).strip()
-            true_text = match.group(2)
-            false_text = match.group(3) if match.group(3) else ""
-            
-            # FIX 2: Clean the context by removing ALL conditional tags.
-            # This prevents a condition from finding its keyword inside the 
-            # syntax of other unprocessed tags in the prompt.
-            context = self.regex.sub("", prompt)
-
-            if self.evaluate_logic(condition, context, variables):
-                replacement = true_text
-            else:
-                replacement = false_text
-            
-            prompt = prompt.replace(full_tag, replacement, 1)
-        return prompt
-
-class VariableReplacer:
-    def __init__(self):
-        self.assign_regex = re.compile(r'^\$([a-zA-Z0-9_]+)\s*=\s*(.*?)$', re.MULTILINE)
-        self.use_regex = re.compile(r'\$([a-zA-Z0-9_]+)((?:\.[a-zA-Z_]+)*)')
-        self.variables = {}
-
-    def load_globals(self, globals_dict):
-        self.variables.update(globals_dict)
-
-    def store_variables(self, text, tag_replacer, dynamic_replacer):
-        def _replace_assign(match):
-            var_name = match.group(1)
-            raw_value = match.group(2).strip()
-            
-            resolved_value = raw_value
-            for _ in range(10): 
-                prev_value = resolved_value
-                resolved_value = tag_replacer.replace(resolved_value)
-                resolved_value = dynamic_replacer.replace(resolved_value)
-                if prev_value == resolved_value:
-                    break
-            
-            self.variables[var_name] = resolved_value
-            return "" 
-        return self.assign_regex.sub(_replace_assign, text)
-
-    def replace_variables(self, text):
-        def _replace_use(match):
-            var_name = match.group(1)
-            methods_str = match.group(2) 
-            
-            value = self.variables.get(var_name)
-            if value is None:
-                return match.group(0)
-            
-            if methods_str:
-                methods = methods_str.split('.')[1:]
-                for method in methods:
-                    if method == 'clean':
-                        value = value.replace('_', ' ').replace('-', ' ')
-                    elif method == 'upper':
-                        value = value.upper()
-                    elif method == 'lower':
-                        value = value.lower()
-                    elif method == 'title':
-                        value = value.title()
-                    elif method == 'capitalize':
-                        value = value.capitalize()
-                        
-            return value
-            
-        return self.use_regex.sub(_replace_use, text)
 
 # ==============================================================================
 # DANBOORU & LORA
@@ -1241,6 +1159,20 @@ class LoRAHandler:
 
         return new_lora
 
+    def get_lora_hash(self, lora_path):
+        """Get SHA256 hash of LoRA file for CivitAI lookup"""
+        try:
+            import hashlib
+            sha256 = hashlib.sha256()
+            with open(lora_path, 'rb') as f:
+                # Read in chunks to handle large files
+                for chunk in iter(lambda: f.read(8192), b''):
+                    sha256.update(chunk)
+            return sha256.hexdigest().upper()[:10]  # CivitAI uses first 10 chars
+        except Exception as e:
+            print(f"[Umi LoRA Browser] Error hashing {lora_path}: {e}")
+            return None
+
     def get_lora_tags(self, lora_path, max_tags=10):
         try:
             with safe_open(lora_path, framework="pt", device="cpu") as f:
@@ -1271,23 +1203,24 @@ class LoRAHandler:
             return None
 
     def load_lora_cached(self, lora_path, limit):
+        # Fix memory leak: skip caching entirely when limit is 0
+        if limit == 0:
+            return comfy.utils.load_torch_file(lora_path, safe_load=True)
+
         if lora_path in LORA_MEMORY_CACHE:
             data = LORA_MEMORY_CACHE.pop(lora_path)
             LORA_MEMORY_CACHE[lora_path] = data
             return data
-        
-        if limit == 0:
-            return comfy.utils.load_torch_file(lora_path, safe_load=True)
 
         lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        
+
         LORA_MEMORY_CACHE[lora_path] = lora
         while len(LORA_MEMORY_CACHE) > limit:
             LORA_MEMORY_CACHE.popitem(last=False)
-            
+
         return lora
 
-    def extract_and_load(self, text, model, clip, behavior, cache_limit):
+    def extract_and_load(self, text, model, clip, behavior, cache_limit, max_tags=5):
         matches = self.regex.findall(text)
         clean_text = self.regex.sub("", text)
         lora_info_output = []
@@ -1298,13 +1231,18 @@ class LoRAHandler:
 
         for content in matches:
             content = content.strip()
-            
+
             if ':' in content:
                 parts = content.rsplit(':', 1)
                 name = parts[0].strip()
                 try:
                     strength = float(parts[1].strip())
-                except ValueError:
+                    # Input validation: clamp strength to valid range
+                    if strength < 0.0 or strength > 5.0:
+                        print(f"[UmiAI] WARNING: LoRA strength {strength} for '{name}' is out of range. Clamping to [0.0, 5.0].")
+                        strength = max(0.0, min(5.0, strength))
+                except ValueError as e:
+                    print(f"[UmiAI] ERROR: Invalid LoRA strength '{parts[1].strip()}' for '{name}'. Using 1.0 as default.")
                     name = content
                     strength = 1.0
             else:
@@ -1314,9 +1252,9 @@ class LoRAHandler:
             lora_path = folder_paths.get_full_path("loras", name)
             if not lora_path:
                 lora_path = folder_paths.get_full_path("loras", f"{name}.safetensors")
-            
+
             if lora_path:
-                tags = self.get_lora_tags(lora_path)
+                tags = self.get_lora_tags(lora_path, max_tags=max_tags)
                 info_block = f"[LORA: {name} (Str: {strength})]\n"
                 if tags:
                     info_block += f"Common Tags: {', '.join(tags)}"
@@ -1352,21 +1290,30 @@ class LoRAHandler:
 
 class NegativePromptGenerator:
     def __init__(self):
-        self.negative_tag = set()
+        self.negative_list = []  # Changed from set to list to preserve order
+        self.seen_lower = set()  # Track lowercase versions for deduplication
 
     def strip_negative_tags(self, text):
         matches = re.findall(r'\*\*.*?\*\*', text)
         for match in matches:
-            self.negative_tag.add(match.replace("**", ""))
+            tag = match.replace("**", "").strip()
+            tag_lower = tag.lower()
+            if tag and tag_lower not in self.seen_lower:
+                self.seen_lower.add(tag_lower)
+                self.negative_list.append(tag)
             text = text.replace(match, "")
         return text
 
     def add_list(self, tags):
         for t in tags:
-            self.negative_tag.add(t.strip())
+            tag = t.strip()
+            tag_lower = tag.lower()
+            if tag and tag_lower not in self.seen_lower:
+                self.seen_lower.add(tag_lower)
+                self.negative_list.append(tag)
 
     def get_negative_string(self):
-        return ", ".join([t for t in self.negative_tag if t.strip()])
+        return ", ".join(self.negative_list)
 
 # ==============================================================================
 # NODE DEFINITION
@@ -1403,6 +1350,7 @@ class UmiAIWildcardNode:
 
                 # Basic Settings
                 "lora_tags_behavior": (["Append to Prompt", "Disabled", "Prepend to Prompt"], {"default": "Append to Prompt"}),
+                "lora_max_tags": ("INT", {"default": 5, "min": 0, "max": 20, "step": 1}),
                 "lora_cache_limit": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
                 "width": ("INT", {"default": 1024, "min": 64, "max": 8192}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 8192}),
@@ -1428,8 +1376,8 @@ class UmiAIWildcardNode:
             }
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING", "INT", "INT", "STRING")
-    RETURN_NAMES = ("model", "clip", "text", "negative_text", "width", "height", "lora_info")
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING", "INT", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("model", "clip", "text", "negative_text", "width", "height", "lora_info", "input_text", "input_negative")
     FUNCTION = "process"
     CATEGORY = "UmiAI"
     COLOR = "#322947"
@@ -1763,6 +1711,7 @@ class UmiAIWildcardNode:
         width = self.get_val(kwargs, "width", 1024, int)
         height = self.get_val(kwargs, "height", 1024, int)
         lora_tags_behavior = self.get_val(kwargs, "lora_tags_behavior", "Append to Prompt", str)
+        lora_max_tags = self.get_val(kwargs, "lora_max_tags", 5, int)
         lora_cache_limit = self.get_val(kwargs, "lora_cache_limit", 5, int) 
         input_negative = self.get_val(kwargs, "input_negative", "", str)
 
@@ -1829,11 +1778,19 @@ class UmiAIWildcardNode:
         prompt = text
         previous_prompt = ""
         iterations = 0
+        prompt_history = []  # Track prompts for cycle detection
         tag_selector.clear_seeded_values()
 
         while previous_prompt != prompt and iterations < 50:
+            # Cycle detection: check if we've seen this exact prompt before
+            if prompt in prompt_history:
+                print(f"[UmiAI] WARNING: Cycle detected in prompt processing. Breaking loop to prevent infinite recursion.")
+                print(f"[UmiAI] Problematic prompt fragment: {prompt[:100]}...")
+                break
+
+            prompt_history.append(previous_prompt)
             previous_prompt = prompt
-            
+
             # Process Vision and LLM tags
             prompt = vision_replacer.replace(prompt)
             prompt = llm_replacer.replace(prompt)
@@ -1845,7 +1802,11 @@ class UmiAIWildcardNode:
             prompt = dynamic_replacer.replace(prompt)
             prompt = danbooru_replacer.replace(prompt, danbooru_threshold, danbooru_max_tags)
             iterations += 1
-            
+
+        # Warn if we hit the iteration limit
+        if iterations >= 50:
+            print(f"[UmiAI] WARNING: Reached maximum processing iterations (50). Possible recursive wildcards or variables.")
+
         prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
         
         additions = tag_selector.get_prefixes_and_suffixes()
@@ -1865,7 +1826,7 @@ class UmiAIWildcardNode:
         prompt = re.sub(r',\s*,', ',', prompt)
         prompt = re.sub(r'\s+', ' ', prompt).strip().strip(',')
 
-        prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(prompt, model, clip, lora_tags_behavior, lora_cache_limit)
+        prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(prompt, model, clip, lora_tags_behavior, lora_cache_limit, lora_max_tags)
 
         generated_negatives = neg_gen.get_negative_string()
         final_negative = input_negative
@@ -1878,10 +1839,119 @@ class UmiAIWildcardNode:
         final_width = settings['width'] if settings['width'] > 0 else width
         final_height = settings['height'] if settings['height'] > 0 else height
 
-        return (final_model, final_clip, prompt, final_negative, final_width, final_height, lora_info)
+        # Escape colons that aren't part of weight syntax to prevent SD misinterpretation
+        prompt = escape_unweighted_colons(prompt)
+        final_negative = escape_unweighted_colons(final_negative)
 
-NODE_CLASS_MAPPINGS = {"UmiAIWildcardNode": UmiAIWildcardNode}
-NODE_DISPLAY_NAME_MAPPINGS = {"UmiAIWildcardNode": "UmiAI Wildcard Processor"}
+        # Phase 8: Log prompt to history
+        log_prompt_to_history(prompt, final_negative, seed)
+
+        return (final_model, final_clip, prompt, final_negative, final_width, final_height, lora_info, text, input_negative)
+
+# ==============================================================================
+# UMI SAVE IMAGE NODE (with embedded metadata)
+# ==============================================================================
+class UmiSaveImage:
+    """Save images with Umi prompt metadata embedded for the Image Browser"""
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+        self.compress_level = 4
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "Umi"}),
+            },
+            "optional": {
+                "positive_prompt": ("STRING", {"forceInput": True, "multiline": True}),
+                "negative_prompt": ("STRING", {"forceInput": True, "multiline": True}),
+                "input_prompt": ("STRING", {"forceInput": True, "multiline": True}),  # Original input before wildcards
+                "input_negative": ("STRING", {"forceInput": True, "multiline": True}),  # Original negative before wildcards
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_images"
+    OUTPUT_NODE = True
+    CATEGORY = "UmiAI"
+
+    def save_images(self, images, filename_prefix="Umi", positive_prompt="", negative_prompt="", input_prompt="", input_negative="", prompt=None, extra_pnginfo=None):
+        from PIL import Image, PngImagePlugin
+        import numpy as np
+
+        filename_prefix += self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0]
+        )
+
+        results = list()
+
+        for (batch_number, image) in enumerate(images):
+            # Convert tensor to PIL Image
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+
+            # Prepare PNG metadata
+            metadata = PngImagePlugin.PngInfo()
+
+            # Add Umi-specific metadata (processed prompts)
+            if positive_prompt:
+                metadata.add_text("umi_prompt", positive_prompt)
+                print(f"[UmiSaveImage] Saved umi_prompt: {positive_prompt[:100]}...")
+            if negative_prompt:
+                metadata.add_text("umi_negative", negative_prompt)
+                print(f"[UmiSaveImage] Saved umi_negative: {negative_prompt[:100]}...")
+
+            # Add original input prompts (before wildcard processing)
+            if input_prompt:
+                metadata.add_text("umi_input_prompt", input_prompt)
+                print(f"[UmiSaveImage] Saved umi_input_prompt: {input_prompt[:100]}...")
+            if input_negative:
+                metadata.add_text("umi_input_negative", input_negative)
+                print(f"[UmiSaveImage] Saved umi_input_negative: {input_negative[:100]}...")
+
+            # Add standard ComfyUI workflow metadata if available
+            if prompt is not None:
+                metadata.add_text("prompt", json.dumps(prompt))
+            if extra_pnginfo is not None:
+                for key, value in extra_pnginfo.items():
+                    metadata.add_text(key, json.dumps(value))
+
+            # Generate filename
+            file = f"{filename}_{counter:05}_.png"
+            img.save(
+                os.path.join(full_output_folder, file),
+                pnginfo=metadata,
+                compress_level=self.compress_level
+            )
+
+            results.append({
+                "filename": file,
+                "subfolder": subfolder,
+                "type": self.type
+            })
+
+            counter += 1
+
+        return { "ui": { "images": results } }
+
+NODE_CLASS_MAPPINGS = {
+    "UmiAIWildcardNode": UmiAIWildcardNode,
+    "UmiSaveImage": UmiSaveImage
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "UmiAIWildcardNode": "UmiAI Wildcard Processor",
+    "UmiSaveImage": "Umi Save Image (with metadata)"
+}
 
 # ==============================================================================
 # API ENDPOINTS
@@ -1894,15 +1964,121 @@ async def get_wildcards(request):
     loader = TagLoader(all_paths, options)
     loader.build_index()
     
-    combined_list = sorted(list(loader.files_index | loader.umi_tags))
+    # Separate txt files from yaml for proper autocomplete
+    txt_files = []
+    yaml_files = []
+    tags = set()
+    basenames = {}
+    
+    for path in all_paths:
+        if not os.path.exists(path):
+            continue
+            
+        # Scan TXT files (for __ wildcards)
+        for filepath in glob.glob(os.path.join(path, '**', '*.txt'), recursive=True):
+            rel_path = os.path.relpath(filepath, path)
+            tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+            if tag_name not in txt_files:
+                txt_files.append(tag_name)
+            
+            # Add basename mapping
+            basename = os.path.splitext(os.path.basename(filepath))[0]
+            if basename not in basenames:
+                basenames[basename] = tag_name
+        
+        # Scan YAML files (for tags)
+        for filepath in glob.glob(os.path.join(path, '**', '*.yaml'), recursive=True):
+            rel_path = os.path.relpath(filepath, path)
+            tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+            if tag_name not in yaml_files:
+                yaml_files.append(tag_name)
+            
+            # Add basename mapping
+            basename = os.path.splitext(os.path.basename(filepath))[0]
+            if basename not in basenames:
+                basenames[basename] = tag_name
+            
+            # Parse YAML for Tags
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f)
+                    if isinstance(data, dict):
+                        for entry_name, entry in data.items():
+                            # Add entry names as searchable (for <EntryName>)
+                            tags.add(str(entry_name).strip())
+                            # Also add Tags field if present
+                            if isinstance(entry, dict) and 'Tags' in entry:
+                                for t in entry['Tags']:
+                                    tags.add(str(t).strip())
+            except Exception as e:
+                print(f"[UmiAI] Error parsing YAML {filepath}: {e}")
     
     loras = folder_paths.get_filename_list("loras")
     loras = sorted(loras) if loras else []
 
     return web.json_response({
-        "wildcards": combined_list,
+        "files": sorted(txt_files),
+        "wildcards": sorted(txt_files),
+        "yaml_files": sorted(yaml_files),
+        "tags": sorted(list(tags)),
+        "basenames": basenames,
         "loras": loras,
     })
+
+@server.PromptServer.instance.routes.get("/umiapp/loras")
+async def get_loras_metadata(request):
+    """Phase 6: Get all LoRAs with metadata for browser panel"""
+    loras = folder_paths.get_filename_list("loras")
+    if not loras:
+        return web.json_response({"loras": []})
+
+    lora_handler = LoRAHandler()
+    lora_data = []
+
+    # Load CivitAI cache if exists
+    civitai_cache = {}
+    cache_path = os.path.join(os.path.dirname(__file__), "civitai_cache.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                civitai_cache = json.load(f)
+        except Exception as e:
+            print(f"[Umi LoRA Browser] Error loading CivitAI cache: {e}")
+
+    # Load manual overrides if exists
+    overrides = {}
+    overrides_path = os.path.join(os.path.dirname(__file__), "lora_overrides.json")
+    if os.path.exists(overrides_path):
+        try:
+            with open(overrides_path, 'r', encoding='utf-8') as f:
+                overrides = json.load(f)
+        except Exception as e:
+            print(f"[Umi LoRA Browser] Error loading overrides: {e}")
+
+    for lora_name in sorted(loras):
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        if not lora_path:
+            continue
+
+        # Get base name without extension
+        base_name = os.path.splitext(lora_name)[0]
+
+        # Get activation tags from SafeTensors metadata
+        tags = lora_handler.get_lora_tags(lora_path, max_tags=10)
+
+        # Build lora info with overrides
+        lora_info = {
+            "name": base_name,
+            "filename": lora_name,
+            "tags": tags if tags else [],
+            "path": lora_path,
+            "civitai": civitai_cache.get(base_name, {}),
+            "override": overrides.get(base_name, {})  # Add override data
+        }
+
+        lora_data.append(lora_info)
+
+    return web.json_response({"loras": lora_data})
 
 @server.PromptServer.instance.routes.post("/umiapp/refresh")
 async def refresh_wildcards(request):
@@ -1924,8 +2100,843 @@ async def refresh_wildcards(request):
     loras = sorted(loras) if loras else []
     
     return web.json_response({
-        "status": "success", 
+        "status": "success",
         "count": len(combined_list),
         "wildcards": combined_list,
         "loras": loras
     })
+
+@server.PromptServer.instance.routes.post("/umiapp/loras/civitai/batch")
+async def fetch_civitai_batch(request):
+    """Phase 6: Batch fetch CivitAI metadata for all LoRAs with rate limiting"""
+    import aiohttp
+    import asyncio
+
+    loras = folder_paths.get_filename_list("loras")
+    if not loras:
+        return web.json_response({"error": "No LoRAs found"}, status=404)
+
+    # Load existing cache
+    cache_path = os.path.join(os.path.dirname(__file__), "civitai_cache.json")
+    cache = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+        except:
+            pass
+
+    results = {
+        "total": len(loras),
+        "cached": 0,
+        "fetched": 0,
+        "failed": 0,
+        "skipped": 0
+    }
+
+    async def fetch_one(session, lora_name):
+        base_name = os.path.splitext(lora_name)[0]
+
+        # Skip if already cached
+        if base_name in cache:
+            results["cached"] += 1
+            return
+
+        try:
+            # Rate limiting - wait 1.5 seconds between requests
+            await asyncio.sleep(1.5)
+
+            # Get file path and hash
+            lora_path = folder_paths.get_full_path("loras", lora_name)
+            if not lora_path:
+                results["skipped"] += 1
+                return
+
+            lora_handler = LoRAHandler()
+            file_hash = lora_handler.get_lora_hash(lora_path)
+
+            # Try hash-based lookup first (exact match!)
+            model = None
+            if file_hash:
+                hash_url = f"https://civitai.com/api/v1/model-versions/by-hash/{file_hash}"
+                try:
+                    async with session.get(hash_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            version_data = await resp.json()
+                            # Fetch the full model data
+                            model_id = version_data.get("modelId")
+                            if model_id:
+                                model_url = f"https://civitai.com/api/v1/models/{model_id}"
+                                async with session.get(model_url, timeout=aiohttp.ClientTimeout(total=10)) as model_resp:
+                                    if model_resp.status == 200:
+                                        model = await model_resp.json()
+                                        print(f"[Umi LoRA Browser] Hash match found for '{base_name}'")
+                except Exception as e:
+                    print(f"[Umi LoRA Browser] Hash lookup failed for '{base_name}': {e}")
+
+            # Fallback to name search if hash lookup failed
+            if not model:
+                from urllib.parse import quote
+                search_url = f"https://civitai.com/api/v1/models?query={quote(base_name)}&types=LORA&limit=5"
+
+                async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        results["skipped"] += 1
+                        print(f"[Umi LoRA Browser] Skipped '{base_name}': No CivitAI data found")
+                        return
+
+                    search_data = await resp.json()
+
+                    if not search_data.get("items"):
+                        results["skipped"] += 1
+                        print(f"[Umi LoRA Browser] Skipped '{base_name}': No search results")
+                        return
+
+                    # Try to find best match based on name similarity
+                    items = search_data["items"]
+
+                    # First try exact match (case insensitive)
+                    for item in items:
+                        if item.get("name", "").lower() == base_name.lower():
+                            model = item
+                            print(f"[Umi LoRA Browser] Exact name match for '{base_name}'")
+                            break
+
+                    # If no exact match, use first result but validate similarity
+                    if not model:
+                        candidate = items[0]
+                        model_name = candidate.get("name", "").lower()
+                        base_words = set(base_name.lower().replace('_', ' ').replace('-', ' ').split())
+                        model_words = set(model_name.replace('_', ' ').replace('-', ' ').split())
+
+                        # Calculate word overlap - skip if less than 30% match
+                        if base_words and model_words:
+                            overlap = len(base_words & model_words) / len(base_words)
+                            if overlap < 0.3:  # Less than 30% word match
+                                results["skipped"] += 1
+                                print(f"[Umi LoRA Browser] Skipped '{base_name}': Poor match (closest: '{candidate.get('name')}', overlap: {overlap:.0%})")
+                                return
+                            else:
+                                model = candidate
+                                print(f"[Umi LoRA Browser] Fuzzy match for '{base_name}' -> '{candidate.get('name')}' (overlap: {overlap:.0%})")
+                        else:
+                            results["skipped"] += 1
+                            return
+
+            # If we still don't have a model, skip
+            if not model:
+                results["skipped"] += 1
+                return
+
+            # Extract CivitAI data from the model
+            civitai_data = {
+                "id": model.get("id"),
+                "name": model.get("name"),
+                "description": model.get("description", "")[:300],  # Truncate
+                "tags": model.get("tags", [])[:15],
+                "creator": model.get("creator", {}).get("username", "Unknown"),
+                "url": f"https://civitai.com/models/{model.get('id')}",
+            }
+
+            if model.get("modelVersions"):
+                latest_version = model["modelVersions"][0]
+                civitai_data["trigger_words"] = latest_version.get("trainedWords", [])[:15]
+                civitai_data["base_model"] = latest_version.get("baseModel", "Unknown")
+
+                if latest_version.get("images"):
+                    first_image = latest_version["images"][0]
+                    civitai_data["preview_url"] = first_image.get("url")
+                    civitai_data["nsfw"] = first_image.get("nsfw", "None")
+
+            cache[base_name] = civitai_data
+            results["fetched"] += 1
+            print(f"[Umi LoRA Browser] Fetched: {base_name}")
+
+        except asyncio.TimeoutError:
+            results["failed"] += 1
+            print(f"[Umi LoRA Browser] Timeout: {base_name}")
+        except Exception as e:
+            results["failed"] += 1
+            print(f"[Umi LoRA Browser] Error fetching {base_name}: {e}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Process in batches to avoid overwhelming CivitAI
+            batch_size = 5
+            for i in range(0, len(loras), batch_size):
+                batch = loras[i:i+batch_size]
+                tasks = [fetch_one(session, lora_name) for lora_name in batch]
+                await asyncio.gather(*tasks)
+
+                # Save cache after each batch
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(cache, f, indent=2, ensure_ascii=False)
+
+        return web.json_response({"success": True, "results": results})
+
+    except Exception as e:
+        print(f"[Umi LoRA Browser] Batch fetch error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.post("/umiapp/loras/civitai/single")
+async def fetch_civitai_single(request):
+    """Fetch CivitAI metadata for a single LoRA"""
+    import aiohttp
+    
+    try:
+        data = await request.json()
+        lora_name = data.get("lora_name")
+        
+        if not lora_name:
+            return web.json_response({"error": "lora_name required"}, status=400)
+        
+        base_name = os.path.splitext(lora_name)[0] if "." in lora_name else lora_name
+        
+        # Load existing cache
+        cache_path = os.path.join(os.path.dirname(__file__), "civitai_cache.json")
+        cache = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+            except:
+                pass
+        
+        # Skip if already cached
+        if base_name in cache:
+            return web.json_response({"success": True, "cached": True, "data": cache[base_name]})
+        
+        async with aiohttp.ClientSession() as session:
+            # Get file path and hash
+            lora_path = folder_paths.get_full_path("loras", lora_name)
+            if not lora_path:
+                # Try with .safetensors extension
+                lora_path = folder_paths.get_full_path("loras", f"{lora_name}.safetensors")
+            
+            file_hash = None
+            if lora_path:
+                lora_handler = LoRAHandler()
+                file_hash = lora_handler.get_lora_hash(lora_path)
+            
+            model = None
+            
+            # Try hash-based lookup first
+            if file_hash:
+                hash_url = f"https://civitai.com/api/v1/model-versions/by-hash/{file_hash}"
+                try:
+                    async with session.get(hash_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            version_data = await resp.json()
+                            model_id = version_data.get("modelId")
+                            if model_id:
+                                model_url = f"https://civitai.com/api/v1/models/{model_id}"
+                                async with session.get(model_url, timeout=aiohttp.ClientTimeout(total=10)) as model_resp:
+                                    if model_resp.status == 200:
+                                        model = await model_resp.json()
+                except Exception as e:
+                    print(f"[Umi LoRA Browser] Hash lookup failed: {e}")
+            
+            # Fallback to name search - EXACT MATCH ONLY
+            if not model:
+                from urllib.parse import quote
+                search_url = f"https://civitai.com/api/v1/models?query={quote(base_name)}&types=LORA&limit=5"
+                
+                async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        search_data = await resp.json()
+                        items = search_data.get("items", [])
+                        
+                        # Only accept exact name match - NO FALLBACK
+                        for item in items:
+                            if item.get("name", "").lower() == base_name.lower():
+                                model = item
+                                break
+                        
+                        # If no exact match, return not found (user can use Edit to add manually)
+            
+            if not model:
+                return web.json_response({"success": False, "error": "No exact match found. Use Edit to add manually."})
+            
+            # Extract CivitAI data
+            civitai_data = {
+                "id": model.get("id"),
+                "name": model.get("name"),
+                "description": model.get("description", "")[:300],
+                "tags": model.get("tags", [])[:15],
+                "creator": model.get("creator", {}).get("username", "Unknown"),
+                "url": f"https://civitai.com/models/{model.get('id')}",
+            }
+            
+            if model.get("modelVersions"):
+                latest_version = model["modelVersions"][0]
+                civitai_data["trigger_words"] = latest_version.get("trainedWords", [])[:15]
+                civitai_data["base_model"] = latest_version.get("baseModel", "Unknown")
+                
+                if latest_version.get("images"):
+                    first_image = latest_version["images"][0]
+                    civitai_data["preview_url"] = first_image.get("url")
+                    civitai_data["nsfw"] = first_image.get("nsfw", "None")
+            
+            # Save to cache
+            cache[base_name] = civitai_data
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, indent=2, ensure_ascii=False)
+            
+            return web.json_response({"success": True, "cached": False, "data": civitai_data})
+            
+    except Exception as e:
+        print(f"[Umi LoRA Browser] Single fetch error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.get("/umiapp/loras/overrides")
+async def get_lora_overrides(request):
+    """Get manual overrides for LoRAs (nicknames, custom tags, custom preview)"""
+    overrides_path = os.path.join(os.path.dirname(__file__), "lora_overrides.json")
+
+    if os.path.exists(overrides_path):
+        try:
+            with open(overrides_path, 'r', encoding='utf-8') as f:
+                overrides = json.load(f)
+            return web.json_response({"overrides": overrides})
+        except Exception as e:
+            print(f"[Umi LoRA Browser] Error loading overrides: {e}")
+            return web.json_response({"overrides": {}})
+
+    return web.json_response({"overrides": {}})
+
+@server.PromptServer.instance.routes.post("/umiapp/loras/overrides/save")
+async def save_lora_override(request):
+    """Save manual override for a specific LoRA"""
+    try:
+        data = await request.json()
+        lora_name = data.get("lora_name")
+        override_data = data.get("override", {})
+
+        if not lora_name:
+            return web.json_response({"error": "LoRA name required"}, status=400)
+
+        overrides_path = os.path.join(os.path.dirname(__file__), "lora_overrides.json")
+
+        # Load existing overrides
+        overrides = {}
+        if os.path.exists(overrides_path):
+            try:
+                with open(overrides_path, 'r', encoding='utf-8') as f:
+                    overrides = json.load(f)
+            except:
+                pass
+
+        # Update override for this LoRA
+        overrides[lora_name] = override_data
+
+        # Save back to file
+        with open(overrides_path, 'w', encoding='utf-8') as f:
+            json.dump(overrides, f, indent=2, ensure_ascii=False)
+
+        return web.json_response({"success": True})
+
+    except Exception as e:
+        print(f"[Umi LoRA Browser] Error saving override: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.get("/umiapp/images/scan")
+async def scan_images(request):
+    """Phase 6: Scan output directory for images with metadata"""
+    import asyncio
+    from PIL import Image as PILImage
+    from PIL.PngImagePlugin import PngInfo
+
+    # Get output directory
+    output_dir = folder_paths.get_output_directory()
+    if not os.path.exists(output_dir):
+        return web.json_response({"error": "Output directory not found"}, status=404)
+
+    # Get query parameters
+    params = request.rel_url.query
+    limit = int(params.get("limit", 100))
+    offset = int(params.get("offset", 0))
+    sort_by = params.get("sort", "newest")  # newest, oldest, name
+
+    images_data = []
+
+    def extract_metadata(image_path):
+        """Extract metadata from PNG/JPG"""
+        try:
+            with PILImage.open(image_path) as img:
+                metadata = {
+                    "width": img.width,
+                    "height": img.height,
+                    "format": img.format,
+                    "prompt": None,
+                    "negative": None,
+                    "workflow": None,
+                    "parameters": {}
+                }
+
+                # PNG metadata
+                if img.format == "PNG":
+                    # ComfyUI workflow (in 'prompt' key)
+                    if "prompt" in img.info:
+                        try:
+                            metadata["workflow"] = json.loads(img.info["prompt"])
+                        except:
+                            pass
+
+                    # A1111 format (in 'parameters' key)
+                    if "parameters" in img.info:
+                        params_text = img.info["parameters"]
+                        metadata["a1111_params"] = params_text
+
+                        # Parse A1111 format
+                        lines = params_text.split("\n")
+                        if len(lines) > 0:
+                            metadata["prompt"] = lines[0]
+
+                        # Look for "Negative prompt:"
+                        for i, line in enumerate(lines):
+                            if line.startswith("Negative prompt:"):
+                                metadata["negative"] = line.replace("Negative prompt:", "").strip()
+                                break
+
+                    # Check for custom Umi keys
+                    if "umi_prompt" in img.info:
+                        metadata["umi_prompt"] = img.info["umi_prompt"]
+                    if "umi_negative" in img.info:
+                        metadata["umi_negative"] = img.info["umi_negative"]
+                    if "umi_input_prompt" in img.info:
+                        metadata["umi_input_prompt"] = img.info["umi_input_prompt"]
+                    if "umi_input_negative" in img.info:
+                        metadata["umi_input_negative"] = img.info["umi_input_negative"]
+
+                    # Set fallback for 'prompt' and 'negative' if not already set
+                    if metadata["prompt"] is None and "umi_prompt" in img.info:
+                        metadata["prompt"] = img.info["umi_prompt"]
+                    if metadata["negative"] is None and "umi_negative" in img.info:
+                        metadata["negative"] = img.info["umi_negative"]
+
+                # EXIF data (for JPG)
+                if hasattr(img, '_getexif') and img._getexif():
+                    exif = img._getexif()
+                    # User Comment tag (0x9286)
+                    if 0x9286 in exif:
+                        metadata["prompt"] = exif[0x9286]
+
+                return metadata
+
+        except Exception as e:
+            print(f"[Umi Image Browser] Error extracting metadata from {image_path}: {e}")
+            return None
+
+    # Scan directory
+    try:
+        image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
+        all_images = []
+
+        for root, dirs, files in os.walk(output_dir):
+            for file in files:
+                if os.path.splitext(file.lower())[1] in image_extensions:
+                    full_path = os.path.join(root, file)
+                    all_images.append({
+                        "path": full_path,
+                        "filename": file,
+                        "relative_path": os.path.relpath(full_path, output_dir),
+                        "mtime": os.path.getmtime(full_path),
+                        "size": os.path.getsize(full_path)
+                    })
+
+        # Sort images
+        if sort_by == "newest":
+            all_images.sort(key=lambda x: x["mtime"], reverse=True)
+        elif sort_by == "oldest":
+            all_images.sort(key=lambda x: x["mtime"])
+        elif sort_by == "name":
+            all_images.sort(key=lambda x: x["filename"])
+
+        # Paginate
+        paginated = all_images[offset:offset+limit]
+
+        # Extract metadata for paginated results
+        for img_info in paginated:
+            metadata = extract_metadata(img_info["path"])
+            if metadata:
+                img_info["metadata"] = metadata
+            else:
+                img_info["metadata"] = {}
+
+            # Create web-accessible URL
+            rel_path = img_info["relative_path"].replace("\\", "/")
+            img_info["url"] = f"/view?filename={rel_path}&type=output"
+
+            # Remove full path for security
+            del img_info["path"]
+
+        return web.json_response({
+            "images": paginated,
+            "total": len(all_images),
+            "offset": offset,
+            "limit": limit
+        })
+
+    except Exception as e:
+        print(f"[Umi Image Browser] Scan error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+# Phase 8: Preset Manager Endpoints
+@server.PromptServer.instance.routes.get("/umiapp/presets")
+async def get_presets(request):
+    """Phase 8: Get all saved presets"""
+    presets_file = os.path.join(os.path.dirname(__file__), "presets.json")
+
+    if not os.path.exists(presets_file):
+        return web.json_response({"presets": []})
+
+    try:
+        with open(presets_file, 'r', encoding='utf-8') as f:
+            presets = json.load(f)
+        return web.json_response({"presets": presets})
+    except Exception as e:
+        print(f"[Umi Preset Manager] Error loading presets: {e}")
+        return web.json_response({"presets": []})
+
+@server.PromptServer.instance.routes.post("/umiapp/presets/save")
+async def save_preset(request):
+    """Phase 8: Save a new preset"""
+    try:
+        data = await request.json()
+        name = data.get("name")
+        description = data.get("description", "")
+        preset_data = data.get("data", {})
+
+        if not name:
+            return web.json_response({"error": "Preset name is required"}, status=400)
+
+        presets_file = os.path.join(os.path.dirname(__file__), "presets.json")
+
+        # Load existing presets
+        presets = []
+        if os.path.exists(presets_file):
+            with open(presets_file, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+
+        # Check if preset with same name exists
+        presets = [p for p in presets if p.get("name") != name]
+
+        # Add new preset
+        presets.append({
+            "name": name,
+            "description": description,
+            "data": preset_data,
+            "timestamp": datetime.now().isoformat()
+        })
+
+        # Save presets
+        with open(presets_file, 'w', encoding='utf-8') as f:
+            json.dump(presets, f, indent=2, ensure_ascii=False)
+
+        return web.json_response({"success": True})
+
+    except Exception as e:
+        print(f"[Umi Preset Manager] Error saving preset: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.post("/umiapp/presets/delete")
+async def delete_preset(request):
+    """Phase 8: Delete a preset"""
+    try:
+        data = await request.json()
+        name = data.get("name")
+
+        if not name:
+            return web.json_response({"error": "Preset name is required"}, status=400)
+
+        presets_file = os.path.join(os.path.dirname(__file__), "presets.json")
+
+        if not os.path.exists(presets_file):
+            return web.json_response({"error": "No presets found"}, status=404)
+
+        # Load and filter presets
+        with open(presets_file, 'r', encoding='utf-8') as f:
+            presets = json.load(f)
+
+        presets = [p for p in presets if p.get("name") != name]
+
+        # Save filtered presets
+        with open(presets_file, 'w', encoding='utf-8') as f:
+            json.dump(presets, f, indent=2, ensure_ascii=False)
+
+        return web.json_response({"success": True})
+
+    except Exception as e:
+        print(f"[Umi Preset Manager] Error deleting preset: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+# Phase 8: Prompt History Endpoints
+@server.PromptServer.instance.routes.get("/umiapp/history")
+async def get_history(request):
+    """Phase 8: Get prompt history"""
+    history_file = os.path.join(os.path.dirname(__file__), "prompt_history.json")
+
+    if not os.path.exists(history_file):
+        return web.json_response({"history": []})
+
+    try:
+        with open(history_file, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+
+        # Sort by timestamp descending (newest first)
+        history.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+        return web.json_response({"history": history})
+    except Exception as e:
+        print(f"[Umi History] Error loading history: {e}")
+        return web.json_response({"history": []})
+
+@server.PromptServer.instance.routes.post("/umiapp/history/clear")
+async def clear_history(request):
+    """Phase 8: Clear all prompt history"""
+    try:
+        history_file = os.path.join(os.path.dirname(__file__), "prompt_history.json")
+
+        if os.path.exists(history_file):
+            os.remove(history_file)
+
+        return web.json_response({"success": True})
+    except Exception as e:
+        print(f"[Umi History] Error clearing history: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+# Phase 8: YAML Tag Management Endpoints
+@server.PromptServer.instance.routes.get("/umiapp/yaml/tags")
+async def get_yaml_tags(request):
+    """Phase 8: Export all YAML tags with their entries"""
+    try:
+        all_wildcard_paths = get_all_wildcard_paths()
+        tag_loader = TagLoader(all_wildcard_paths, {'verbose': False, 'seed': 0})
+
+        # Build complete index
+        tag_loader.build_index()
+
+        # Get all YAML entries with tags
+        yaml_entries = tag_loader.yaml_entries
+
+        # Build export data
+        export_data = {
+            "total_entries": len(yaml_entries),
+            "tags": {},
+            "entries": []
+        }
+
+        # Collect all unique tags
+        all_tags = set()
+        for entry_name, entry_data in yaml_entries.items():
+            tags = entry_data.get('tags', [])
+            all_tags.update(tags)
+
+            export_data["entries"].append({
+                "name": entry_name,
+                "title": entry_data.get('title', entry_name),
+                "tags": tags,
+                "prompts": entry_data.get('prompts', []),
+                "description": entry_data.get('description', '')
+            })
+
+        # Build tag index
+        for tag in sorted(all_tags):
+            export_data["tags"][tag] = {
+                "count": sum(1 for e in export_data["entries"] if tag in e["tags"]),
+                "entries": [e["name"] for e in export_data["entries"] if tag in e["tags"]]
+            }
+
+        return web.json_response(export_data)
+
+    except Exception as e:
+        print(f"[Umi YAML Tags] Error exporting tags: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.post("/umiapp/yaml/tags/import")
+async def import_yaml_tags(request):
+    """Phase 8: Import tags from CSV"""
+    try:
+        data = await request.json()
+        csv_data = data.get("csv_data", "")
+
+        if not csv_data:
+            return web.json_response({"error": "No CSV data provided"}, status=400)
+
+        # Parse CSV (format: entry_name,tag1,tag2,tag3...)
+        import csv
+        from io import StringIO
+
+        reader = csv.reader(StringIO(csv_data))
+        updates = []
+
+        for row in reader:
+            if len(row) < 2:
+                continue
+
+            entry_name = row[0].strip()
+            new_tags = [tag.strip() for tag in row[1:] if tag.strip()]
+
+            if entry_name and new_tags:
+                updates.append({
+                    "entry": entry_name,
+                    "tags": new_tags
+                })
+
+        # Return update plan (actual file writing would require YAML editing)
+        return web.json_response({
+            "success": True,
+            "updates_planned": len(updates),
+            "updates": updates,
+            "note": "Tag import parsed successfully. Manual YAML update recommended."
+        })
+
+    except Exception as e:
+        print(f"[Umi YAML Tags] Error importing tags: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.get("/umiapp/yaml/stats")
+async def get_yaml_stats(request):
+    """Phase 8: Get YAML statistics"""
+    try:
+        all_wildcard_paths = get_all_wildcard_paths()
+        tag_loader = TagLoader(all_wildcard_paths, {'verbose': False, 'seed': 0})
+        tag_loader.build_index()
+
+        yaml_entries = tag_loader.yaml_entries
+
+        # Calculate statistics
+        total_entries = len(yaml_entries)
+        total_tags = len(set(tag for entry in yaml_entries.values() for tag in entry.get('tags', [])))
+
+        entries_with_tags = sum(1 for entry in yaml_entries.values() if entry.get('tags'))
+        entries_without_tags = total_entries - entries_with_tags
+
+        # Most common tags
+        tag_counts = {}
+        for entry in yaml_entries.values():
+            for tag in entry.get('tags', []):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+
+        stats = {
+            "total_entries": total_entries,
+            "total_unique_tags": total_tags,
+            "entries_with_tags": entries_with_tags,
+            "entries_without_tags": entries_without_tags,
+            "average_tags_per_entry": round(sum(len(e.get('tags', [])) for e in yaml_entries.values()) / total_entries, 2) if total_entries > 0 else 0,
+            "top_tags": [{"tag": tag, "count": count} for tag, count in top_tags]
+        }
+
+        return web.json_response(stats)
+
+    except Exception as e:
+        print(f"[Umi YAML Stats] Error calculating stats: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+# Phase 8: File Editor Endpoints
+@server.PromptServer.instance.routes.get("/umiapp/files/list")
+async def list_files(request):
+    """Phase 8: List all wildcard files"""
+    try:
+        all_paths = get_all_wildcard_paths()
+        files = []
+
+        for wildcard_path in all_paths:
+            for root, dirs, filenames in os.walk(wildcard_path):
+                for filename in filenames:
+                    if filename.endswith(('.txt', '.yaml')):
+                        full_path = os.path.join(root, filename)
+                        files.append(full_path)
+
+        return web.json_response({"files": files})
+
+    except Exception as e:
+        print(f"[Umi File Editor] Error listing files: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.post("/umiapp/files/read")
+async def read_file(request):
+    """Phase 8: Read a file's content"""
+    try:
+        data = await request.json()
+        filepath = data.get("filepath")
+
+        if not filepath or not os.path.exists(filepath):
+            return web.json_response({"error": "File not found"}, status=404)
+
+        # Security: ensure file is in wildcard paths
+        all_paths = get_all_wildcard_paths()
+        is_valid = any(filepath.startswith(path) for path in all_paths)
+
+        if not is_valid:
+            return web.json_response({"error": "Access denied"}, status=403)
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        return web.json_response({"success": True, "content": content})
+
+    except Exception as e:
+        print(f"[Umi File Editor] Error reading file: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.post("/umiapp/files/write")
+async def write_file(request):
+    """Phase 8: Write content to a file"""
+    try:
+        data = await request.json()
+        filepath = data.get("filepath")
+        content = data.get("content", "")
+
+        if not filepath:
+            return web.json_response({"error": "No filepath provided"}, status=400)
+
+        # Security: ensure file is in wildcard paths
+        all_paths = get_all_wildcard_paths()
+        is_valid = any(filepath.startswith(path) for path in all_paths)
+
+        if not is_valid:
+            return web.json_response({"error": "Access denied"}, status=403)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        return web.json_response({"success": True})
+
+    except Exception as e:
+        print(f"[Umi File Editor] Error writing file: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+@server.PromptServer.instance.routes.post("/umiapp/files/create")
+async def create_file(request):
+    """Phase 8: Create a new file"""
+    try:
+        data = await request.json()
+        filename = data.get("filename")
+
+        if not filename:
+            return web.json_response({"error": "No filename provided"}, status=400)
+
+        # Get first wildcard path
+        all_paths = get_all_wildcard_paths()
+        if not all_paths:
+            return web.json_response({"error": "No wildcard paths configured"}, status=500)
+
+        wildcard_path = all_paths[0]
+        filepath = os.path.join(wildcard_path, filename)
+
+        # Check if file already exists
+        if os.path.exists(filepath):
+            return web.json_response({"error": "File already exists"}, status=400)
+
+        # Create empty file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("")
+
+        return web.json_response({"success": True, "filepath": filepath})
+
+    except Exception as e:
+        print(f"[Umi File Editor] Error creating file: {e}")
+        return web.json_response({"error": str(e)}, status=500)

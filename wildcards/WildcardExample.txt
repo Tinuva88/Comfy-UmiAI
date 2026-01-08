@@ -1,8 +1,0 @@
-Red
-Blue
-Green
-A bright neon pink
-A deep, moody crimson
-A soft pastel yellow
-{Dark|Light} Blue
-[if Cyberpunk: Neon Green | Forest Green]
