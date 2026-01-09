@@ -195,6 +195,26 @@ DOWNLOADABLE_MODELS = {
 
 ALL_KEY = 'all_files_index'
 
+def load_umi_settings():
+    """Load user settings from umi_settings.json"""
+    settings_path = os.path.join(os.path.dirname(__file__), "umi_settings.json")
+    defaults = {
+        'use_folder_paths': False,  # False = __MyFile__, True = __Series/MyFile__
+    }
+    
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                user_settings = json.load(f)
+                defaults.update({k: v for k, v in user_settings.items() if not k.startswith('_')})
+        except Exception as e:
+            print(f"[UmiAI] Warning: Could not load umi_settings.json: {e}")
+    
+    return defaults
+
+# Cache settings at startup
+UMI_SETTINGS = load_umi_settings()
+
 def is_valid_image(image_input):
     """Safe check for image tensor availability."""
     if image_input is None:
@@ -288,7 +308,8 @@ class TagLoader(TagLoaderBase):
         self.loaded_tags = {}
         self.yaml_entries = {}
         self.index_built = False
-        self.ignore_paths = options.get('ignore_paths', True)
+        # Toggle: False = filename only (__MyFile__), True = include folder paths (__Series/MyFile__)
+        self.use_folder_paths = options.get('use_folder_paths', False)
         
         self.txt_lookup = {}
         self.yaml_lookup = {}
@@ -308,16 +329,29 @@ class TagLoader(TagLoaderBase):
             for root, dirs, files in os.walk(location):
                 for file in files:
                     full_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(full_path, location)
-                    key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+                    
+                    # Toggle between filename-only and full path modes
+                    if self.use_folder_paths:
+                        # Full path mode: __Series/A Centaur's Life__
+                        rel_path = os.path.relpath(full_path, location)
+                        key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+                    else:
+                        # Filename only mode: __A Centaur's Life__
+                        key = os.path.splitext(file)[0]
                     
                     name_lower = file.lower()
+                    key_lower = key.lower()
+                    
                     if name_lower.endswith('.txt'):
-                        self.txt_lookup[key.lower()] = full_path
+                        # Handle conflicts by keeping first found
+                        if key_lower not in self.txt_lookup:
+                            self.txt_lookup[key_lower] = full_path
                     elif name_lower.endswith('.yaml'):
-                        self.yaml_lookup[key.lower()] = full_path
+                        if key_lower not in self.yaml_lookup:
+                            self.yaml_lookup[key_lower] = full_path
                     elif name_lower.endswith('.csv'):
-                        self.csv_lookup[key.lower()] = full_path
+                        if key_lower not in self.csv_lookup:
+                            self.csv_lookup[key_lower] = full_path
 
     def load_prompt_file(self, file_key):
         """Phase 6: Load entire .txt file content as a prompt (no parsing)"""
@@ -1353,6 +1387,7 @@ class UmiAIWildcardNode:
                 "lora_tags_behavior": (["Append to Prompt", "Disabled", "Prepend to Prompt"], {"default": "Append to Prompt"}),
                 "lora_max_tags": ("INT", {"default": 5, "min": 0, "max": 20, "step": 1}),
                 "lora_cache_limit": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
+                "use_folder_paths": ("BOOLEAN", {"default": False, "tooltip": "Show folder paths in wildcards: __Series/MyFile__ vs __MyFile__"}),
                 "width": ("INT", {"default": 1024, "min": 64, "max": 8192}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 8192}),
                 
@@ -1713,7 +1748,8 @@ class UmiAIWildcardNode:
         height = self.get_val(kwargs, "height", 1024, int)
         lora_tags_behavior = self.get_val(kwargs, "lora_tags_behavior", "Append to Prompt", str)
         lora_max_tags = self.get_val(kwargs, "lora_max_tags", 5, int)
-        lora_cache_limit = self.get_val(kwargs, "lora_cache_limit", 5, int) 
+        lora_cache_limit = self.get_val(kwargs, "lora_cache_limit", 5, int)
+        use_folder_paths = kwargs.get("use_folder_paths", False)
         input_negative = self.get_val(kwargs, "input_negative", "", str)
 
         # RENAMED INPUTS
@@ -1751,7 +1787,7 @@ class UmiAIWildcardNode:
         options = {
             'verbose': False, 
             'seed': seed,
-            'ignore_paths': True
+            'use_folder_paths': use_folder_paths
         }
 
         all_wildcard_paths = get_all_wildcard_paths()
@@ -1839,10 +1875,6 @@ class UmiAIWildcardNode:
         prompt, settings = self.extract_settings(prompt)
         final_width = settings['width'] if settings['width'] > 0 else width
         final_height = settings['height'] if settings['height'] > 0 else height
-
-        # Escape colons that aren't part of weight syntax to prevent SD misinterpretation
-        prompt = escape_unweighted_colons(prompt)
-        final_negative = escape_unweighted_colons(final_negative)
 
         # Phase 8: Log prompt to history
         log_prompt_to_history(prompt, final_negative, seed)
@@ -2066,9 +2098,10 @@ async def get_loras_metadata(request):
         lora_dir = os.path.dirname(lora_path)
         lora_base_path = os.path.splitext(lora_path)[0]
 
-        # Check for local metadata files (JSON, preview images)
+        # Check for local metadata files (JSON, civitai.info, preview images)
         local_metadata = {}
         local_preview = None
+        civitai_info_tags = []
         
         # Check for .json file next to the LoRA
         json_path = lora_base_path + ".json"
@@ -2078,6 +2111,23 @@ async def get_loras_metadata(request):
                     local_metadata = json.load(f)
             except Exception as e:
                 print(f"[Umi LoRA Browser] Error loading local JSON for {base_name}: {e}")
+        
+        # Check for .civitai.info file (SD-CivitAI Helper format)
+        # Format: "LoRAName.civitai.info" - contains "activation text" field
+        civitai_info_path = lora_base_path + ".civitai.info"
+        if os.path.exists(civitai_info_path):
+            try:
+                with open(civitai_info_path, 'r', encoding='utf-8') as f:
+                    civitai_info = json.load(f)
+                    # Extract activation text if present
+                    activation_text = civitai_info.get("activation text", "")
+                    if activation_text:
+                        civitai_info_tags = [t.strip() for t in activation_text.split(",") if t.strip()]
+                    # Store full civitai info in local_metadata if not already set
+                    if not local_metadata:
+                        local_metadata = civitai_info
+            except Exception as e:
+                print(f"[Umi LoRA Browser] Error loading .civitai.info for {base_name}: {e}")
         
         # Check for preview images (common formats)
         for ext in ['.preview.png', '.preview.jpg', '.preview.jpeg', '.preview.webp', 
@@ -2089,23 +2139,64 @@ async def get_loras_metadata(request):
 
         # Get activation tags from SafeTensors metadata
         tags = lora_handler.get_lora_tags(lora_path, max_tags=10)
+        
+        # Priority for tags: civitai_info_tags > safetensors tags
+        # civitai_info_tags come from .civitai.info "activation text" field
+        final_tags = civitai_info_tags if civitai_info_tags else (tags if tags else [])
 
         # Build lora info with local data priority, then overrides, then CivitAI
         lora_info = {
             "name": base_name,
             "filename": lora_name,
-            "tags": tags if tags else [],
+            "tags": final_tags,
+            "civitai_info_tags": civitai_info_tags,  # Tags from .civitai.info file
+            "safetensor_tags": tags if tags else [],  # Tags from safetensor metadata
             "path": lora_path,
             "civitai": civitai_cache.get(base_name, {}),
             "override": overrides.get(base_name, {}),
-            "local": local_metadata,  # Local JSON data
+            "local": local_metadata,  # Local JSON or .civitai.info data
             "local_preview": local_preview,  # Local preview image path
-            "has_local_data": bool(local_metadata or local_preview)
+            "has_local_data": bool(local_metadata or local_preview or civitai_info_tags)
         }
 
         lora_data.append(lora_info)
 
     return web.json_response({"loras": lora_data})
+
+@server.PromptServer.instance.routes.get("/umiapp/preview")
+async def serve_lora_preview(request):
+    """Serve local LoRA preview images"""
+    import mimetypes
+    
+    path = request.query.get("path", "")
+    if not path:
+        return web.Response(status=400, text="Missing path parameter")
+    
+    # Security: Only allow serving images from loras folder
+    lora_paths = folder_paths.get_folder_paths("loras")
+    path_allowed = False
+    for lora_base in lora_paths:
+        if os.path.commonpath([os.path.abspath(path), os.path.abspath(lora_base)]) == os.path.abspath(lora_base):
+            path_allowed = True
+            break
+    
+    if not path_allowed:
+        return web.Response(status=403, text="Access denied")
+    
+    if not os.path.exists(path):
+        return web.Response(status=404, text="File not found")
+    
+    # Determine content type
+    mime_type, _ = mimetypes.guess_type(path)
+    if not mime_type or not mime_type.startswith("image/"):
+        return web.Response(status=400, text="Not an image file")
+    
+    try:
+        with open(path, 'rb') as f:
+            content = f.read()
+        return web.Response(body=content, content_type=mime_type)
+    except Exception as e:
+        return web.Response(status=500, text=str(e))
 
 @server.PromptServer.instance.routes.post("/umiapp/refresh")
 async def refresh_wildcards(request):
@@ -2117,7 +2208,7 @@ async def refresh_wildcards(request):
     GLOBAL_INDEX['tags'] = set()
     
     all_paths = get_all_wildcard_paths()
-    options = {'ignore_paths': True, 'verbose': False}
+    options = {'use_folder_paths': UMI_SETTINGS.get('use_folder_paths', False), 'verbose': False}
     loader = TagLoader(all_paths, options)
     loader.build_index() 
     
@@ -2738,7 +2829,7 @@ async def get_yaml_tags(request):
     """Phase 8: Export all YAML tags with their entries"""
     try:
         all_wildcard_paths = get_all_wildcard_paths()
-        tag_loader = TagLoader(all_wildcard_paths, {'verbose': False, 'seed': 0})
+        tag_loader = TagLoader(all_wildcard_paths, {'use_folder_paths': UMI_SETTINGS.get('use_folder_paths', False), 'verbose': False, 'seed': 0})
 
         # Build complete index
         tag_loader.build_index()
@@ -2827,7 +2918,7 @@ async def get_yaml_stats(request):
     """Phase 8: Get YAML statistics"""
     try:
         all_wildcard_paths = get_all_wildcard_paths()
-        tag_loader = TagLoader(all_wildcard_paths, {'verbose': False, 'seed': 0})
+        tag_loader = TagLoader(all_wildcard_paths, {'use_folder_paths': UMI_SETTINGS.get('use_folder_paths', False), 'verbose': False, 'seed': 0})
         tag_loader.build_index()
 
         yaml_entries = tag_loader.yaml_entries

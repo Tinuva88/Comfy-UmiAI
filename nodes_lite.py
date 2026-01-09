@@ -53,6 +53,7 @@ def get_all_wildcard_paths():
 class TagLoader(TagLoaderBase):
     def __init__(self, wildcard_paths, options):
         super().__init__(wildcard_paths, options)
+        self.use_folder_paths = options.get('use_folder_paths', False)
         self.build_index()
 
     def build_index(self):
@@ -68,11 +69,19 @@ class TagLoader(TagLoaderBase):
             for root, dirs, files in os.walk(wildcard_path):
                 for file in files:
                     if file.endswith(('.txt', '.yaml', '.yml', '.csv')):
-                        name_without_ext = os.path.splitext(file)[0]
-                        self.files_index.add(name_without_ext)
+                        # Toggle between filename-only and full path modes
+                        full_path = os.path.join(root, file)
+                        if self.use_folder_paths:
+                            # Full path mode: __Series/A Centaur's Life__
+                            rel_path = os.path.relpath(full_path, wildcard_path)
+                            key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+                        else:
+                            # Filename only mode: __A Centaur's Life__
+                            key = os.path.splitext(file)[0]
+                        
+                        self.files_index.add(key)
 
                         if file.endswith(('.yaml', '.yml')):
-                            full_path = os.path.join(root, file)
                             self.scan_yaml_for_tags(full_path)
 
         GLOBAL_INDEX_LITE['built'] = True
@@ -765,6 +774,8 @@ class UmiAIWildcardNodeLite:
                 # Basic Settings
                 "lora_tags_behavior": (["Append to Prompt", "Disabled", "Prepend to Prompt"], {"default": "Append to Prompt"}),
                 "lora_cache_limit": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
+                "auto_clean": ("BOOLEAN", {"default": True, "tooltip": "Auto-clean prompt: remove extra commas/spaces, fix BREAK formatting"}),
+                "use_folder_paths": ("BOOLEAN", {"default": False, "tooltip": "Show folder paths in wildcards: __Series/MyFile__ vs __MyFile__"}),
                 "width": ("INT", {"default": 1024, "min": 64, "max": 8192}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 8192}),
                 "input_negative": ("STRING", {"multiline": True, "forceInput": True}),
@@ -820,6 +831,43 @@ class UmiAIWildcardNodeLite:
 
         return val
 
+    def clean_prompt(self, text):
+        """Clean prompt: remove extra commas/spaces, fix BREAK formatting.
+        
+        - Removes multiple consecutive commas
+        - Removes extra spaces
+        - Removes commas before and after BREAK
+        - Ensures one space before and after BREAK
+        """
+        import re
+        
+        # First, normalize all whitespace to single spaces
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove multiple consecutive commas (with optional spaces between)
+        text = re.sub(r',\s*,+', ',', text)
+        text = re.sub(r',\s*,', ',', text)  # catch any remaining
+        
+        # Clean spaces around commas: remove space before comma, normalize after
+        text = re.sub(r'\s+,', ',', text)  # no space before comma
+        text = re.sub(r',\s+', ', ', text)  # single space after comma
+        
+        # Handle BREAK keyword (case insensitive)
+        # Remove commas and extra spaces around BREAK, ensure " BREAK "
+        # Pattern: optional comma/spaces, BREAK, optional comma/spaces
+        text = re.sub(r'[,\s]*\bBREAK\b[,\s]*', ' BREAK ', text, flags=re.IGNORECASE)
+        
+        # Normalize multiple BREAKs with stuff between
+        text = re.sub(r'BREAK\s+BREAK', 'BREAK', text, flags=re.IGNORECASE)
+        
+        # Final cleanup
+        text = re.sub(r'\s+', ' ', text)  # normalize spaces again
+        text = text.strip().strip(',')
+        text = re.sub(r'^,\s*', '', text)  # remove leading comma
+        text = re.sub(r'\s*,$', '', text)  # remove trailing comma
+        
+        return text
+
     def process(self, **kwargs):
         text = self.get_val(kwargs, "text", "", str)
         seed = self.get_val(kwargs, "seed", 0, int)
@@ -838,6 +886,8 @@ class UmiAIWildcardNodeLite:
 
         lora_tags_behavior = self.get_val(kwargs, "lora_tags_behavior", "Append to Prompt", str)
         lora_cache_limit = self.get_val(kwargs, "lora_cache_limit", 5, int)
+        auto_clean = self.get_val(kwargs, "auto_clean", True, bool) if kwargs.get("auto_clean") is not None else True
+        use_folder_paths = self.get_val(kwargs, "use_folder_paths", False, bool) if kwargs.get("use_folder_paths") is not None else False
         input_negative = self.get_val(kwargs, "input_negative", "", str)
 
         # ============================================================
@@ -870,7 +920,7 @@ class UmiAIWildcardNodeLite:
         options = {
             'verbose': False,
             'seed': seed,
-            'ignore_paths': True
+            'use_folder_paths': use_folder_paths
         }
 
         all_wildcard_paths = get_all_wildcard_paths()
@@ -938,9 +988,12 @@ class UmiAIWildcardNodeLite:
         # Strip negative tags from prompt
         prompt = neg_gen.strip_negative_tags(prompt)
 
-        # Cleanup
-        prompt = re.sub(r',\s*,', ',', prompt)
-        prompt = re.sub(r'\s+', ' ', prompt).strip().strip(',')
+        # Cleanup (enhanced with BREAK handling if auto_clean enabled)
+        if auto_clean:
+            prompt = self.clean_prompt(prompt)
+        else:
+            prompt = re.sub(r',\s*,', ',', prompt)
+            prompt = re.sub(r'\s+', ' ', prompt).strip().strip(',')
 
         # Extract and load LoRAs
         prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(prompt, model, clip, lora_tags_behavior, lora_cache_limit)
@@ -957,10 +1010,6 @@ class UmiAIWildcardNodeLite:
         prompt, settings = self.extract_settings(prompt)
         final_width = settings['width'] if settings['width'] > 0 else width
         final_height = settings['height'] if settings['height'] > 0 else height
-
-        # Escape colons that aren't part of weight syntax to prevent SD misinterpretation
-        prompt = escape_unweighted_colons(prompt)
-        final_negative = escape_unweighted_colons(final_negative)
 
         # Phase 8: Log prompt to history
         log_prompt_to_history(prompt, final_negative, seed)

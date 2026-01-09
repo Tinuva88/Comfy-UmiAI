@@ -580,36 +580,59 @@ function lintPrompt(text) {
         errors.push({ type: 'unclosed', message: 'Unclosed brace {', index: braceStart, length: 1 });
     }
 
-    // 2. Check for unclosed wildcards __ (improved pattern)
-    // Look for __ followed by valid wildcard characters that don't end with __
-    // This finds cases like "__colors" without the closing "__"
-    const unclosedWildcardRe = /__([a-zA-Z0-9_\-\/]+)(?!__)/g;
-    let lastWildcardMatch = null;
-    let wcTestMatch;
+    // 2. Check for unclosed wildcards __ 
+    // A wildcard is unclosed if we find __ that doesn't have a matching closing __
+    // We use the non-greedy approach and validate against known wildcards cache
+    let unclosedStart = -1;
+    let searchPos = 0;
 
-    // Find all potential wildcard starts
-    while ((wcTestMatch = unclosedWildcardRe.exec(text)) !== null) {
-        // Check if this is actually unclosed (not followed by __)
-        const afterMatch = text.slice(wcTestMatch.index + wcTestMatch[0].length);
-        // If the next characters are __, it's closed - skip it
-        if (afterMatch.startsWith('__')) {
+    while (searchPos < text.length) {
+        const startIdx = text.indexOf('__', searchPos);
+        if (startIdx === -1) break;
+
+        // Look for closing __ after this opening
+        const afterStart = startIdx + 2;
+        const endIdx = text.indexOf('__', afterStart);
+
+        if (endIdx === -1) {
+            // No closing __ found - this is unclosed
+            unclosedStart = startIdx;
+            break;
+        }
+
+        // Check if the content between __ __ is valid (exists in cache or is a special pattern)
+        const content = text.substring(afterStart, endIdx);
+
+        // Skip if content is empty
+        if (content.trim() === '') {
+            searchPos = afterStart;
             continue;
         }
-        // If we're at the end of text or followed by non-wildcard chars, it might be unclosed
-        // But only if there's no closing __ anywhere after
-        const restOfText = text.slice(wcTestMatch.index);
-        const fullWildcard = restOfText.match(/^__[\w\-\/]+__/);
-        if (!fullWildcard) {
-            lastWildcardMatch = wcTestMatch;
+
+        // Skip special patterns (these are always valid syntax-wise)
+        if (content.startsWith('@') || content.startsWith('~') || content.includes('$$') || content.includes('[')) {
+            searchPos = endIdx + 2;
+            continue;
         }
+
+        // If we have the cache, validate. If content exists in cache, it's a valid closed wildcard
+        if (knownWildcards.length > 0) {
+            const normalizedContent = content.toLowerCase().trim();
+            const existsInCache = knownWildcards.some(w => w.toLowerCase().trim() === normalizedContent);
+            if (existsInCache) {
+                // Valid wildcard - skip to after the closing __
+                searchPos = endIdx + 2;
+                continue;
+            }
+        }
+
+        // Even if not in cache, the wildcard has proper syntax (both opening and closing __)
+        // So it's not "unclosed", just potentially missing from the database
+        searchPos = endIdx + 2;
     }
 
-    if (lastWildcardMatch && !text.slice(lastWildcardMatch.index).match(/^__[\w\-\/]+__/)) {
-        // Double check it's actually unclosed
-        const textAfterStart = text.slice(lastWildcardMatch.index);
-        if (!textAfterStart.match(/^__[\w\-\/]+__/)) {
-            errors.push({ type: 'unclosed', message: 'Unclosed wildcard __', index: lastWildcardMatch.index, length: lastWildcardMatch[0].length });
-        }
+    if (unclosedStart !== -1) {
+        errors.push({ type: 'unclosed', message: 'Unclosed wildcard __', index: unclosedStart, length: 2 });
     }
 
     // 3. Check for unclosed tag selections <[
@@ -636,28 +659,53 @@ function lintPrompt(text) {
         errors.push({ type: 'unclosed', message: 'Unclosed conditional [if ...]', index: ifMatch.index, length: ifMatch[0].length });
     }
 
-    // 5. Check for missing wildcard files (only if we have the list)
+    // 5. Check for missing wildcard files (validate against wildcard cache)
+    // Priority: Cache existence check overrides standard linting
     if (knownWildcards.length > 0) {
-        const wildcardRe = /__([a-zA-Z0-9_\-\/]+)__/g;
-        let wcMatch;
-        while ((wcMatch = wildcardRe.exec(text)) !== null) {
-            const wcName = wcMatch[1];
-            // Skip special prefixes
-            if (wcName.startsWith('@') || wcName.startsWith('~') || wcName.includes('[')) continue;
-            // Skip if it looks like a range ($$)
-            if (wcMatch[0].includes('$$')) continue;
-            // Skip if inside a variable definition (resolved at runtime)
-            if (isInsideVariableDefinition(text, wcMatch.index)) continue;
+        // Normalize cache keys to lowercase for case-insensitive matching
+        const knownWildcardsLower = knownWildcards.map(w => w.toLowerCase().trim());
 
-            const normalizedName = wcName.toLowerCase();
-            const exists = knownWildcards.some(w => w.toLowerCase() === normalizedName);
-            if (!exists) {
+        // Use non-greedy regex that captures everything between __ including spaces
+        const wildcardRegex = /__([\s\S]+?)__/g;
+        let wcMatch;
+
+        while ((wcMatch = wildcardRegex.exec(text)) !== null) {
+            const wcName = wcMatch[1];
+            const fullMatch = wcMatch[0];
+
+            // Skip special prefixes (prompt files @, sequential ~, logic [)
+            if (wcName.startsWith('@') || wcName.startsWith('~') || wcName.includes('[')) {
+                continue;
+            }
+
+            // Skip if it looks like a range ($$)
+            if (fullMatch.includes('$$')) {
+                continue;
+            }
+
+            // Skip if empty or whitespace only
+            if (wcName.trim() === '') {
+                continue;
+            }
+
+            // Skip if inside a variable definition (resolved at runtime)
+            if (isInsideVariableDefinition(text, wcMatch.index)) {
+                continue;
+            }
+
+            // PRIORITY CHECK: Validate against wildcard cache
+            // If the exact string (normalized) exists in cache, PASS - no error
+            const normalizedName = wcName.toLowerCase().trim();
+            const existsInCache = knownWildcardsLower.includes(normalizedName);
+
+            // Only flag as error if NOT in cache
+            if (!existsInCache) {
                 errors.push({
                     type: 'missing',
                     message: `Wildcard file not found: ${wcName}`,
                     index: wcMatch.index,
-                    length: wcMatch[0].length,
-                    content: wcMatch[0]
+                    length: fullMatch.length,
+                    content: fullMatch
                 });
             }
         }
@@ -734,8 +782,8 @@ function highlightSyntax(text, errors = []) {
     result = result.replace(/(__[\d\-]+\$\$[^_]+__)/g, '<span class="umi-hl-range">$1</span>');
     result = result.replace(/(__~[\w\-\/\s]+__)/g, '<span class="umi-hl-range">$1</span>');
 
-    // 6. Regular wildcards: __tag__ (including spaces like __eye color__)
-    result = result.replace(/(__[\w\-\/\[\]\s]+__)/g, '<span class="umi-hl-wildcard">$1</span>');
+    // 6. Regular wildcards: __tag__ (including spaces, apostrophes, etc. like __A Centaur's Life__)
+    result = result.replace(/(__[\w\-\/\[\]\s']+__)/g, '<span class="umi-hl-wildcard">$1</span>');
 
     // 7. Conditionals: [if condition: true | false]
     result = result.replace(/(\[if\s+[^\]]+\])/gi, '<span class="umi-hl-conditional">$1</span>');

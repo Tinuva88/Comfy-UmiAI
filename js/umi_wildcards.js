@@ -474,7 +474,7 @@ CyberKnight:
     </div>
 
     <div class="umi-section">
-        <h3>🎲 Advanced Features (Phase 2-4)</h3>
+        <h3>🎲 Advanced Features</h3>
 
         <details>
             <summary>⚖️ Weighted Wildcards (NEW)</summary>
@@ -554,6 +554,109 @@ A portrait with $theme_outfit
                 </div>
             </div>
         </details>
+    </div>
+
+    <div class="umi-section">
+        <h3>👤 Character Consistency System</h3>
+        <p>Maintain consistent characters across generations with YAML profiles!</p>
+
+        <div class="umi-grid-2">
+            <div>
+                <h4 style="margin-top:0">Character Syntax</h4>
+                <table class="umi-table">
+                    <tr><td><span class="umi-code">@@name@@</span></td><td>Character only</td></tr>
+                    <tr><td><span class="umi-code">@@name:outfit@@</span></td><td>With outfit</td></tr>
+                    <tr><td><span class="umi-code">@@name:outfit:emotion@@</span></td><td>Full syntax</td></tr>
+                </table>
+            </div>
+            <div>
+                <h4 style="margin-top:0">Character Nodes</h4>
+                <ul style="margin:5px 0; padding-left:20px; font-size:13px">
+                    <li><strong>Character Manager</strong> - Single character builder</li>
+                    <li><strong>Character Batch</strong> - Generate all variations</li>
+                    <li><strong>Sprite Export</strong> - Organized image output</li>
+                    <li><strong>Character Info</strong> - Debug profiles</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="callout callout-info" style="margin-top:10px">
+            <strong>💡 Create profiles in:</strong> <code>characters/name/profile.yaml</code>
+        </div>
+    </div>
+
+    <div class="umi-section">
+        <h3>🎬 Power Features</h3>
+
+        <details>
+            <summary>📷 Camera Control</summary>
+            <p>Generate camera angle prompts for multi-angle LoRAs!</p>
+            <div class="umi-grid-2">
+                <div>
+                    <h4 style="margin-top:0">Camera Control Node</h4>
+                    <ul style="margin:5px 0; padding-left:20px; font-size:12px">
+                        <li>Azimuth: 0-360° (snaps to 45°)</li>
+                        <li>Elevation: -30° to 60°</li>
+                        <li>Distance: close-up, medium, wide</li>
+                        <li>Configurable trigger word</li>
+                    </ul>
+                </div>
+                <div>
+                    <h4 style="margin-top:0">Visual Camera Control</h4>
+                    <p style="font-size:12px">Interactive canvas widget - drag to set camera angle!</p>
+                </div>
+            </div>
+        </details>
+
+        <details>
+            <summary>🎭 Pose Library & Expression Mixer</summary>
+            <p>Pre-built poses and emotion blending!</p>
+            <div class="umi-grid-2">
+                <div>
+                    <h4 style="margin-top:0">Pose Library</h4>
+                    <p style="font-size:12px">30+ poses: standing, sitting, action, expressive, lying, kneeling</p>
+                    <p style="font-size:12px">Edit <code>presets/poses.yaml</code> to add custom poses!</p>
+                </div>
+                <div>
+                    <h4 style="margin-top:0">Expression Mixer</h4>
+                    <p style="font-size:12px">40+ emotions with weighted blending</p>
+                    <p style="font-size:12px">Example: happy:60% + excited:40%</p>
+                </div>
+            </div>
+        </details>
+
+        <details>
+            <summary>🎨 Scene Composer</summary>
+            <p>Combine backgrounds, lighting, and atmosphere presets!</p>
+            <ul style="margin:5px 0; padding-left:20px; font-size:12px">
+                <li>50+ backgrounds (studio, outdoor, indoor, fantasy, sci-fi)</li>
+                <li>11 lighting styles (natural, dramatic, neon, cinematic)</li>
+                <li>10 atmosphere presets (cheerful, mysterious, romantic)</li>
+            </ul>
+            <p style="font-size:12px">Edit <code>presets/scenes.yaml</code> to add custom scenes!</p>
+        </details>
+
+        <details>
+            <summary>📊 LoRA Dataset Export</summary>
+            <p>Generate training data for LoRA fine-tuning!</p>
+            <ul style="margin:5px 0; padding-left:20px; font-size:12px">
+                <li><strong>Kohya-compatible</strong> folder structure</li>
+                <li>Auto-generated captions</li>
+                <li>Flip augmentation support</li>
+                <li>Caption nodes for processing external captioner output</li>
+            </ul>
+        </details>
+    </div>
+
+    <div class="umi-section">
+        <h3>📦 Bundled Wildcards</h3>
+        <p>Ready-to-use wildcards in the <code>wildcards/</code> folder:</p>
+        <table class="umi-table">
+            <tr><td><span class="umi-code">__poses__</span></td><td>40+ character poses</td></tr>
+            <tr><td><span class="umi-code">__emotions__</span></td><td>45+ facial expressions</td></tr>
+            <tr><td><span class="umi-code">__backgrounds__</span></td><td>40+ environments</td></tr>
+            <tr><td><span class="umi-code">__lighting__</span></td><td>30+ lighting setups</td></tr>
+        </table>
     </div>
 
     <div class="umi-section">

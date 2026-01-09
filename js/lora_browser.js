@@ -323,15 +323,20 @@ class LoraBrowserPanel {
     createLoraCard(lora) {
         const civitai = lora.civitai || {};
         const override = lora.override || {};
+        const local = lora.local || {};
         const hasCivitai = civitai.id !== undefined;
         const hasOverride = Object.keys(override).length > 0;
+        const hasCivitaiInfo = lora.civitai_info_tags && lora.civitai_info_tags.length > 0;
 
-        // Priority: override > civitai > safetensors tags
+        // Priority: override > civitai_info (from .civitai.info file) > civitai API > safetensors tags
         const displayName = override.nickname || lora.name;
 
         let displayTags = [];
         if (override.tags && override.tags.length > 0) {
             displayTags = override.tags.slice(0, 5);
+        } else if (hasCivitaiInfo) {
+            // Tags from .civitai.info file "activation text" field
+            displayTags = lora.civitai_info_tags.slice(0, 5);
         } else if (hasCivitai && civitai.trigger_words && civitai.trigger_words.length > 0) {
             displayTags = civitai.trigger_words.slice(0, 5);
         } else if (lora.tags && lora.tags.length > 0) {
@@ -342,7 +347,17 @@ class LoraBrowserPanel {
             ? displayTags.map(tag => `<span style="background: #3e4451; padding: 2px 6px; border-radius: 3px; font-size: 10px;">${tag}</span>`).join(" ")
             : '<span style="color: #666; font-size: 11px;">No tags</span>';
 
-        const previewUrl = override.preview_url || (hasCivitai && civitai.preview_url) || null;
+        // Preview priority: override > local file (.preview.png etc) > civitai API
+        let previewUrl = null;
+        if (override.preview_url) {
+            previewUrl = override.preview_url;
+        } else if (lora.local_preview) {
+            // Local preview file - need to serve via API
+            previewUrl = `/umiapp/preview?path=${encodeURIComponent(lora.local_preview)}`;
+        } else if (hasCivitai && civitai.preview_url) {
+            previewUrl = civitai.preview_url;
+        }
+
         const previewHtml = previewUrl
             ? `<div style="width: 100%; height: 120px; background: url('${previewUrl}') center/cover; border-radius: 4px; margin-bottom: 8px;"></div>`
             : '';
@@ -721,6 +736,19 @@ class LoraBrowserPanel {
         }
 
         this.element.style.display = "flex";
+
+        // Show loading message while fetching
+        const grid = this.element.querySelector(".umi-lora-grid");
+        if (grid) {
+            grid.innerHTML = `
+                <div style="grid-column: 1/-1; text-align: center; color: #888; padding: 60px;">
+                    <div style="font-size: 48px; margin-bottom: 15px;">⏳</div>
+                    <div style="font-size: 16px; font-weight: 600; color: #61afef; margin-bottom: 8px;">Loading LoRAs...</div>
+                    <div style="font-size: 12px;">This may take a few seconds depending on how many LoRAs you have.</div>
+                </div>
+            `;
+        }
+
         await this.fetchLoras();
         this.renderLoras();
     }

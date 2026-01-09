@@ -1,0 +1,4 @@
+{
+    "use_folder_paths": false,
+    "_comment": "Set use_folder_paths to true to show wildcards as __Series/MyFile__ instead of __MyFile__"
+}
