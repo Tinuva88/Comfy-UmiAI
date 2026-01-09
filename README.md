@@ -6,12 +6,7 @@
 
 UmiAI transforms static prompts into dynamic, context-aware workflows. It introduces **Persistent Variables**, **Advanced Boolean Logic**, **Native LoRA Loading**, **Local LLM Integration**, **Vision Models**, and **External Data Fetching** directly into your prompt text box—all in a single, powerful ComfyUI node.
 
-> 🚨 **CRITICAL UPDATE NOTICE** 🚨
->
-> **If you are updating from an older version:**
-> The internal logic engine has been completely rewritten. You **MUST** right-click the UmiAI Node in your workflow and select **Fix Node (Recreate)** (or delete and re-add it).
->
-> If you do not do this, the new inputs and logic operators will not load, and your workflow may fail.
+> 💡 **Note:** If your workflow has issues after updating, right-click the UmiAI Node and select **Fix Node (Recreate)** to reset it with correct default values.
 
 ---
 
@@ -22,18 +17,30 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 * **🧠 Persistent Variables:** Define a choice once (`$hair={Red|Blue}`) and reuse it (`$hair`) anywhere to ensure consistency across your prompt.
 * **🎲 Dynamic Wildcards:** Replace `__tagname__` with random selections from text files, with support for weighted ranges (`1-3$$tagname`).
 * **🔄 Random Choices:** Use `{option1|option2|option3}` to randomly pick variants within your prompt.
-* **📊 Weighted Choices (NEW v1.5):** Use `{25%Red|75%Blue}` for precise probability control over random selections.
+* **📊 Weighted Choices:** Use `{25%Red|75%Blue}` for precise probability control over random selections.
 * **💬 Comment Support:** Add `//` or `#` comments to document your complex prompts without affecting output.
 
-### ✨ Editor Features (NEW in v1.5)
-* **🎨 Syntax Highlighting:** Real-time color coding for wildcards (orange), tags (green), choices (yellow), variables (purple), LoRAs (blue), and conditionals (cyan).
-* **🔍 Prompt Linting:** Automatic error detection for unclosed brackets, missing wildcards, and missing LoRAs. Green bar = no issues, red bar = errors found.
-* **💡 Smart Autocomplete:** Type trigger characters to see intelligent suggestions:
-  - `__` → Wildcard files (.txt)
+### ✨ Editor Features
+* **🎨 Syntax Highlighting:** Real-time color coding:
+  - Green: Wildcards (`__tag__`), Prompt files (`__@file__`)
+  - Blue: YAML tags (`<[tag]>`)
+  - Yellow: Dynamic choices (`{a|b}`)
+  - Gold: Range wildcards (`__2-4$$tag__`)
+  - Purple: Variables (`$var`)
+  - Cyan: Conditionals (`[if:]`)
+  - Teal: Functions (`[shuffle:]`, `[clean:]`)
+  - Orange: LoRAs (`<lora:>`)
+  - Magenta: BREAK keyword
+  - Red: Negatives (`**neg**`)
+* **🔍 Prompt Linting:** Automatic error detection with expandable error panel. Click the lint bar to see all issues.
+* **🔧 Syntax Fix:** Click Fix buttons to automatically repair broken syntax (brackets, wildcards, YAML tags).
+* **🧹 Auto-Clean:** Toggle button to automatically clean up spaces, commas, and format BREAK keywords.
+* **💡 Smart Autocomplete:** Type trigger characters for suggestions:
+  - `__` → Wildcard files
   - `<[` → YAML tags
   - `<lora:` → LoRA models
   - `$` → Variables from globals.yaml
-* **👁️ Wildcard Preview:** Hover over any `__wildcard__` to see its contents (first 15 entries).
+* **👁️ Wildcard Preview:** Hover over any `__wildcard__` to see its contents.
 
 ### 🤖 AI-Powered Features
 * **👁️ Vision Models (Optional):** Use `[VISION: custom instruction]` to describe images with local AI models (JoyCaption Alpha-2, LLava-1.5).
@@ -44,12 +51,12 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 ### 🎯 LoRA Management
 * **🔋 Native LoRA Loading:** Type `<lora:filename:1.0>` directly in the text. The node patches the model internally—no external LoRA Loader nodes required.
 * **📦 LoRA Browser (Ctrl+L):** Visual grid browser with preview images, search, strength slider, and one-click insertion.
-* **🌐 CivitAI Integration (NEW v1.5):** Fetch metadata, preview images, and trigger words from CivitAI with batch or per-card fetch buttons.
+* **🌐 CivitAI Integration:** Fetch metadata, preview images, and trigger words from CivitAI with batch or per-card fetch buttons.
 * **🛠️ Z-Image Support:** Automatically detects and fixes Z-Image format LoRAs (QKV Fusion) on the fly.
 * **📊 LoRA Metadata Extraction:** Automatically pulls training tags from LoRA safetensors files for enhanced prompting.
 * **💾 LRU Caching:** Efficient LoRA memory management with configurable cache limits.
 
-### 🖼️ Browser Panels (NEW in v1.5)
+### 🖼️ Browser Panels
 * **📦 LoRA Browser (Ctrl+L):** Browse, search, and insert LoRAs with CivitAI metadata and preview images.
 * **🖼️ Image Browser (Ctrl+I):** Booru-style gallery for generated images with metadata extraction and prompt copying.
 * **💾 Preset Manager (Ctrl+P):** Save and load complete node configurations instantly.
@@ -137,6 +144,7 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 | **Wildcards** | `__filename__` | `__colors__` |
 | **Weighted Range** | `1-3$$filename` | `2-4$$accessories__` |
 | **YAML Tags** | `<[tagname]>` | `<[Demihuman]>` |
+| **Character** | `@@name:outfit:emotion@@` | `@@elena:casual:happy@@` |
 | **Danbooru** | `char:name` | `char:tifa_lockhart` |
 | **Vision AI** | `[VISION: instruction]` | `[VISION: describe the mood]` |
 | **LLM Naturalize** | `[LLM: tags]` | `[LLM: 1girl, solo, beach]` |
@@ -144,7 +152,7 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 | **Negative Prompt** | `--neg: text` | `--neg: blurry, low quality` |
 | **Comments** | `//` or `#` | `// This is a comment` |
 
-### ⌨️ Keyboard Shortcuts (NEW in v1.5)
+### ⌨️ Keyboard Shortcuts
 
 | Shortcut | Action |
 | :--- | :--- |
@@ -155,6 +163,8 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 | **Ctrl+Y** | Open YAML Tag Manager |
 | **Ctrl+E** | Open File Editor |
 | **Ctrl+?** | Open Shortcuts & Syntax Reference |
+| **Ctrl+M** | Open Model Manager |
+| **Ctrl+Shift+B** | Fix syntax errors (in text field) |
 | **ESC** | Close any panel |
 
 ---
@@ -314,6 +324,221 @@ UmiAI uses LRU (Least Recently Used) caching to efficiently manage LoRA models i
 * Loading LoRAs only when needed
 * Removing old LoRAs when memory limits are reached
 * Garbage collection for optimal memory usage
+
+---
+
+## 🎭 Character Consistency System
+
+Maintain consistent character appearances across multiple generations with outfit and emotion variations.
+
+### Character Folder Structure
+```
+ComfyUI-UmiAI/
+└── characters/
+    ├── elena/
+    │   ├── profile.yaml      # Character definition
+    │   └── reference.png     # Reference image for IP-Adapter
+    └── kai/
+        ├── profile.yaml
+        └── reference.png
+```
+
+### Creating a Character Profile
+
+Create `characters/[name]/profile.yaml`:
+
+```yaml
+name: Elena
+base_prompt: 'elena, silver hair, long hair, blue eyes, fair skin'
+lora: elena_character_v1
+lora_strength: 0.8
+
+outfits:
+  casual:
+    prompt: 'casual clothes, t-shirt, jeans'
+  formal:
+    prompt: 'elegant black dress, high heels'
+  combat:
+    prompt: 'battle armor, wielding sword'
+
+emotions:
+  happy: 'smiling, happy expression, bright eyes'
+  sad: 'tearful eyes, sad expression'
+  angry: 'furrowed brow, intense eyes'
+```
+
+### Inline Syntax
+
+Use the `@@character:outfit:emotion@@` syntax directly in your prompts:
+
+```text
+// Base character only
+@@elena@@
+
+// With outfit
+@@elena:casual@@
+
+// With outfit and emotion (full)
+@@elena:casual:happy@@
+
+// Combine with other features
+A portrait of @@elena:formal:happy@@ in a garden, __ArtStyle__
+```
+
+### Character Manager Node
+
+**UmiAI Character Manager** - Single character prompt builder:
+- Inputs: character (dropdown), outfit, emotion, pose
+- Outputs: `prompt`, `negative`, `lora_string`, `reference_image`, `pose_image`
+- Connect `reference_image` to IP-Adapter, `pose_image` to ControlNet
+
+### Character Batch Generator Node
+
+**UmiAI Character Batch Generator** - Generate all variations:
+- Modes: `all_outfits`, `all_emotions`, `all_poses`, `outfit_emotion_matrix`
+- Outputs: `prompts_list`, `labels_list`, `count`
+- Use with batch processing nodes for sprite sheet generation
+
+### Sprite Export Node
+
+**UmiAI Sprite Export** - Organized output:
+- Saves to: `output/sprites/character/outfit/emotion_pose.png`
+- Formats: PNG, WebP
+- Auto-organizes by character for easy management
+
+### Character Info Node
+
+**UmiAI Character Info** - Profile debugging:
+- Outputs: character_info, outfits_list, emotions_list, poses_list, counts
+- Useful for workflow planning and debugging
+
+### API Endpoint
+
+Access character data via API for external tools:
+```
+GET /umiapp/characters
+```
+Returns: character names, outfits, emotions, poses for each profile
+
+---
+
+## 🎬 Camera Control & Pose System
+
+### Camera Control Nodes
+
+Generate camera angle prompts for multi-angle LoRAs:
+
+| Node | Description |
+| :--- | :--- |
+| **UmiAI Camera Control** | Slider-based azimuth/elevation/distance |
+| **UmiAI Visual Camera Control** | Interactive canvas widget |
+
+**Features:**
+- Azimuth: 0-360° (snaps to 45° increments)
+- Elevation: -30° to 60° (low angle → high angle)
+- Distance: close-up, medium shot, wide shot
+- Configurable trigger word (default: `<sks>`)
+
+**Output example:** `<sks> front view eye-level shot medium shot`
+
+### Pose Library
+
+**UmiAI Pose Library** - 30+ built-in poses loaded from `presets/poses.yaml`:
+- Categories: standing, sitting, action, expressive, lying, kneeling, leaning
+- Outputs: `pose_prompt`, `pose_tags`
+
+### Expression Mixer
+
+**UmiAI Expression Mixer** - Blend emotions with weights:
+- 40+ emotions from `presets/emotions.yaml`
+- Mix up to 3 emotions with percentage weights
+- Example: happy:60% + excited:40%
+
+### Scene Composer
+
+**UmiAI Scene Composer** - Combine backgrounds, lighting, atmosphere:
+- 50+ backgrounds from `presets/scenes.yaml`
+- 11 lighting styles
+- 10 atmosphere presets
+
+### Adding Custom Presets
+
+Edit the YAML files in `presets/` folder:
+
+```yaml
+# In presets/poses.yaml
+my_custom_pose:
+  prompt: "your pose description"
+  tags: ["tag1", "tag2"]
+```
+
+---
+
+## 📊 LoRA Dataset Generation
+
+Generate training data for LoRA fine-tuning:
+
+### Dataset Export
+
+**UmiAI Dataset Export** - Kohya-compatible output:
+- Formats: kohya, dreambooth, simple
+- Auto-generates captions from character profiles
+- Flip augmentation support
+- Configurable repeats
+
+### Caption Nodes
+
+| Node | Description |
+| :--- | :--- |
+| **UmiAI Auto Caption** | Wrapper for external captioners (BLIP, WD14) |
+| **UmiAI Caption Enhancer** | Combine captions with character info |
+| **UmiAI Caption Generator** | Build captions from components |
+
+---
+
+## 📦 Bundled Wildcards
+
+UmiAI includes ready-to-use wildcards in the `wildcards/` folder:
+
+| Wildcard | Contents |
+| :--- | :--- |
+| `__poses__` | 40+ character poses |
+| `__emotions__` | 45+ facial expressions |
+| `__backgrounds__` | 40+ environments |
+| `__lighting__` | 30+ lighting setups |
+
+**Usage in prompts:**
+```text
+A portrait of @@elena:casual@@ with __emotions__, __poses__, __backgrounds__, __lighting__
+```
+
+---
+
+## 🔧 Model Manager
+
+Download recommended models directly in ComfyUI:
+
+**Open:** Press `Ctrl+Shift+M`
+
+### Available Categories:
+- **Character LoRAs** - Consistency LoRAs
+- **ControlNets** - Pose, depth, canny
+- **YOLO/SAM** - Detection and segmentation
+- **Captioners** - BLIP, WD14, Florence-2
+- **Upscalers** - 2x and 4x models
+
+---
+
+## 🎥 Sample Workflows
+
+Import ready-to-use workflows from `workflows/` folder:
+
+| Workflow | Description |
+| :--- | :--- |
+| `character_basic.json` | Character Manager → Sampler |
+| `character_batch.json` | Batch Generator → Sprite Export |
+| `camera_control.json` | Visual Camera → Character |
+| `lora_dataset.json` | Full dataset generation pipeline |
 
 ---
 

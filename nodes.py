@@ -31,7 +31,8 @@ from aiohttp import web
 from .shared_utils import (
     escape_unweighted_colons, parse_wildcard_weight, get_all_wildcard_paths, log_prompt_to_history,
     LogicEvaluator, DynamicPromptReplacer, VariableReplacer, NegativePromptGenerator,
-    ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase
+    ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase,
+    CharacterReplacer
 )
 
 # ==============================================================================
@@ -2062,18 +2063,44 @@ async def get_loras_metadata(request):
 
         # Get base name without extension
         base_name = os.path.splitext(lora_name)[0]
+        lora_dir = os.path.dirname(lora_path)
+        lora_base_path = os.path.splitext(lora_path)[0]
+
+        # Check for local metadata files (JSON, preview images)
+        local_metadata = {}
+        local_preview = None
+        
+        # Check for .json file next to the LoRA
+        json_path = lora_base_path + ".json"
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    local_metadata = json.load(f)
+            except Exception as e:
+                print(f"[Umi LoRA Browser] Error loading local JSON for {base_name}: {e}")
+        
+        # Check for preview images (common formats)
+        for ext in ['.preview.png', '.preview.jpg', '.preview.jpeg', '.preview.webp', 
+                    '.png', '.jpg', '.jpeg', '.webp']:
+            preview_path = lora_base_path + ext
+            if os.path.exists(preview_path):
+                local_preview = preview_path
+                break
 
         # Get activation tags from SafeTensors metadata
         tags = lora_handler.get_lora_tags(lora_path, max_tags=10)
 
-        # Build lora info with overrides
+        # Build lora info with local data priority, then overrides, then CivitAI
         lora_info = {
             "name": base_name,
             "filename": lora_name,
             "tags": tags if tags else [],
             "path": lora_path,
             "civitai": civitai_cache.get(base_name, {}),
-            "override": overrides.get(base_name, {})  # Add override data
+            "override": overrides.get(base_name, {}),
+            "local": local_metadata,  # Local JSON data
+            "local_preview": local_preview,  # Local preview image path
+            "has_local_data": bool(local_metadata or local_preview)
         }
 
         lora_data.append(lora_info)

@@ -268,20 +268,23 @@ const HELP_HTML = `
     </div>
 
     <div class="umi-section">
-        <h3>✨ Editor Features (NEW in 1.5)</h3>
-        <p>The prompt editor now includes powerful features to help you write and debug prompts faster!</p>
+        <h3>✨ Editor Features</h3>
+        <p>The prompt editor includes powerful features to help you write and debug prompts faster!</p>
 
         <div class="umi-grid-2">
             <div>
                 <h4 style="margin-top:0">🎨 Syntax Highlighting</h4>
                 <p style="font-size:12px">Real-time color coding for all UmiAI syntax elements:</p>
                 <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                    <li><span style="color:#d19a66">__wildcards__</span> - Orange</li>
-                    <li><span style="color:#98c379">&lt;[tags]&gt;</span> - Green</li>
+                    <li><span style="color:#98c379">__wildcards__</span> - Green</li>
+                    <li><span style="color:#61afef">&lt;[tags]&gt;</span> - Blue</li>
                     <li><span style="color:#e5c07b">{choices}</span> - Yellow</li>
+                    <li><span style="color:#ffd43b">__2-4$$range__</span> - Gold</li>
                     <li><span style="color:#c678dd">$variables</span> - Purple</li>
-                    <li><span style="color:#61afef">&lt;lora:name&gt;</span> - Blue</li>
+                    <li><span style="color:#ff922b">&lt;lora:name&gt;</span> - Orange</li>
                     <li><span style="color:#56b6c2">[conditionals]</span> - Cyan</li>
+                    <li><span style="color:#20c997">[functions]</span> - Teal</li>
+                    <li><span style="color:#ff79c6">BREAK</span> - Magenta</li>
                 </ul>
             </div>
             <div>
@@ -293,20 +296,19 @@ const HELP_HTML = `
                     <li>Missing wildcard files</li>
                     <li>Missing LoRA files</li>
                 </ul>
-                <p style="font-size:11px; color:#888">Green bar = ✓ No issues | Red bar = ⚠ Errors found</p>
+                <p style="font-size:11px; color:#888">Click the lint bar to expand error details</p>
             </div>
         </div>
 
         <div class="umi-grid-2" style="margin-top:15px">
             <div>
-                <h4 style="margin-top:0">💡 Smart Autocomplete</h4>
-                <p style="font-size:12px">Type trigger characters to see suggestions:</p>
-                <table class="umi-table" style="font-size:12px">
-                    <tr><td><code>__</code></td><td>Wildcard files (.txt)</td></tr>
-                    <tr><td><code>&lt;[</code></td><td>YAML tags</td></tr>
-                    <tr><td><code>&lt;lora:</code></td><td>LoRA models</td></tr>
-                    <tr><td><code>$</code></td><td>Variables from globals.yaml</td></tr>
-                </table>
+                <h4 style="margin-top:0">🔧 Fix & Clean Tools</h4>
+                <p style="font-size:12px">Automate prompt cleanup:</p>
+                <ul style="margin:5px 0; padding-left:20px; font-size:12px">
+                    <li><strong>Fix:</strong> Repair broken brackets, wildcards, YAML tags</li>
+                    <li><strong>Auto-Clean:</strong> Toggle to clean spaces, commas, BREAK formatting</li>
+                    <li><strong>Ctrl+Shift+B:</strong> Keyboard shortcut for fix</li>
+                </ul>
             </div>
             <div>
                 <h4 style="margin-top:0">👁️ Wildcard Preview</h4>
@@ -314,7 +316,6 @@ const HELP_HTML = `
                 <ul style="margin:5px 0; padding-left:20px; font-size:12px">
                     <li>Shows first 15 entries</li>
                     <li>Works with .txt, .yaml, .csv</li>
-                    <li>300ms delay to avoid flicker</li>
                     <li>Cached for performance</li>
                 </ul>
             </div>
@@ -428,11 +429,11 @@ IceMage:
 
             <div style="margin-top:15px; border-top:1px solid #444; padding-top:10px">
                 <h4 style="margin:10px 0 5px 0; font-size:13px">🆕 Logic with .txt Wildcards</h4>
-                <p style="font-size:12px">You can now add tags to .txt file entries and filter them with logic!</p>
-                <div class="umi-block" style="font-size:12px">// colors.txt with tags and weights
-Red::Fire,Warm,Bright:5
-Blue::Ice,Cool,Calm:3
-Green::Nature,Earth:2
+                <p style="font-size:12px">You can add tags to .txt file entries and filter them with logic!</p>
+                <div class="umi-block" style="font-size:12px">// colors.txt with tags
+Red::Fire,Warm,Bright
+Blue::Ice,Cool,Calm
+Green::Nature,Earth
 
 // Usage with logic filter
 __colors[Fire OR Ice]__       → Red or Blue only
@@ -442,7 +443,6 @@ __colors[Bright AND Fire]__   → Red only</div>
                 <p style="font-size:12px; margin-top:10px"><strong>Syntax formats:</strong></p>
                 <ul style="margin:5px 0; padding-left:20px; font-size:12px">
                     <li><code>text::tag1,tag2</code> - Entry with tags</li>
-                    <li><code>text::tag1,tag2:weight</code> - Tags + weight</li>
                     <li><code>__file[logic]__</code> - Filter by logic expression</li>
                 </ul>
             </div>

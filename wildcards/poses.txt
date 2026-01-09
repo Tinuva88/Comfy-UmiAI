@@ -1,0 +1,52 @@
+# Standing poses
+standing, facing viewer, front view, full body
+standing, from side, side view, full body
+standing, from behind, back view, full body
+standing, arms crossed, confident pose
+standing, hands on hips, confident stance
+standing, casual pose, relaxed, weight shifted
+standing, walking, in motion, dynamic pose
+standing, one leg raised, balanced
+
+# Sitting poses
+sitting on chair, seated, relaxed pose
+sitting elegantly, crossed legs, refined pose
+sitting on floor, legs crossed, casual
+sitting in seiza position, kneeling, traditional
+sitting, leaning back, relaxed, comfortable
+sitting on edge, ready to stand
+
+# Action poses
+walking, in motion, dynamic pose, mid-stride
+running, action pose, dynamic, sprinting
+jumping, mid-air, dynamic action pose, airborne
+falling, mid-air, floating, weightless
+fighting stance, martial arts pose, ready to fight
+kicking, high kick, action pose
+punching, striking, action pose, fist forward
+dodging, evasive action, dynamic
+
+# Expressive poses
+waving, raised hand, greeting gesture, friendly
+peace sign, v sign, cheerful gesture
+thumbs up, approval gesture, positive
+pointing, finger extended, indicating
+thinking pose, hand on chin, contemplative
+praying, hands together, prayer pose
+heart hands, making heart shape with hands
+saluting, military salute, formal
+
+# Lying/reclining
+lying down, on back, reclined, relaxed
+lying on side, sideways, resting
+lying on stomach, prone position
+
+# Kneeling/crouching
+kneeling, on one knee, proposing pose
+kneeling, on both knees, humble
+crouching, low stance, ready position
+
+# Leaning
+leaning against wall, casual pose, relaxed
+leaning forward, curious, engaged
+leaning back, relaxed, laid back

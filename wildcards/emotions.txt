@@ -1,0 +1,48 @@
+# Positive emotions
+happy, smiling, cheerful expression, joyful
+excited, enthusiastic, energetic, eager
+laughing, joyful, open mouth smile, amused
+content, peaceful smile, satisfied, calm
+loving, affectionate, warm smile, tender
+proud, accomplished, satisfied smirk
+hopeful, optimistic, expectant expression
+
+# Negative emotions
+sad, melancholy, downcast expression, sorrowful
+crying, tears, emotional, weeping
+angry, furious, intense expression, rage
+annoyed, irritated, frowning, displeased
+scared, frightened, fearful expression, terror
+worried, anxious, concerned expression
+disgusted, repulsed expression
+frustrated, exasperated, fed up
+jealous, envious expression, resentful
+lonely, isolated, alone, forlorn
+
+# Neutral emotions
+neutral expression, calm, composed
+serious, stern, focused expression
+thoughtful, pensive, contemplating, deep in thought
+curious, interested, inquisitive, questioning look
+bored, uninterested, indifferent expression
+sleepy, drowsy, tired eyes
+confused, puzzled, questioning look, perplexed
+
+# Expressive
+shy, blushing, embarrassed, timid
+confident, self-assured, smirking, bold
+determined, resolute, fierce eyes, focused
+surprised, shocked, wide eyes, astonished
+smug, self-satisfied, knowing smile
+mischievous, playful, trouble-making grin
+embarrassed, flustered, red face, awkward
+seductive, alluring, bedroom eyes, sultry
+innocent, pure, naive expression, sweet
+fierce, intense, warrior expression, powerful
+
+# Special expressions
+winking, one eye closed, playful
+tongue out, playful, teasing
+poker face, expressionless, blank stare
+yandere expression, obsessive, intense eyes
+tsundere expression, blushing, looking away

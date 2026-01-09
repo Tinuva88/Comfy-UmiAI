@@ -6,18 +6,34 @@ import { app } from "../../scripts/app.js";
 // =============================================================================
 
 const HIGHLIGHT_COLORS = {
+    // === CORE WILDCARDS (Green family) ===
     wildcard: "#98c379",       // Green - __wildcards__
-    tagSelect: "#61afef",      // Blue - <[tag]>
+    promptFile: "#7ec699",     // Lighter green - __@filename__
+
+    // === SELECTIONS (Yellow/Gold family) ===
     dynamicChoice: "#e5c07b",  // Yellow - {a|b|c}
-    variable: "#c678dd",       // Purple - $variable
+    rangeSelect: "#ffd43b",    // Gold - __2-4$$tag__
+    tagSelect: "#61afef",      // Blue - <[tag]>
+
+    // === CONTROL (Cyan/Teal family) ===
     conditional: "#56b6c2",    // Cyan - [if ...: ... | ...]
-    lora: "#e06c75",           // Red/Pink - <lora:...>
+    function: "#20c997",       // Teal - [shuffle:], [clean:]
+
+    // === MODELS & TRIGGERS (Orange/Pink family) ===
+    lora: "#ff922b",           // Orange - <lora:...>
+    trigger: "#ff79c6",        // Magenta/Pink - <sks>, trigger words
+    character: "#e879f9",      // Light purple - @@character@@
+
+    // === MODIFIERS (Purple/Tan family) ===
+    variable: "#c678dd",       // Purple - $variable
+    weight: "#d19a66",         // Tan/Orange - (text:1.2)
+
+    // === SPECIAL ===
+    breakKeyword: "#f472b6",   // Hot pink - BREAK keyword
     negative: "#ff6b6b",       // Warning red - **neg** or --neg:
     comment: "#5c6370",        // Gray - # comments
-    weight: "#d19a66",         // Orange - (text:1.2)
-    function: "#61afef",       // Blue italic - [shuffle:], [clean:]
-    rangeSelect: "#e5c07b",    // Yellow - __2-4$$tag__
-    promptFile: "#98c379",     // Green - __@filename__
+
+    // === UI ===
     text: "#abb2bf",           // Default text color
     error: "#ff4444",          // Error red
 };
@@ -131,6 +147,9 @@ const HIGHLIGHT_STYLES = `
     .umi-hl-function { color: ${HIGHLIGHT_COLORS.function} !important; font-style: italic; }
     .umi-hl-range { color: ${HIGHLIGHT_COLORS.rangeSelect} !important; }
     .umi-hl-prompt-file { color: ${HIGHLIGHT_COLORS.promptFile} !important; font-weight: 500; }
+    .umi-hl-break { color: ${HIGHLIGHT_COLORS.breakKeyword} !important; font-weight: bold; }
+    .umi-hl-character { color: ${HIGHLIGHT_COLORS.character} !important; font-weight: 600; }
+    .umi-hl-trigger { color: ${HIGHLIGHT_COLORS.trigger} !important; font-weight: 600; }
     
     /* Error highlighting for linting */
     .umi-hl-error { 
@@ -173,6 +192,100 @@ const HIGHLIGHT_STYLES = `
     
     .umi-lint-icon {
         margin-right: 5px !important;
+    }
+    
+    .umi-lint-bar {
+        cursor: pointer !important;
+    }
+    
+    .umi-lint-bar:hover {
+        background: rgba(40, 40, 40, 0.98) !important;
+    }
+    
+    /* Expandable error panel */
+    .umi-error-panel {
+        position: absolute !important;
+        bottom: 22px !important;
+        left: 0 !important;
+        right: 0 !important;
+        max-height: 150px !important;
+        background: rgba(30, 30, 30, 0.98) !important;
+        border: 1px solid #444 !important;
+        border-bottom: none !important;
+        border-radius: 6px 6px 0 0 !important;
+        overflow-y: auto !important;
+        z-index: 4 !important;
+        display: none !important;
+        font-family: 'Consolas', monospace !important;
+        font-size: 11px !important;
+        pointer-events: auto !important;
+    }
+    
+    .umi-error-panel.visible {
+        display: block !important;
+    }
+    
+    .umi-error-item {
+        padding: 4px 10px !important;
+        border-bottom: 1px solid #333 !important;
+        color: #e5c07b !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+    }
+    
+    .umi-error-item:last-child {
+        border-bottom: none !important;
+    }
+    
+    .umi-error-item:hover {
+        background: rgba(50, 50, 50, 0.8) !important;
+    }
+    
+    .umi-error-text {
+        flex: 1 !important;
+    }
+    
+    .umi-fix-btn {
+        background: #3a3a3a !important;
+        border: 1px solid #555 !important;
+        color: #98c379 !important;
+        padding: 2px 8px !important;
+        border-radius: 4px !important;
+        cursor: pointer !important;
+        font-size: 10px !important;
+        margin-left: 8px !important;
+    }
+    
+    .umi-fix-btn:hover {
+        background: #4a4a4a !important;
+        border-color: #98c379 !important;
+    }
+    
+    /* Auto-clean toggle - positioned inside lint bar */
+    .umi-autoclean-toggle {
+        background: #3a3a3a !important;
+        border: 1px solid #555 !important;
+        color: #aaa !important;
+        padding: 2px 8px !important;
+        border-radius: 3px !important;
+        cursor: pointer !important;
+        font-size: 10px !important;
+        font-family: 'Consolas', monospace !important;
+        margin-left: auto !important;
+        transition: all 0.2s !important;
+        white-space: nowrap !important;
+    }
+    
+    .umi-autoclean-toggle:hover {
+        background: #3a3a3a !important;
+        border-color: #666 !important;
+    }
+    
+    .umi-autoclean-toggle.active {
+        background: #2d4a2d !important;
+        border-color: #98c379 !important;
+        color: #98c379 !important;
     }
     
     /* Hover preview tooltip */
@@ -422,6 +535,27 @@ function findWildcardAtPosition(text, pos) {
 // LINTING LOGIC
 // =============================================================================
 
+// Helper: Check if a position in text is inside a variable definition like $var={...} or $var=...
+function isInsideVariableDefinition(text, position) {
+    // Look for $varname={...} or $varname=value patterns
+    const varDefPatterns = [
+        /\$[\w]+\s*=\s*\{[^}]*\}/g,  // $var={...}
+        /\$[\w]+\s*=\s*[^\s,{}]+/g,   // $var=value (simple assignment)
+    ];
+
+    for (const pattern of varDefPatterns) {
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+            const start = match.index;
+            const end = start + match[0].length;
+            if (position >= start && position < end) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 function lintPrompt(text) {
     const errors = [];
 
@@ -512,6 +646,8 @@ function lintPrompt(text) {
             if (wcName.startsWith('@') || wcName.startsWith('~') || wcName.includes('[')) continue;
             // Skip if it looks like a range ($$)
             if (wcMatch[0].includes('$$')) continue;
+            // Skip if inside a variable definition (resolved at runtime)
+            if (isInsideVariableDefinition(text, wcMatch.index)) continue;
 
             const normalizedName = wcName.toLowerCase();
             const exists = knownWildcards.some(w => w.toLowerCase() === normalizedName);
@@ -588,18 +724,18 @@ function highlightSyntax(text, errors = []) {
     // 2. LoRA tags: <lora:name:strength> or <lora:name>
     result = result.replace(/(&lt;lora:[^&]*?&gt;)/gi, '<span class="umi-hl-lora">$1</span>');
 
-    // 3. Tag selection: <[...]>
-    result = result.replace(/(&lt;\[[^\]]*?\]&gt;)/g, '<span class="umi-hl-tag-select">$1</span>');
+    // 3. Tag selection: <[...]> (including spaces like <[Dark Skin]>)
+    result = result.replace(/(&lt;\[[^\]]+\]&gt;)/g, '<span class="umi-hl-tag-select">$1</span>');
 
     // 4. Prompt file loader: __@filename__
-    result = result.replace(/(__@[\w\-\/]+__)/g, '<span class="umi-hl-prompt-file">$1</span>');
+    result = result.replace(/(__@[\w\-\/\s]+__)/g, '<span class="umi-hl-prompt-file">$1</span>');
 
     // 5. Range wildcards: __2-4$$tag__ or __~tag__
     result = result.replace(/(__[\d\-]+\$\$[^_]+__)/g, '<span class="umi-hl-range">$1</span>');
-    result = result.replace(/(__~[\w\-\/]+__)/g, '<span class="umi-hl-range">$1</span>');
+    result = result.replace(/(__~[\w\-\/\s]+__)/g, '<span class="umi-hl-range">$1</span>');
 
-    // 6. Regular wildcards: __tag__
-    result = result.replace(/(__[\w\-\/\[\]]+__)/g, '<span class="umi-hl-wildcard">$1</span>');
+    // 6. Regular wildcards: __tag__ (including spaces like __eye color__)
+    result = result.replace(/(__[\w\-\/\[\]\s]+__)/g, '<span class="umi-hl-wildcard">$1</span>');
 
     // 7. Conditionals: [if condition: true | false]
     result = result.replace(/(\[if\s+[^\]]+\])/gi, '<span class="umi-hl-conditional">$1</span>');
@@ -620,6 +756,15 @@ function highlightSyntax(text, errors = []) {
     // 12. Weights: (text:1.2) - SD weight syntax
     result = result.replace(/(\([^():]+:\d+\.?\d*\))/g, '<span class="umi-hl-weight">$1</span>');
 
+    // 13. BREAK keyword - stands out in magenta/pink
+    result = result.replace(/\b(BREAK)\b/g, '<span class="umi-hl-break">$1</span>');
+
+    // 14. Character references: @@name:outfit:emotion@@
+    result = result.replace(/(@@[a-zA-Z0-9_-]+(?::[a-zA-Z0-9_-]+)?(?::[a-zA-Z0-9_-]+)?@@)/g, '<span class="umi-hl-character">$1</span>');
+
+    // 15. LoRA trigger words: <sks>, <ohwx>, <lora_trigger>, etc.
+    result = result.replace(/(&lt;(?!lora:|lyco:)[a-zA-Z0-9_-]+&gt;)/gi, '<span class="umi-hl-trigger">$1</span>');
+
     // Add trailing newline to match textarea behavior
     result += "\n";
 
@@ -627,7 +772,8 @@ function highlightSyntax(text, errors = []) {
 }
 
 // Apply syntax highlighting to a textarea element
-function applyHighlighting(textareaEl) {
+// widget is the ComfyUI widget object for proper value updates
+function applyHighlighting(textareaEl, widget = null) {
     if (!textareaEl) {
         console.log("[UmiAI Syntax] No textarea element provided");
         return null;
@@ -656,7 +802,33 @@ function applyHighlighting(textareaEl) {
     // Create lint status bar
     const lintBar = document.createElement("div");
     lintBar.className = "umi-lint-bar umi-lint-bar-clean";
-    lintBar.innerHTML = '<span class="umi-lint-icon">✓</span> No issues';
+
+    // Create lint text span (separate from button so we can update it)
+    const lintText = document.createElement("span");
+    lintText.innerHTML = '<span class="umi-lint-icon">✓</span> No issues';
+    lintBar.appendChild(lintText);
+
+    // Create expandable error panel
+    const errorPanel = document.createElement("div");
+    errorPanel.className = "umi-error-panel";
+
+    // Create auto-clean toggle button
+    const autoCleanBtn = document.createElement("button");
+    autoCleanBtn.className = "umi-autoclean-toggle";
+    autoCleanBtn.textContent = "🧹 Clean";
+    autoCleanBtn.title = "Toggle auto-clean: removes extra spaces, commas, and whitespace";
+
+    // Load persisted auto-clean setting
+    let autoCleanEnabled = localStorage.getItem('umiAutoClean') === 'true';
+    if (autoCleanEnabled) {
+        autoCleanBtn.classList.add('active');
+    }
+
+    // Add button to lint bar
+    lintBar.appendChild(autoCleanBtn);
+
+    // Placeholder for compatibility (Fix button removed - now in error panel)
+    const fixBracketsBtn = { contains: () => false };
 
     // Ensure parent has relative positioning
     const parentStyle = getComputedStyle(parent);
@@ -678,28 +850,232 @@ function applyHighlighting(textareaEl) {
     // Insert backdrop before textarea
     parent.insertBefore(backdrop, textareaEl);
     parent.appendChild(lintBar);
+    parent.appendChild(errorPanel);
+
+    // Store current errors for the panel
+    let currentErrors = [];
+
+    // Auto-fix function for bracket issues
+    const autoFixBrackets = (text) => {
+        let fixed = text;
+
+        // Count brackets
+        let braceOpen = (fixed.match(/{/g) || []).length;
+        let braceClose = (fixed.match(/}/g) || []).length;
+        let bracketOpen = (fixed.match(/\[/g) || []).length;
+        let bracketClose = (fixed.match(/]/g) || []).length;
+        let parenOpen = (fixed.match(/\(/g) || []).length;
+        let parenClose = (fixed.match(/\)/g) || []).length;
+
+        // Add missing closing brackets
+        while (braceOpen > braceClose) { fixed += '}'; braceClose++; }
+        while (bracketOpen > bracketClose) { fixed += ']'; bracketClose++; }
+        while (parenOpen > parenClose) { fixed += ')'; parenClose++; }
+
+        // Remove extra closing brackets (from the end)
+        while (braceClose > braceOpen && fixed.endsWith('}')) {
+            fixed = fixed.slice(0, -1); braceClose--;
+        }
+        while (bracketClose > bracketOpen && fixed.endsWith(']')) {
+            fixed = fixed.slice(0, -1); bracketClose--;
+        }
+        while (parenClose > parenOpen && fixed.endsWith(')')) {
+            fixed = fixed.slice(0, -1); parenClose--;
+        }
+
+        // Fix wildcard syntax issues (skip ~ and @ prefixed wildcards)
+        // __xxx_ -> __xxx__ (trailing underscore instead of double)
+        fixed = fixed.replace(/__([a-zA-Z0-9\-\/\s]+)_(?!_)/g, '__$1__');
+        // _xxx__ -> __xxx__ (leading single underscore, skip ~/@)
+        fixed = fixed.replace(/(?<!_)_([a-zA-Z0-9][a-zA-Z0-9\-\/\s]*)__/g, '__$1__');
+        // xxx__ -> __xxx__ (no leading underscores - match word boundary)
+        fixed = fixed.replace(/(?:^|[,\s])([a-zA-Z0-9\-\/]+)__(?!_)/gm, (match, name) => {
+            // Preserve the leading comma/space
+            const prefix = match.startsWith(',') ? ', ' : (match.match(/^\s/) ? ' ' : '');
+            return prefix + '__' + name + '__';
+        });
+
+        // Fix YAML tag syntax: <[xxx] -> <[xxx]> and [xxx]> -> <[xxx]>
+        fixed = fixed.replace(/<\[([^\]]+)\](?!>)/g, '<[$1]>');
+        fixed = fixed.replace(/(?<!<)\[([^\]]+)\]>/g, '<[$1]>');
+
+        return fixed;
+    };
+
+    // Rename for clarity since it now fixes more than brackets
+    const autoFixSyntax = autoFixBrackets;
+
+    // Auto-clean function
+    const autoClean = (text) => {
+        let cleaned = text;
+
+        // Remove multiple spaces -> single space
+        cleaned = cleaned.replace(/  +/g, ' ');
+
+        // Remove comma sequences with spaces (  ,  ,  ,  -> ,)
+        cleaned = cleaned.replace(/[,\s]*,[,\s]*/g, ', ');
+
+        // Remove duplicate commas
+        cleaned = cleaned.replace(/,+/g, ',');
+
+        // Clean spaces before commas
+        cleaned = cleaned.replace(/\s+,/g, ',');
+
+        // Ensure single space after comma
+        cleaned = cleaned.replace(/,([^\s])/g, ', $1');
+
+        // BREAK handling: remove commas around BREAK, ensure spaces
+        cleaned = cleaned.replace(/,?\s*BREAK\s*,?/g, ' BREAK ');
+
+        // Clean up any double spaces created
+        cleaned = cleaned.replace(/  +/g, ' ');
+
+        // Remove leading/trailing commas from lines
+        cleaned = cleaned.split('\n').map(line => line.trim().replace(/^,+\s*|\s*,+$/g, '').trim()).join('\n');
+
+        return cleaned;
+    };
+
+    // Update error panel content (display only - no fix buttons due to ComfyUI event issues)
+    const updateErrorPanel = () => {
+        // Clear panel
+        errorPanel.innerHTML = '';
+
+        if (currentErrors.length === 0) {
+            return;
+        }
+
+        // Add error items
+        currentErrors.forEach((error, i) => {
+            const item = document.createElement('div');
+            item.className = 'umi-error-item';
+
+            const text = document.createElement('span');
+            text.className = 'umi-error-text';
+            text.textContent = `${i + 1}. ${error.message}`;
+            item.appendChild(text);
+
+            // Add Fix button for fixable errors
+            if (error.type === 'unclosed' || error.type === 'wildcard') {
+                const fixBtn = document.createElement('button');
+                fixBtn.className = 'umi-fix-btn';
+                fixBtn.textContent = 'Fix';
+                fixBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    doFixSyntax();
+                });
+                item.appendChild(fixBtn);
+            }
+
+            errorPanel.appendChild(item);
+        });
+
+        // Add "Fix All" button at the bottom
+        const fixAllItem = document.createElement('div');
+        fixAllItem.className = 'umi-error-item';
+        fixAllItem.style.background = '#2a2a2a';
+
+        const fixAllBtn = document.createElement('button');
+        fixAllBtn.className = 'umi-fix-btn';
+        fixAllBtn.style.width = '100%';
+        fixAllBtn.textContent = '🔧 Fix All Issues';
+        fixAllBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            doFixSyntax();
+        });
+
+        fixAllItem.appendChild(fixAllBtn);
+        errorPanel.appendChild(fixAllItem);
+    };
+
+    // Fix syntax function used by error panel buttons
+    const doFixSyntax = () => {
+        console.log('[UmiAI] doFixSyntax called');
+        const before = textareaEl.value;
+        const fixed = autoFixSyntax(before);
+
+        textareaEl.value = fixed;
+        if (widget && widget.value !== undefined) {
+            widget.value = fixed;
+            if (widget.callback) widget.callback(fixed);
+        }
+
+        textareaEl.dispatchEvent(new Event('input', { bubbles: true }));
+        syncHighlight();
+        errorPanel.classList.remove('visible');
+        console.log('[UmiAI] Fixed:', fixed !== before ? 'Yes' : 'No change');
+    };
 
     // Sync function
     const syncHighlight = () => {
-        const text = textareaEl.value;
+        let text = textareaEl.value;
+
+        // Apply auto-clean if enabled
+        if (autoCleanEnabled) {
+            const cleaned = autoClean(text);
+            if (cleaned !== text) {
+                const cursorPos = textareaEl.selectionStart;
+                textareaEl.value = cleaned;
+                textareaEl.setSelectionRange(cursorPos, cursorPos);
+                text = cleaned;
+            }
+        }
+
         const errors = lintPrompt(text);
+        currentErrors = errors;
 
         // Update highlighting
         backdrop.innerHTML = highlightSyntax(text, errors);
 
-        // Update lint bar
+        // Update lint bar text (not the whole bar, to preserve button)
         if (errors.length === 0) {
             lintBar.className = "umi-lint-bar umi-lint-bar-clean";
-            lintBar.innerHTML = '<span class="umi-lint-icon">✓</span> No issues';
+            lintText.innerHTML = '<span class="umi-lint-icon">✓</span> No issues';
             lintBar.title = "";
+            errorPanel.classList.remove('visible');
         } else {
             lintBar.className = "umi-lint-bar umi-lint-bar-errors";
             const errorCount = errors.length;
-            const firstError = errors[0].message;
-            lintBar.innerHTML = `<span class="umi-lint-icon">⚠</span> ${errorCount} issue${errorCount > 1 ? 's' : ''}: ${firstError}`;
-            lintBar.title = errors.map(e => e.message).join('\n');
+
+            lintText.innerHTML = `<span class="umi-lint-icon">⚠</span> ${errorCount} issue${errorCount > 1 ? 's' : ''} (click)`;
+
+            // Full error list on hover
+            lintBar.title = "Click to show/hide error details";
+
+            // Update error panel content
+            updateErrorPanel();
         }
     };
+
+    // Toggle error panel on lint bar click (but not on button clicks)
+    lintBar.addEventListener('click', (e) => {
+        // Don't toggle if clicking either button
+        if (e.target === autoCleanBtn || autoCleanBtn.contains(e.target) ||
+            e.target === fixBracketsBtn || fixBracketsBtn.contains(e.target)) {
+            return;
+        }
+        if (currentErrors.length > 0) {
+            errorPanel.classList.toggle('visible');
+        }
+    });
+
+    // Auto-clean toggle
+    autoCleanBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        autoCleanEnabled = !autoCleanEnabled;
+        autoCleanBtn.classList.toggle('active', autoCleanEnabled);
+
+        // Persist setting
+        localStorage.setItem('umiAutoClean', autoCleanEnabled);
+
+        console.log('[UmiAI] Auto-clean:', autoCleanEnabled ? 'ON' : 'OFF');
+        if (autoCleanEnabled) {
+            syncHighlight(); // Apply immediately
+        }
+    });
 
     // Sync scroll positions
     const syncScroll = () => {
@@ -727,12 +1103,41 @@ function applyHighlighting(textareaEl) {
         hidePreviewTooltip();
     });
 
+    // Keyboard shortcut: Ctrl+Shift+B to fix brackets
+    textareaEl.addEventListener("keydown", (e) => {
+        if (e.ctrlKey && e.shiftKey && (e.key === 'B' || e.key === 'b')) {
+            e.preventDefault();
+            e.stopPropagation();
+            console.log('[UmiAI] Keyboard shortcut: Fix Syntax');
+
+            const fixed = autoFixSyntax(textareaEl.value);
+            textareaEl.value = fixed;
+
+            if (widget && widget.value !== undefined) {
+                widget.value = fixed;
+                if (widget.callback) widget.callback(fixed);
+            }
+
+            textareaEl.dispatchEvent(new Event('input', { bubbles: true }));
+            syncHighlight();
+        }
+    });
+
+    // Close error panel when clicking elsewhere
+    document.addEventListener('click', (e) => {
+        if (!errorPanel.contains(e.target) && !lintBar.contains(e.target)) {
+            errorPanel.classList.remove('visible');
+        }
+    });
+
+    // Fix button click handlers are attached directly in updateErrorPanel()
+
     // Initial sync
     syncHighlight();
 
     console.log("[UmiAI Syntax] Highlighting applied successfully");
 
-    return { backdrop, lintBar, syncHighlight, syncScroll };
+    return { backdrop, lintBar, errorPanel, autoCleanBtn, syncHighlight, syncScroll };
 }
 
 // =============================================================================
@@ -779,8 +1184,8 @@ app.registerExtension({
 
                 console.log("[UmiAI Syntax] Found text widget inputEl:", inputEl.tagName);
 
-                // Apply highlighting
-                const result = applyHighlighting(inputEl);
+                // Apply highlighting - pass widget for proper value updates
+                const result = applyHighlighting(inputEl, textWidget);
                 if (result) {
                     self._syntaxHighlight = result;
                 }

@@ -1,0 +1,148 @@
+{
+    "last_node_id": 8,
+    "last_link_id": 7,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "UmiCharacterManager",
+            "pos": [
+                100,
+                200
+            ],
+            "size": {
+                "0": 315,
+                "1": 200
+            },
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "prompt",
+                    "type": "STRING",
+                    "links": [
+                        1
+                    ]
+                },
+                {
+                    "name": "negative",
+                    "type": "STRING",
+                    "links": []
+                },
+                {
+                    "name": "reference_image",
+                    "type": "IMAGE",
+                    "links": []
+                }
+            ],
+            "title": "UmiAI Character Manager"
+        },
+        {
+            "id": 2,
+            "type": "UmiSceneComposer",
+            "pos": [
+                100,
+                450
+            ],
+            "size": {
+                "0": 315,
+                "1": 150
+            },
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "scene_prompt",
+                    "type": "STRING",
+                    "links": [
+                        2
+                    ]
+                }
+            ],
+            "title": "UmiAI Scene Composer"
+        },
+        {
+            "id": 3,
+            "type": "UmiAIWildcardNodeLite",
+            "pos": [
+                470,
+                200
+            ],
+            "size": {
+                "0": 400,
+                "1": 300
+            },
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "text",
+                    "type": "STRING",
+                    "link": 1
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "processed_text",
+                    "type": "STRING",
+                    "links": [
+                        3
+                    ]
+                },
+                {
+                    "name": "negative_text",
+                    "type": "STRING",
+                    "links": [
+                        4
+                    ]
+                }
+            ],
+            "title": "UmiAI Wildcard Processor (Lite)"
+        }
+    ],
+    "links": [
+        [
+            1,
+            1,
+            0,
+            3,
+            0,
+            "STRING"
+        ],
+        [
+            2,
+            2,
+            0,
+            3,
+            0,
+            "STRING"
+        ],
+        [
+            3,
+            3,
+            0,
+            null,
+            null,
+            "STRING"
+        ],
+        [
+            4,
+            3,
+            1,
+            null,
+            null,
+            "STRING"
+        ]
+    ],
+    "groups": [],
+    "config": {},
+    "extra": {
+        "info": {
+            "name": "UmiAI Character Basic Workflow",
+            "description": "Basic character generation with UmiAI nodes"
+        }
+    },
+    "version": 0.4
+}

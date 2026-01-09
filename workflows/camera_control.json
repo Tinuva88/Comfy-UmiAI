@@ -1,0 +1,126 @@
+{
+    "last_node_id": 5,
+    "last_link_id": 4,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "UmiVisualCameraControl",
+            "pos": [
+                100,
+                200
+            ],
+            "size": {
+                "0": 340,
+                "1": 380
+            },
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "prompt",
+                    "type": "STRING",
+                    "links": [
+                        1
+                    ]
+                },
+                {
+                    "name": "camera_tags",
+                    "type": "STRING",
+                    "links": []
+                }
+            ],
+            "title": "UmiAI Visual Camera Control"
+        },
+        {
+            "id": 2,
+            "type": "UmiCharacterManager",
+            "pos": [
+                100,
+                630
+            ],
+            "size": {
+                "0": 315,
+                "1": 200
+            },
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "prompt",
+                    "type": "STRING",
+                    "links": [
+                        2
+                    ]
+                },
+                {
+                    "name": "negative",
+                    "type": "STRING",
+                    "links": []
+                },
+                {
+                    "name": "reference_image",
+                    "type": "IMAGE",
+                    "links": []
+                }
+            ],
+            "title": "UmiAI Character Manager"
+        },
+        {
+            "id": 3,
+            "type": "UmiAIWildcardNodeLite",
+            "pos": [
+                500,
+                300
+            ],
+            "size": {
+                "0": 400,
+                "1": 300
+            },
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "processed_text",
+                    "type": "STRING",
+                    "links": []
+                },
+                {
+                    "name": "negative_text",
+                    "type": "STRING",
+                    "links": []
+                }
+            ],
+            "title": "UmiAI Wildcard Processor (Lite)"
+        }
+    ],
+    "links": [
+        [
+            1,
+            1,
+            0,
+            3,
+            0,
+            "STRING"
+        ],
+        [
+            2,
+            2,
+            0,
+            3,
+            0,
+            "STRING"
+        ]
+    ],
+    "groups": [],
+    "config": {},
+    "extra": {
+        "info": {
+            "name": "UmiAI Camera Control Workflow",
+            "description": "Visual camera angle control for character poses"
+        }
+    },
+    "version": 0.4
+}

@@ -19,7 +19,8 @@ from datetime import datetime
 from .shared_utils import (
     escape_unweighted_colons, parse_wildcard_weight, log_prompt_to_history,
     LogicEvaluator, DynamicPromptReplacer, VariableReplacer, NegativePromptGenerator,
-    ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase
+    ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase,
+    CharacterReplacer
 )
 
 # ==============================================================================
@@ -843,12 +844,18 @@ class UmiAIWildcardNodeLite:
         # CORE PROCESSING
         # ============================================================
 
-        # Strip comments
+        # Strip comments: // comments until newline OR comma
+        # Protect __# and <# patterns first
         protected_text = text.replace('__#', '___UMI_HASH_PROTECT___').replace('<#', '<___UMI_HASH_PROTECT___')
+        
+        # Process // comments: remove from // until newline or comma
+        import re
+        # Match // followed by anything that's NOT a comma or newline, stopping at comma or end
+        protected_text = re.sub(r'//[^,\n]*', '', protected_text)
+        
         clean_lines = []
         for line in protected_text.splitlines():
-            if '//' in line:
-                line = line.split('//')[0]
+            # Handle # comments (inline, not at start of line)
             if '#' in line and not line.strip().startswith("#"):
                  if ' #' in line:
                     line = line.split(' #')[0]
@@ -902,6 +909,7 @@ class UmiAIWildcardNodeLite:
             prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
             tag_selector.update_variables(variable_replacer.variables)
             prompt = variable_replacer.replace_variables(prompt)
+            prompt = CharacterReplacer.replace(prompt)  # @@character:outfit:emotion@@
             prompt = tag_replacer.replace(prompt)
             prompt = dynamic_replacer.replace(prompt)
             iterations += 1

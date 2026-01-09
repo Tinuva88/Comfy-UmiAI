@@ -1,0 +1,172 @@
+# UmiAI Expression/Emotion Presets
+# Add your own emotions below following this format
+
+positive:
+  happy:
+    prompt: "happy, smiling, cheerful expression, joyful"
+    tags: ["happy", "smiling", "cheerful"]
+    intensity: 1.0
+  excited:
+    prompt: "excited, enthusiastic, energetic, eager"
+    tags: ["excited", "enthusiastic", "energetic"]
+    intensity: 1.0
+  laughing:
+    prompt: "laughing, joyful, open mouth smile, amused"
+    tags: ["laughing", "joyful", "amused"]
+    intensity: 1.0
+  content:
+    prompt: "content, peaceful smile, satisfied, calm"
+    tags: ["content", "satisfied", "calm"]
+    intensity: 0.7
+  loving:
+    prompt: "loving, affectionate, warm smile, tender"
+    tags: ["loving", "affectionate", "warm"]
+    intensity: 0.8
+  proud:
+    prompt: "proud, accomplished, satisfied smirk"
+    tags: ["proud", "accomplished", "satisfied"]
+    intensity: 0.8
+  hopeful:
+    prompt: "hopeful, optimistic, expectant expression"
+    tags: ["hopeful", "optimistic", "expectant"]
+    intensity: 0.7
+
+negative:
+  sad:
+    prompt: "sad, melancholy, downcast expression, sorrowful"
+    tags: ["sad", "melancholy", "sorrowful"]
+    intensity: 1.0
+  crying:
+    prompt: "crying, tears, emotional, weeping"
+    tags: ["crying", "tears", "emotional"]
+    intensity: 1.0
+  angry:
+    prompt: "angry, furious, intense expression, rage"
+    tags: ["angry", "furious", "rage"]
+    intensity: 1.0
+  annoyed:
+    prompt: "annoyed, irritated, frowning, displeased"
+    tags: ["annoyed", "irritated", "frowning"]
+    intensity: 0.7
+  scared:
+    prompt: "scared, frightened, fearful expression, terror"
+    tags: ["scared", "frightened", "fearful"]
+    intensity: 1.0
+  worried:
+    prompt: "worried, anxious, concerned expression"
+    tags: ["worried", "anxious", "concerned"]
+    intensity: 0.8
+  disgusted:
+    prompt: "disgusted, repulsed expression, grossed out"
+    tags: ["disgusted", "repulsed"]
+    intensity: 0.9
+  frustrated:
+    prompt: "frustrated, exasperated, fed up"
+    tags: ["frustrated", "exasperated"]
+    intensity: 0.8
+  jealous:
+    prompt: "jealous, envious expression, resentful"
+    tags: ["jealous", "envious", "resentful"]
+    intensity: 0.7
+  lonely:
+    prompt: "lonely, isolated, alone, forlorn"
+    tags: ["lonely", "isolated", "forlorn"]
+    intensity: 0.8
+
+neutral:
+  neutral:
+    prompt: "neutral expression, calm, composed"
+    tags: ["neutral", "calm", "composed"]
+    intensity: 0.5
+  serious:
+    prompt: "serious, stern, focused expression"
+    tags: ["serious", "stern", "focused"]
+    intensity: 0.7
+  thoughtful:
+    prompt: "thoughtful, pensive, contemplating, deep in thought"
+    tags: ["thoughtful", "pensive", "contemplating"]
+    intensity: 0.7
+  curious:
+    prompt: "curious, interested, inquisitive, questioning look"
+    tags: ["curious", "interested", "inquisitive"]
+    intensity: 0.8
+  bored:
+    prompt: "bored, uninterested, indifferent expression"
+    tags: ["bored", "uninterested", "indifferent"]
+    intensity: 0.6
+  sleepy:
+    prompt: "sleepy, drowsy, tired eyes, yawning"
+    tags: ["sleepy", "drowsy", "tired"]
+    intensity: 0.7
+  confused:
+    prompt: "confused, puzzled, questioning look, perplexed"
+    tags: ["confused", "puzzled", "perplexed"]
+    intensity: 0.8
+
+expressive:
+  shy:
+    prompt: "shy, blushing, embarrassed, timid"
+    tags: ["shy", "blushing", "embarrassed"]
+    intensity: 0.8
+  confident:
+    prompt: "confident, self-assured, smirking, bold"
+    tags: ["confident", "self-assured", "bold"]
+    intensity: 0.9
+  determined:
+    prompt: "determined, resolute, fierce eyes, focused"
+    tags: ["determined", "resolute", "fierce"]
+    intensity: 1.0
+  surprised:
+    prompt: "surprised, shocked, wide eyes, astonished"
+    tags: ["surprised", "shocked", "astonished"]
+    intensity: 1.0
+  smug:
+    prompt: "smug, self-satisfied, knowing smile"
+    tags: ["smug", "self-satisfied", "knowing"]
+    intensity: 0.8
+  mischievous:
+    prompt: "mischievous, playful, trouble-making grin"
+    tags: ["mischievous", "playful", "grin"]
+    intensity: 0.8
+  embarrassed:
+    prompt: "embarrassed, flustered, red face, awkward"
+    tags: ["embarrassed", "flustered", "awkward"]
+    intensity: 0.9
+  seductive:
+    prompt: "seductive, alluring, bedroom eyes, sultry"
+    tags: ["seductive", "alluring", "sultry"]
+    intensity: 0.9
+  innocent:
+    prompt: "innocent, pure, naive expression, sweet"
+    tags: ["innocent", "pure", "sweet"]
+    intensity: 0.7
+  fierce:
+    prompt: "fierce, intense, warrior expression, powerful"
+    tags: ["fierce", "intense", "powerful"]
+    intensity: 1.0
+
+special:
+  yandere:
+    prompt: "yandere expression, obsessive, intense eyes, unsettling smile"
+    tags: ["yandere", "obsessive", "intense"]
+    intensity: 1.0
+  tsundere:
+    prompt: "tsundere expression, blushing, looking away, flustered but defiant"
+    tags: ["tsundere", "blushing", "defiant"]
+    intensity: 0.9
+  ahegao:
+    prompt: "ahegao, exaggerated pleasure expression"
+    tags: ["ahegao", "exaggerated"]
+    intensity: 1.0
+  poker_face:
+    prompt: "poker face, expressionless, blank stare"
+    tags: ["poker face", "expressionless", "blank"]
+    intensity: 0.3
+  wink:
+    prompt: "winking, one eye closed, playful"
+    tags: ["winking", "playful"]
+    intensity: 0.7
+  tongue_out:
+    prompt: "tongue out, playful, teasing"
+    tags: ["tongue out", "playful", "teasing"]
+    intensity: 0.7

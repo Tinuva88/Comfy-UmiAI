@@ -106,43 +106,25 @@ def escape_unweighted_colons(prompt):
 
 def parse_wildcard_weight(line):
     """
-    Parse a wildcard file line to extract value, weight, and tags.
-
-    Format: "text::tag1,tag2:weight" or "text:weight" or "text::tags" or just "text"
-
+    Parse a wildcard file line to extract value and tags.
+    
+    Format: "text::tag1,tag2" or just "text"
+    Weight parsing via colon has been removed to avoid conflicts with entries like "show:1988"
+    
     Returns:
         dict: {'value': str, 'weight': float, 'tags': list}
     """
     value = line
-    weight = 1.0
+    weight = 1.0  # Weight is always 1.0 now (feature removed)
     tags = []
 
-    # Check for tags (using :: separator)
+    # Check for tags (using :: separator only - unambiguous)
     if '::' in line:
         parts = line.split('::', 1)
         value = parts[0].strip()
         remainder = parts[1].strip()
-
-        # Check if remainder has weight at the end
-        weight_parts = remainder.rsplit(':', 1)
-        if len(weight_parts) == 2 and weight_parts[1].strip().replace('.', '', 1).isdigit():
-            # Has tags and weight: "text::tag1,tag2:weight"
-            tags = [t.strip() for t in weight_parts[0].split(',') if t.strip()]
-            weight = float(weight_parts[1].strip())
-        else:
-            # Just tags: "text::tag1,tag2"
-            tags = [t.strip() for t in remainder.split(',') if t.strip()]
-    elif ':' in line:
-        parts = line.rsplit(':', 1)
-        # Only treat as weight if:
-        # 1. The part after colon is a valid number
-        # 2. The part before colon doesn't end with a closing paren (not a tag like "char_(name:1999)")
-        if (len(parts) == 2 and
-            parts[1].strip().replace('.', '', 1).isdigit() and
-            not parts[0].rstrip().endswith(')')):
-            # This is a weighted entry
-            value = parts[0].strip()
-            weight = float(parts[1].strip())
+        # Parse tags from remainder
+        tags = [t.strip() for t in remainder.split(',') if t.strip()]
 
     return {
         'value': value,
@@ -562,12 +544,17 @@ class DynamicPromptReplacer:
                     return ""
                 return variants[self.seed % len(variants)]
 
-        # Enhanced percentage support: {25%Red|75%Blue} or {50%yes|no}
-        # Supports multiple percentages per option
+        # Enhanced percentage support with new algorithm:
+        # {Red|Blue|Yellow|Green} - Equal 25% each (no percentages)
+        # {15%Red|15%Blue|15%Yellow|10%Green} - Total 55%, 45% blank chance
+        # {35%Red|35%Blue|35%Yellow|35%Green} - Total 140%, normalized to ~25% each
+        # {115%Red|25%Blue|Yellow|Green} - Total 140%, Y/G get 0%
+        # {75%Red|Blue|Yellow|Green} - 75% R, remaining 25% split among B/Y/G (8.33% each)
         if '%' in content and '$$' not in content:
             parts = content.split('|')
             options = []
-            total_pct = 0
+            total_explicit_pct = 0
+            unassigned_count = 0
             has_percentage = False
             
             for part in parts:
@@ -578,44 +565,59 @@ class DynamicPromptReplacer:
                     try:
                         pct = float(pct_split[0])
                         text = pct_split[1].strip() if len(pct_split) > 1 else ""
-                        options.append((pct, text))
-                        total_pct += pct
+                        options.append({'pct': pct, 'text': text, 'has_pct': True})
+                        total_explicit_pct += pct
                         has_percentage = True
                     except ValueError:
                         # Not a valid percentage, treat as regular option
-                        options.append((None, part))
+                        options.append({'pct': None, 'text': part, 'has_pct': False})
+                        unassigned_count += 1
                 else:
-                    # No percentage, will get equal share of remaining
-                    options.append((None, part))
+                    # No percentage specified
+                    options.append({'pct': None, 'text': part, 'has_pct': False})
+                    unassigned_count += 1
             
             if has_percentage:
-                # Calculate probabilities
-                # If total < 100%, remaining = chance of empty result
-                # If total > 100%, normalize all to sum to 100%
+                # Calculate the effective max and distribute unassigned options
+                # Rule: Unassigned options get 0% if sum >= 100%, else split remaining
                 
-                roll = self.rng.random() * 100
-                
-                if total_pct > 100:
-                    # Normalize: scale all percentages proportionally
-                    scale = 100 / total_pct
-                    cumulative = 0
-                    for pct, text in options:
-                        if pct is not None:
-                            cumulative += pct * scale
-                            if roll < cumulative:
-                                return text
-                    # Fallback to last option
-                    return options[-1][1] if options else ""
+                if total_explicit_pct >= 100:
+                    # No room for unassigned options - they get 0%
+                    for opt in options:
+                        if opt['pct'] is None:
+                            opt['pct'] = 0
                 else:
-                    # total <= 100%: remaining = empty chance
-                    cumulative = 0
-                    for pct, text in options:
-                        if pct is not None:
-                            cumulative += pct
-                            if roll < cumulative:
-                                return text
-                    # Roll landed in the "empty" zone (remaining percentage)
-                    return ""
+                    # Distribute remaining (100 - sum) equally among unassigned
+                    remaining = 100 - total_explicit_pct
+                    share = remaining / unassigned_count if unassigned_count > 0 else 0
+                    for opt in options:
+                        if opt['pct'] is None:
+                            opt['pct'] = share
+                
+                # Recalculate total after distribution
+                total_pct = sum(opt['pct'] for opt in options)
+                
+                # Normalize if total > 100
+                if total_pct > 100:
+                    scale = 100 / total_pct
+                    for opt in options:
+                        opt['pct'] *= scale
+                    total_pct = 100
+                
+                # Roll and pick
+                roll = self.rng.random() * 100
+                cumulative = 0
+                
+                for opt in options:
+                    cumulative += opt['pct']
+                    if roll < cumulative:
+                        return opt['text']
+                
+                # If we're here and total < 100, roll landed in "blank" zone
+                # If total == 100, return last option as fallback
+                if total_pct >= 100 and options:
+                    return options[-1]['text']
+                return ""
 
         # Range selection: {2-3$$opt1|opt2|opt3|opt4} picks 2-3 random options
         if '$$' in content:
@@ -793,10 +795,73 @@ class ConditionalReplacer:
     Supports: tag existence, variable checks, logical operators (AND, OR, NOT, XOR, NAND, NOR)
     """
     def __init__(self):
-        self.regex = re.compile(
-            r'\[if\s+([^:|\]]+?)\s*:\s*((?:(?!\[if).)*?)(?:\s*\|\s*((?:(?!\[if).)*?))?\]', 
-            re.IGNORECASE | re.DOTALL
-        )
+        # Simple pattern to find [if starts - we'll parse brackets manually
+        self.if_start = re.compile(r'\[if\s+', re.IGNORECASE)
+
+    def find_matching_bracket(self, text, start):
+        """Find the closing ] that matches the opening [ at start, accounting for nested brackets."""
+        depth = 1
+        i = start + 1
+        while i < len(text) and depth > 0:
+            if text[i] == '[':
+                depth += 1
+            elif text[i] == ']':
+                depth -= 1
+            i += 1
+        return i - 1 if depth == 0 else -1
+
+    def parse_conditional(self, text, start):
+        """
+        Parse a conditional starting at position 'start'.
+        Returns (end_pos, condition, true_text, false_text) or None if invalid.
+        """
+        # Find the [ position
+        bracket_start = text.rfind('[', 0, start + 4)  # [if is 3 chars before content
+        if bracket_start == -1:
+            return None
+        
+        # Find matching ]
+        end = self.find_matching_bracket(text, bracket_start)
+        if end == -1:
+            return None
+        
+        # Extract full content between [if and ]
+        inner = text[bracket_start + 1:end]
+        
+        # Parse: "if condition : true_text | false_text" or "if condition : true_text"
+        if_match = re.match(r'if\s+(.+?)\s*:\s*', inner, re.IGNORECASE | re.DOTALL)
+        if not if_match:
+            return None
+        
+        condition = if_match.group(1).strip()
+        rest = inner[if_match.end():]
+        
+        # Find the | separator (but not inside nested brackets or braces)
+        depth_bracket = 0
+        depth_brace = 0
+        pipe_pos = -1
+        
+        for i, c in enumerate(rest):
+            if c == '[':
+                depth_bracket += 1
+            elif c == ']':
+                depth_bracket -= 1
+            elif c == '{':
+                depth_brace += 1
+            elif c == '}':
+                depth_brace -= 1
+            elif c == '|' and depth_bracket == 0 and depth_brace == 0:
+                pipe_pos = i
+                break
+        
+        if pipe_pos == -1:
+            true_text = rest
+            false_text = ""
+        else:
+            true_text = rest[:pipe_pos]
+            false_text = rest[pipe_pos + 1:]
+        
+        return (end + 1, condition, true_text.strip(), false_text.strip())
 
     def evaluate_logic(self, condition, context, variables=None):
         """Evaluate a logical condition against the context."""
@@ -832,6 +897,19 @@ class ConditionalReplacer:
                         expression.append('nor')
                     else:
                         expression.append(ops[upper_token])
+                elif '!=' in token:
+                    # Handle inequality: $var!=value
+                    left, right = token.split('!=', 1)
+                    left = left.strip()
+                    right = right.strip()
+                    
+                    if left.startswith('$'):
+                        var_name = left[1:]
+                        left_val = str(variables.get(var_name, "")).lower()
+                    else:
+                        left_val = left.lower()
+                    
+                    expression.append(str(left_val != right.lower()))
                 elif '=' in token:
                     left, right = token.split('=', 1)
                     left = left.strip()
@@ -885,25 +963,32 @@ class ConditionalReplacer:
         if variables is None: 
             variables = {}
         
-        while True:
-            match = self.regex.search(prompt)
-            if not match: 
+        max_iterations = 100  # Prevent infinite loops
+        iteration = 0
+        
+        while iteration < max_iterations:
+            match = self.if_start.search(prompt)
+            if not match:
                 break
             
-            full_tag = match.group(0)
-            condition = match.group(1).strip()
-            true_text = match.group(2)
-            false_text = match.group(3) if match.group(3) else ""
+            parsed = self.parse_conditional(prompt, match.start())
+            if not parsed:
+                # Invalid conditional, skip past it
+                break
             
-            # Clean the context by removing ALL conditional tags
-            context = self.regex.sub("", prompt)
+            end_pos, condition, true_text, false_text = parsed
+            full_tag = prompt[match.start() - 1:end_pos]  # Include the leading [
+            
+            # Clean the context by removing current tag to avoid self-reference
+            context = prompt[:match.start() - 1] + prompt[end_pos:]
 
             if self.evaluate_logic(condition, context, variables):
                 replacement = true_text
             else:
                 replacement = false_text
             
-            prompt = prompt.replace(full_tag, replacement, 1)
+            prompt = prompt[:match.start() - 1] + replacement + prompt[end_pos:]
+            iteration += 1
         
         return prompt
 
@@ -1099,8 +1184,9 @@ class TagReplacerBase:
     def __init__(self, tag_selector):
         self.tag_selector = tag_selector
         self.replacement_history = []  # Track replacements for cycle detection
-        self.clean_regex = re.compile(r'\[clean:(.*?)\]', re.IGNORECASE)
-        self.shuffle_regex = re.compile(r'\[shuffle:(.*?)\]', re.IGNORECASE)
+        # Use more flexible patterns that can handle content with brackets
+        self.clean_regex = re.compile(r'\[clean:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
+        self.shuffle_regex = re.compile(r'\[shuffle:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
 
     def replace_functions(self, text):
         """Process [shuffle:] and [clean:] tags."""
@@ -1117,9 +1203,14 @@ class TagReplacerBase:
 
         def _clean(match):
             content = match.group(1)
+            # Remove extra whitespace
             content = re.sub(r'\s+', ' ', content)
-            content = re.sub(r',\s*,', ',', content)
+            # Remove empty commas (,,)
+            content = re.sub(r',\s*,+', ',', content)
+            # Clean up spaces around commas
             content = content.replace(' ,', ',')
+            content = re.sub(r',\s+', ', ', content)
+            # Remove leading/trailing commas and spaces
             return content.strip(', ')
 
         text = self.shuffle_regex.sub(_shuffle, text)
@@ -1136,3 +1227,150 @@ class TagReplacerBase:
                 return f"[PROMPT_FILE_NOT_FOUND: {filename}]"
         except Exception as e:
             return f"[PROMPT_FILE_ERROR: {filename}: {str(e)}]"
+
+
+# ==============================================================================
+# CHARACTER REPLACER
+# ==============================================================================
+
+class CharacterReplacer:
+    """
+    Replaces @@character:outfit:emotion@@ syntax with expanded character prompts.
+    
+    Syntax:
+        @@elena@@                   - Base character only
+        @@elena:casual@@            - Character with outfit
+        @@elena:casual:happy@@      - Character with outfit and emotion
+    """
+    
+    # Regex pattern for @@character:outfit:emotion@@
+    pattern = re.compile(r'@@([a-zA-Z0-9_-]+)(?::([a-zA-Z0-9_-]+))?(?::([a-zA-Z0-9_-]+))?@@')
+    
+    # Cache for character data
+    _cache = {}
+    _mtime_cache = {}
+    
+    @classmethod
+    def get_characters_path(cls):
+        """Get the path to the characters folder."""
+        # Check in the UmiAI custom node folder
+        node_path = os.path.dirname(os.path.abspath(__file__))
+        chars_path = os.path.join(node_path, "characters")
+        if os.path.isdir(chars_path):
+            return chars_path
+        return None
+    
+    @classmethod
+    def list_characters(cls):
+        """List all available character names."""
+        chars_path = cls.get_characters_path()
+        if not chars_path:
+            return []
+        
+        characters = []
+        for item in os.listdir(chars_path):
+            item_path = os.path.join(chars_path, item)
+            profile_path = os.path.join(item_path, "profile.yaml")
+            if os.path.isdir(item_path) and os.path.isfile(profile_path):
+                characters.append(item)
+        
+        return characters
+    
+    @classmethod
+    def load_character(cls, name):
+        """Load a character profile, using cache if available."""
+        chars_path = cls.get_characters_path()
+        if not chars_path:
+            return None
+        
+        profile_path = os.path.join(chars_path, name, "profile.yaml")
+        if not os.path.isfile(profile_path):
+            return None
+        
+        # Check if cached and still valid
+        mtime = os.path.getmtime(profile_path)
+        if name in cls._cache and cls._mtime_cache.get(name) == mtime:
+            return cls._cache[name]
+        
+        # Load fresh
+        try:
+            with open(profile_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+                cls._cache[name] = data
+                cls._mtime_cache[name] = mtime
+                return data
+        except Exception as e:
+            print(f"[UmiAI Character] Error loading {name}: {e}")
+            return None
+    
+    @classmethod
+    def expand_character(cls, name, outfit=None, emotion=None, include_lora=True):
+        """
+        Expand a character reference into a full prompt.
+        
+        Args:
+            name: Character folder name (e.g., 'elena')
+            outfit: Outfit name (e.g., 'casual')
+            emotion: Emotion name (e.g., 'happy')
+            include_lora: Whether to include the LoRA tag
+            
+        Returns:
+            Expanded prompt string or original reference if not found
+        """
+        data = cls.load_character(name)
+        if not data:
+            return f"@@{name}@@"  # Return original if not found
+        
+        parts = []
+        
+        # Add LoRA if available
+        if include_lora and data.get('lora'):
+            lora_name = data['lora']
+            lora_strength = data.get('lora_strength', 1.0)
+            parts.append(f"<lora:{lora_name}:{lora_strength}>")
+        
+        # Add base prompt
+        if data.get('base_prompt'):
+            parts.append(data['base_prompt'])
+        
+        # Add outfit if specified
+        if outfit and 'outfits' in data:
+            outfit_lower = outfit.lower()
+            if outfit_lower in data['outfits']:
+                outfit_data = data['outfits'][outfit_lower]
+                if isinstance(outfit_data, dict):
+                    parts.append(outfit_data.get('prompt', ''))
+                else:
+                    parts.append(str(outfit_data))
+        
+        # Add emotion if specified
+        if emotion and 'emotions' in data:
+            emotion_lower = emotion.lower()
+            if emotion_lower in data['emotions']:
+                emotion_data = data['emotions'][emotion_lower]
+                if isinstance(emotion_data, dict):
+                    parts.append(emotion_data.get('prompt', ''))
+                else:
+                    parts.append(str(emotion_data))
+        
+        return ", ".join(filter(None, parts))
+    
+    @classmethod
+    def replace(cls, text):
+        """
+        Replace all @@character:outfit:emotion@@ patterns in text.
+        
+        Args:
+            text: Input text with character references
+            
+        Returns:
+            Text with character references expanded
+        """
+        def _replace(match):
+            name = match.group(1)
+            outfit = match.group(2)  # May be None
+            emotion = match.group(3)  # May be None
+            return cls.expand_character(name, outfit, emotion)
+        
+        return cls.pattern.sub(_replace, text)
+

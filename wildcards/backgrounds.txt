@@ -1,0 +1,50 @@
+# Studio backgrounds
+white background, studio lighting, clean backdrop, simple background
+gray background, soft studio lighting, neutral backdrop
+gradient background, professional studio, smooth transition
+dark background, black backdrop, dramatic
+transparent background, png, no background, isolated
+
+# Outdoor nature
+outdoor, nature background, trees, grass, natural setting
+forest background, deep woods, trees, foliage
+beach background, ocean, sand, coastal, seaside
+mountain background, peaks, scenic, majestic
+garden background, flowers, plants, beautiful garden
+park background, grass, trees, benches, peaceful
+sunset background, orange sky, golden hour, scenic
+night background, dark sky, stars, moonlight
+rainy day, rain, wet, umbrellas
+snowy background, winter, snow, cold
+
+# Urban/city
+city background, urban setting, buildings, cityscape
+street background, road, urban, city street
+rooftop, city view, high vantage point
+alley, urban, narrow passage
+neon city, night city, cyberpunk aesthetic
+
+# Indoor
+indoor, room interior, home setting, residential
+bedroom interior, bed, cozy, personal space
+living room interior, sofa, comfortable, home
+kitchen interior, cooking space
+office interior, desk, professional setting, work
+classroom interior, desks, school setting
+cafe interior, coffee shop, cozy atmosphere
+library interior, bookshelves, books, quiet
+gym interior, workout equipment, fitness
+
+# Fantasy/special
+fantasy castle background, medieval, magical, towers
+magical forest, enchanted woods, fantasy, mystical
+floating in clouds, sky, heavenly, ethereal
+underwater background, ocean depths, bubbles, aquatic
+space background, stars, nebula, cosmic, galaxy
+spaceship interior, futuristic, sci-fi, technology
+cyberpunk city, neon lights, futuristic, dystopian
+
+# Abstract
+abstract background, colorful, artistic patterns
+geometric background, shapes, abstract, modern
+bokeh background, blurred lights, soft focus

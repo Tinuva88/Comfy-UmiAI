@@ -1,0 +1,94 @@
+{
+    "last_node_id": 6,
+    "last_link_id": 5,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "UmiCharacterBatch",
+            "pos": [
+                100,
+                200
+            ],
+            "size": {
+                "0": 315,
+                "1": 180
+            },
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "outputs": [
+                {
+                    "name": "prompts_list",
+                    "type": "STRING",
+                    "links": [
+                        1
+                    ]
+                },
+                {
+                    "name": "labels_list",
+                    "type": "STRING",
+                    "links": []
+                },
+                {
+                    "name": "count",
+                    "type": "INT",
+                    "links": []
+                }
+            ],
+            "widgets_values": [
+                "elena",
+                "all_outfits"
+            ],
+            "title": "UmiAI Character Batch Generator"
+        },
+        {
+            "id": 2,
+            "type": "UmiSpriteExport",
+            "pos": [
+                750,
+                200
+            ],
+            "size": {
+                "0": 315,
+                "1": 180
+            },
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+                {
+                    "name": "images",
+                    "type": "IMAGE",
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "name": "output_path",
+                    "type": "STRING",
+                    "links": []
+                }
+            ],
+            "title": "UmiAI Sprite Export"
+        }
+    ],
+    "links": [
+        [
+            1,
+            1,
+            0,
+            null,
+            null,
+            "STRING"
+        ]
+    ],
+    "groups": [],
+    "config": {},
+    "extra": {
+        "info": {
+            "name": "UmiAI Character Batch Workflow",
+            "description": "Generate all outfit/emotion variations for a character"
+        }
+    },
+    "version": 0.4
+}

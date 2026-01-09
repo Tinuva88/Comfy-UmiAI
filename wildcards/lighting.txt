@@ -1,0 +1,37 @@
+# Natural lighting
+natural lighting, soft shadows, daylight
+sunlight, bright, sunny day
+overcast lighting, cloudy, diffused
+shade, indirect light, soft
+
+# Studio lighting
+studio lighting, professional, even illumination
+soft lighting, diffused, gentle, flattering
+flat lighting, even, no harsh shadows
+three-point lighting, professional
+
+# Time of day
+golden hour lighting, warm tones, sunset light
+blue hour lighting, cool tones, twilight
+morning light, early sun, fresh
+midday sun, harsh shadows, bright
+evening light, warm, long shadows
+
+# Dramatic
+dramatic lighting, high contrast, chiaroscuro
+rim lighting, backlit, silhouette edges, halo
+low key lighting, dark, moody
+high key lighting, bright, minimal shadows
+spotlight, focused light, dramatic
+
+# Colored lighting
+neon lighting, colorful, vibrant, glowing
+warm lighting, orange tones, cozy
+cool lighting, blue tones, cold
+red lighting, dramatic, intense
+purple lighting, ethereal, mysterious
+
+# Cinematic
+cinematic lighting, movie quality, professional
+film noir lighting, high contrast, shadows
+volumetric lighting, god rays, atmospheric

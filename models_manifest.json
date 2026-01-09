@@ -1,0 +1,259 @@
+{
+    "version": "1.3",
+    "description": "Recommended models for UmiAI Character Consistency System (VNCCS-style)",
+    "source_attribution": "Models hosted by Tinuva - https://huggingface.co/Tinuva/Comfy-Umi",
+    "categories": {
+        "checkpoints": {
+            "name": "SD Checkpoints",
+            "description": "Base Stable Diffusion models (SDXL/Illustrious recommended)",
+            "target_dir": "checkpoints",
+            "models": []
+        },
+        "character_loras": {
+            "name": "Character Consistency LoRAs",
+            "description": "LoRAs for maintaining character appearance consistency",
+            "target_dir": "loras",
+            "models": [
+                {
+                    "name": "vn_character_sheet_v4",
+                    "filename": "vn_character_sheet_v4.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/vn_character_sheet_v4.safetensors",
+                    "size_mb": 228,
+                    "required": true,
+                    "description": "Main character sheet LoRA for consistency"
+                },
+                {
+                    "name": "vn_character_sheet",
+                    "filename": "vn_character_sheet.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/vn_character_sheet.safetensors",
+                    "size_mb": 228,
+                    "required": false,
+                    "description": "Legacy character sheet LoRA"
+                }
+            ]
+        },
+        "dmd2_loras": {
+            "name": "DMD2 Speed LoRAs",
+            "description": "LoRAs for faster generation (4-step)",
+            "target_dir": "loras/DMD2",
+            "models": [
+                {
+                    "name": "dmd2_sdxl_4step",
+                    "filename": "dmd2_sdxl_4step_lora_fp16.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/DMD2/dmd2_sdxl_4step_lora_fp16.safetensors",
+                    "size_mb": 394,
+                    "required": false,
+                    "description": "4-step generation for SDXL"
+                }
+            ]
+        },
+        "illustrious_loras": {
+            "name": "Illustrious LoRAs",
+            "description": "Style LoRAs for Illustrious models",
+            "target_dir": "loras/IL",
+            "models": [
+                {
+                    "name": "mimimeter",
+                    "filename": "mimimeter.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/IL/mimimeter.safetensors",
+                    "size_mb": 52,
+                    "required": false,
+                    "description": "Style consistency LoRA"
+                }
+            ]
+        },
+        "qwen_loras": {
+            "name": "QWEN VNCCS Helper LoRAs",
+            "description": "Helper LoRAs for clothes transfer, posing, and more",
+            "target_dir": "loras/qwen/VNCCS",
+            "models": [
+                {
+                    "name": "clothes_helper",
+                    "filename": "ClothesHelperUltimateV1_000005100.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/ClothesHelperUltimateV1_000005100.safetensors",
+                    "size_mb": 148,
+                    "required": false,
+                    "description": "Clothes generation helper"
+                },
+                {
+                    "name": "transfer_clothes",
+                    "filename": "TransferClothes_000006700.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/TransferClothes_000006700.safetensors",
+                    "size_mb": 295,
+                    "required": false,
+                    "description": "Clothes transfer between characters"
+                },
+                {
+                    "name": "poser_helper",
+                    "filename": "poser_helper_v2_000004200.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/poser_helper_v2_000004200.safetensors",
+                    "size_mb": 295,
+                    "required": false,
+                    "description": "Pose consistency helper"
+                }
+            ]
+        },
+        "controlnet": {
+            "name": "ControlNet Models",
+            "description": "Models for pose and structure control",
+            "target_dir": "controlnet/SDXL",
+            "models": [
+                {
+                    "name": "anytest_v4",
+                    "filename": "AnytestV4.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/controlnet/SDXL/AnytestV4.safetensors",
+                    "size_mb": 2500,
+                    "required": true,
+                    "description": "Multi-purpose ControlNet"
+                },
+                {
+                    "name": "illustrious_openpose",
+                    "filename": "IllustriousXL_openpose.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/controlnet/SDXL/IllustriousXL_openpose.safetensors",
+                    "size_mb": 2500,
+                    "required": true,
+                    "description": "OpenPose for character poses"
+                }
+            ]
+        },
+        "face_detection": {
+            "name": "Face & Body Detection Models",
+            "description": "YOLO models for Face Detailer and body parts",
+            "target_dir": "ultralytics/bbox",
+            "models": [
+                {
+                    "name": "face_yolov8m",
+                    "filename": "face_yolov8m.pt",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/face_yolov8m.pt",
+                    "size_mb": 52,
+                    "required": true,
+                    "description": "Face detection (bounding box)"
+                },
+                {
+                    "name": "face_yolov9c",
+                    "filename": "face_yolov9c.pt",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/face_yolov9c.pt",
+                    "size_mb": 52,
+                    "required": false,
+                    "description": "Alternate face detection"
+                },
+                {
+                    "name": "foot_yolov8l",
+                    "filename": "foot-yolov8l.pt",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/foot-yolov8l.pt",
+                    "size_mb": 88,
+                    "required": false,
+                    "description": "Foot detection"
+                },
+                {
+                    "name": "hand_yolov8s",
+                    "filename": "hand_yolov8s.pt",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/hand_yolov8s.pt",
+                    "size_mb": 23,
+                    "required": false,
+                    "description": "Hand detection"
+                }
+            ]
+        },
+        "segmentation": {
+            "name": "Segmentation Models",
+            "description": "YOLO segmentation models for masking",
+            "target_dir": "ultralytics/segm",
+            "models": [
+                {
+                    "name": "face_yolov8m_seg",
+                    "filename": "face_yolov8m-seg_60.pt",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/face_yolov8m-seg_60.pt",
+                    "size_mb": 55,
+                    "required": true,
+                    "description": "Face segmentation"
+                },
+                {
+                    "name": "hair_yolov8n_seg",
+                    "filename": "hair_yolov8n-seg_60.pt",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/hair_yolov8n-seg_60.pt",
+                    "size_mb": 7,
+                    "required": false,
+                    "description": "Hair segmentation"
+                },
+                {
+                    "name": "person_yolov8m_seg",
+                    "filename": "person_yolov8m-seg.pt",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/person_yolov8m-seg.pt",
+                    "size_mb": 55,
+                    "required": false,
+                    "description": "Person/body segmentation"
+                }
+            ]
+        },
+        "sam": {
+            "name": "SAM Models",
+            "description": "Segment Anything for masking",
+            "target_dir": "sams",
+            "models": [
+                {
+                    "name": "sam_vit_b",
+                    "filename": "sam_vit_b_01ec64.pth",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/sams/sam_vit_b_01ec64.pth",
+                    "size_mb": 375,
+                    "required": true,
+                    "description": "SAM ViT-B for segmentation"
+                }
+            ]
+        },
+        "upscalers": {
+            "name": "Upscale Models",
+            "description": "For enhancing image quality",
+            "target_dir": "upscale_models",
+            "models": [
+                {
+                    "name": "4x_apisr",
+                    "filename": "4x_APISR_GRL_GAN_generator.pth",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/upscale_models/4x_APISR_GRL_GAN_generator.pth",
+                    "size_mb": 7,
+                    "required": false,
+                    "description": "4x upscaler"
+                },
+                {
+                    "name": "2x_apisr",
+                    "filename": "2x_APISR_RRDB_GAN_generator.pth",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/upscale_models/2x_APISR_RRDB_GAN_generator.pth",
+                    "size_mb": 18,
+                    "required": false,
+                    "description": "2x upscaler"
+                }
+            ]
+        },
+        "captioners": {
+            "name": "Image Captioners & Taggers",
+            "description": "Models for auto-captioning images (for LoRA training)",
+            "target_dir": "clip_vision",
+            "models": [
+                {
+                    "name": "blip_base",
+                    "filename": "model_base_caption_capfilt_large.pth",
+                    "url": "https://huggingface.co/Salesforce/blip-image-captioning-base/resolve/main/model_base_caption_capfilt_large.pth",
+                    "size_mb": 990,
+                    "required": false,
+                    "description": "BLIP base captioner - natural language captions"
+                },
+                {
+                    "name": "wd14_vit",
+                    "filename": "wd-v1-4-vit-tagger-v2.onnx",
+                    "url": "https://huggingface.co/SmilingWolf/wd-v1-4-vit-tagger-v2/resolve/main/model.onnx",
+                    "size_mb": 350,
+                    "required": false,
+                    "description": "WD14 tagger - anime/booru tag generation"
+                },
+                {
+                    "name": "florence2_base",
+                    "filename": "florence-2-base.safetensors",
+                    "url": "https://huggingface.co/microsoft/Florence-2-base/resolve/main/model.safetensors",
+                    "size_mb": 460,
+                    "required": false,
+                    "description": "Florence-2 - versatile vision-language model"
+                }
+            ]
+        }
+    }
+}

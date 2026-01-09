@@ -1,5 +1,10 @@
 from .nodes import UmiAIWildcardNode, UmiSaveImage
 from .nodes_lite import UmiAIWildcardNodeLite
+from .nodes_character import UmiCharacterManager, UmiCharacterBatch, UmiSpriteExport, UmiCharacterInfo
+from .nodes_camera import UmiCameraControl, UmiVisualCameraControl
+from .nodes_power import UmiPoseLibrary, UmiExpressionMixer, UmiSceneComposer, UmiLoraAnimator, UmiPromptTemplate
+from .nodes_dataset import UmiDatasetExport, UmiCaptionGenerator
+from .nodes_caption import UmiAutoCaption, UmiCaptionEnhancer
 from server import PromptServer
 from aiohttp import web
 import os
@@ -106,6 +111,34 @@ async def fetch_globals(request):
         "count": len(variables)
     })
 
+@PromptServer.instance.routes.get("/umiapp/characters")
+async def fetch_characters(request):
+    """Fetch available characters and their profiles for autocomplete and external tools."""
+    from .nodes_character import CharacterLoader
+    
+    characters = CharacterLoader.list_characters()
+    character_data = {}
+    
+    for char_name in characters:
+        if char_name == "none":
+            continue
+        data = CharacterLoader.load_character(char_name)
+        if data:
+            character_data[char_name] = {
+                "name": data.get('name', char_name),
+                "description": data.get('description', ''),
+                "lora": data.get('lora', ''),
+                "outfits": list(data.get('outfits', {}).keys()),
+                "emotions": list(data.get('emotions', {}).keys()),
+                "poses": list(data.get('poses', {}).keys()),
+            }
+    
+    return web.json_response({
+        "characters": list(character_data.keys()),
+        "profiles": character_data,
+        "count": len(character_data)
+    })
+
 @PromptServer.instance.routes.get("/umiapp/preview")
 async def preview_wildcard(request):
     """Preview the contents of a wildcard file for hover tooltips."""
@@ -132,13 +165,9 @@ async def preview_wildcard(request):
                                 break
                             line = line.strip()
                             if line and not line.startswith('#'):
-                                # Strip weights and tags for preview
+                                # Strip tags (:: separator) for preview
                                 if '::' in line:
                                     line = line.split('::')[0]
-                                elif ':' in line:
-                                    parts = line.rsplit(':', 1)
-                                    if len(parts) == 2 and parts[1].replace('.', '').isdigit():
-                                        line = parts[0]
                                 lines.append(line)
                         entries = lines
                     elif ext in ['yaml', 'yml']:
@@ -191,12 +220,9 @@ async def preview_wildcard_file(file_path, filename):
                         break
                     line = line.strip()
                     if line and not line.startswith('#'):
+                        # Strip tags (:: separator) for preview
                         if '::' in line:
                             line = line.split('::')[0]
-                        elif ':' in line:
-                            parts = line.rsplit(':', 1)
-                            if len(parts) == 2 and parts[1].replace('.', '').isdigit():
-                                line = parts[0]
                         lines.append(line)
                 entries = lines
             elif ext in ['yaml', 'yml']:
@@ -244,17 +270,258 @@ async def refresh_wildcards(request):
         **data
     })
 
+# ==============================================================================
+# MODEL DOWNLOADER API
+# ==============================================================================
+
+import json
+import asyncio
+import aiohttp
+
+# Download progress tracking
+_download_progress = {}
+
+def load_model_manifest():
+    """Load the model manifest file."""
+    manifest_path = os.path.join(os.path.dirname(__file__), "models_manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+@PromptServer.instance.routes.get("/umiapp/models/manifest")
+async def get_model_manifest(request):
+    """Return the full model manifest."""
+    manifest = load_model_manifest()
+    if not manifest:
+        return web.json_response({"error": "Manifest not found"}, status=404)
+    return web.json_response(manifest)
+
+@PromptServer.instance.routes.get("/umiapp/models/status")
+async def get_models_status(request):
+    """Check which models are installed."""
+    manifest = load_model_manifest()
+    if not manifest:
+        return web.json_response({"error": "Manifest not found"}, status=404)
+    
+    models_dir = folder_paths.models_dir
+    status = {}
+    total_required = 0
+    installed_required = 0
+    
+    for cat_id, category in manifest.get("categories", {}).items():
+        cat_status = {
+            "name": category.get("name", cat_id),
+            "models": []
+        }
+        
+        target_dir = os.path.join(models_dir, category.get("target_dir", ""))
+        
+        for model in category.get("models", []):
+            filename = model.get("filename", "")
+            model_path = os.path.join(target_dir, filename)
+            installed = os.path.exists(model_path)
+            
+            if model.get("required", False):
+                total_required += 1
+                if installed:
+                    installed_required += 1
+            
+            cat_status["models"].append({
+                "name": model.get("name", filename),
+                "filename": filename,
+                "installed": installed,
+                "required": model.get("required", False),
+                "size_mb": model.get("size_mb", 0)
+            })
+        
+        status[cat_id] = cat_status
+    
+    return web.json_response({
+        "status": status,
+        "summary": {
+            "total_required": total_required,
+            "installed_required": installed_required,
+            "ready": installed_required >= total_required
+        }
+    })
+
+@PromptServer.instance.routes.post("/umiapp/models/download")
+async def download_model(request):
+    """Start downloading a model."""
+    global _download_progress
+    
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    
+    category_id = data.get("category")
+    model_name = data.get("model")
+    
+    if not category_id or not model_name:
+        return web.json_response({"error": "category and model required"}, status=400)
+    
+    manifest = load_model_manifest()
+    if not manifest:
+        return web.json_response({"error": "Manifest not found"}, status=404)
+    
+    # Find the model
+    category = manifest.get("categories", {}).get(category_id)
+    if not category:
+        return web.json_response({"error": "Category not found"}, status=404)
+    
+    model = None
+    for m in category.get("models", []):
+        if m.get("name") == model_name:
+            model = m
+            break
+    
+    if not model:
+        return web.json_response({"error": "Model not found"}, status=404)
+    
+    # Prepare download
+    models_dir = folder_paths.models_dir
+    target_dir = os.path.join(models_dir, category.get("target_dir", ""))
+    os.makedirs(target_dir, exist_ok=True)
+    
+    target_path = os.path.join(target_dir, model.get("filename", ""))
+    url = model.get("url", "")
+    
+    if not url:
+        return web.json_response({"error": "No download URL"}, status=400)
+    
+    # Start async download
+    download_id = f"{category_id}_{model_name}"
+    _download_progress[download_id] = {
+        "status": "starting",
+        "progress": 0,
+        "total": model.get("size_mb", 0) * 1024 * 1024,
+        "downloaded": 0
+    }
+    
+    async def do_download():
+        try:
+            _download_progress[download_id]["status"] = "downloading"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        _download_progress[download_id]["status"] = "error"
+                        _download_progress[download_id]["error"] = f"HTTP {response.status}"
+                        return
+                    
+                    total = int(response.headers.get('content-length', 0))
+                    _download_progress[download_id]["total"] = total
+                    
+                    # Create parent directories if needed
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    
+                    with open(target_path, 'wb') as f:
+                        downloaded = 0
+                        async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            _download_progress[download_id]["downloaded"] = downloaded
+                            if total > 0:
+                                _download_progress[download_id]["progress"] = int(downloaded / total * 100)
+            
+            _download_progress[download_id]["status"] = "complete"
+            _download_progress[download_id]["progress"] = 100
+            print(f"[UmiAI] Downloaded: {target_path}")
+            
+        except Exception as e:
+            _download_progress[download_id]["status"] = "error"
+            _download_progress[download_id]["error"] = str(e)
+            print(f"[UmiAI] Download error: {e}")
+    
+    asyncio.create_task(do_download())
+    
+    return web.json_response({
+        "download_id": download_id,
+        "status": "started",
+        "target": target_path
+    })
+
+@PromptServer.instance.routes.get("/umiapp/models/progress")
+async def get_download_progress(request):
+    """Get download progress."""
+    download_id = request.query.get("id", "")
+    
+    if download_id and download_id in _download_progress:
+        return web.json_response(_download_progress[download_id])
+    
+    # Return all progress
+    return web.json_response(_download_progress)
+
+@PromptServer.instance.routes.post("/umiapp/models/download-all")
+async def download_all_required(request):
+    """Download all required models."""
+    manifest = load_model_manifest()
+    if not manifest:
+        return web.json_response({"error": "Manifest not found"}, status=404)
+    
+    queued = []
+    for cat_id, category in manifest.get("categories", {}).items():
+        for model in category.get("models", []):
+            if model.get("required", False):
+                # Check if already installed
+                models_dir = folder_paths.models_dir
+                target_dir = os.path.join(models_dir, category.get("target_dir", ""))
+                target_path = os.path.join(target_dir, model.get("filename", ""))
+                
+                if not os.path.exists(target_path):
+                    queued.append({
+                        "category": cat_id,
+                        "model": model.get("name")
+                    })
+    
+    return web.json_response({
+        "queued": queued,
+        "count": len(queued)
+    })
+
 # 2. Mappings
 NODE_CLASS_MAPPINGS = {
     "UmiAIWildcardNode": UmiAIWildcardNode,
     "UmiAIWildcardNodeLite": UmiAIWildcardNodeLite,
-    "UmiSaveImage": UmiSaveImage
+    "UmiSaveImage": UmiSaveImage,
+    "UmiCharacterManager": UmiCharacterManager,
+    "UmiCharacterBatch": UmiCharacterBatch,
+    "UmiSpriteExport": UmiSpriteExport,
+    "UmiCharacterInfo": UmiCharacterInfo,
+    "UmiCameraControl": UmiCameraControl,
+    "UmiVisualCameraControl": UmiVisualCameraControl,
+    "UmiPoseLibrary": UmiPoseLibrary,
+    "UmiExpressionMixer": UmiExpressionMixer,
+    "UmiSceneComposer": UmiSceneComposer,
+    "UmiLoraAnimator": UmiLoraAnimator,
+    "UmiPromptTemplate": UmiPromptTemplate,
+    "UmiDatasetExport": UmiDatasetExport,
+    "UmiCaptionGenerator": UmiCaptionGenerator,
+    "UmiAutoCaption": UmiAutoCaption,
+    "UmiCaptionEnhancer": UmiCaptionEnhancer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiAIWildcardNode": "UmiAI Wildcard Processor",
     "UmiAIWildcardNodeLite": "UmiAI Wildcard Processor (Lite)",
-    "UmiSaveImage": "Umi Save Image (with metadata)"
+    "UmiSaveImage": "Umi Save Image (with metadata)",
+    "UmiCharacterManager": "UmiAI Character Manager",
+    "UmiCharacterBatch": "UmiAI Character Batch Generator",
+    "UmiSpriteExport": "UmiAI Sprite Export",
+    "UmiCharacterInfo": "UmiAI Character Info",
+    "UmiCameraControl": "UmiAI Camera Control",
+    "UmiVisualCameraControl": "UmiAI Visual Camera Control",
+    "UmiPoseLibrary": "UmiAI Pose Library",
+    "UmiExpressionMixer": "UmiAI Expression Mixer",
+    "UmiSceneComposer": "UmiAI Scene Composer",
+    "UmiLoraAnimator": "UmiAI LoRA Strength Animator",
+    "UmiPromptTemplate": "UmiAI Prompt Template",
+    "UmiDatasetExport": "UmiAI Dataset Export (LoRA Training)",
+    "UmiCaptionGenerator": "UmiAI Caption Generator",
+    "UmiAutoCaption": "UmiAI Auto Caption (Wrapper)",
+    "UmiCaptionEnhancer": "UmiAI Caption Enhancer",
 }
 
 # 3. Expose the web directory
