@@ -7,7 +7,16 @@
             "name": "SD Checkpoints",
             "description": "Base Stable Diffusion models (SDXL/Illustrious recommended)",
             "target_dir": "checkpoints",
-            "models": []
+            "models": [
+                {
+                    "name": "Milamber",
+                    "filename": "Milamber.safetensors",
+                    "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/Milamber.safetensors",
+                    "size_mb": 6617,
+                    "required": false,
+                    "description": "Exclusive Illustrious vPred checkpoint for UmiAI"
+                }
+            ]
         },
         "character_loras": {
             "name": "Character Consistency LoRAs",
