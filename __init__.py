@@ -1,10 +1,14 @@
-from .nodes import UmiAIWildcardNode, UmiSaveImage
+from .nodes import (UmiAIWildcardNode, UmiSaveImage, UmiPoseGenerator, UmiEmotionGenerator, 
+                    UmiEmotionStudio, UmiCharacterCreator as UmiCharacterCreator2, 
+                    UmiSpriteGenerator as UmiSpriteGenerator2, UmiDatasetGenerator as UmiDatasetGenerator2,
+                    UmiPositionControl as UmiPositionControl2, UmiVisualCameraControl as UmiVisualCameraControl2)
 from .nodes_lite import UmiAIWildcardNodeLite
 from .nodes_character import UmiCharacterManager, UmiCharacterBatch, UmiSpriteExport, UmiCharacterInfo
-from .nodes_camera import UmiCameraControl, UmiVisualCameraControl
+from .nodes_camera import UmiCameraControl, UmiVisualCameraControl, UmiCameraAngleSelector
 from .nodes_power import UmiPoseLibrary, UmiExpressionMixer, UmiSceneComposer, UmiLoraAnimator, UmiPromptTemplate
 from .nodes_dataset import UmiDatasetExport, UmiCaptionGenerator
 from .nodes_caption import UmiAutoCaption, UmiCaptionEnhancer
+from .nodes_qwen_detailer import UmiQWENDetailer, UmiBBoxExtractor
 from server import PromptServer
 from aiohttp import web
 import os
@@ -138,6 +142,128 @@ async def fetch_characters(request):
         "profiles": character_data,
         "count": len(character_data)
     })
+
+# VNCCS-style costume API
+@PromptServer.instance.routes.get("/umiapp/character/costumes")
+async def get_character_costumes(request):
+    """List costumes for a character (VNCCS-compatible)."""
+    character = request.query.get("character", "")
+    if not character:
+        return web.json_response([])
+    
+    chars_path = os.path.join(os.path.dirname(__file__), "characters", character)
+    sheets_path = os.path.join(chars_path, "Sheets")
+    
+    costumes = []
+    if os.path.exists(sheets_path):
+        for item in os.listdir(sheets_path):
+            if os.path.isdir(os.path.join(sheets_path, item)):
+                costumes.append(item)
+    
+    return web.json_response(costumes)
+
+# VNCCS-style character sheet preview
+@PromptServer.instance.routes.get("/umiapp/character/preview")
+async def get_character_preview(request):
+    """Get cropped preview from character sheet (VNCCS-compatible)."""
+    import io
+    import re
+    from PIL import Image
+    
+    character = request.query.get("character", "")
+    if not character:
+        return web.Response(status=404, text="No character specified")
+    
+    chars_path = os.path.join(os.path.dirname(__file__), "characters", character)
+    
+    # Try to find a sheet image
+    sheet_dir = os.path.join(chars_path, "Sheets", "Naked", "neutral")
+    if not os.path.exists(sheet_dir):
+        # Try any costume
+        sheets_base = os.path.join(chars_path, "Sheets")
+        if os.path.exists(sheets_base):
+            for costume in sorted(os.listdir(sheets_base)):
+                path = os.path.join(sheets_base, costume, "neutral")
+                if os.path.isdir(path):
+                    sheet_dir = path
+                    break
+    
+    if not os.path.exists(sheet_dir):
+        return web.Response(status=404, text="Sheet not found")
+    
+    # Find the best sheet file (highest index)
+    pattern = os.path.join(sheet_dir, "sheet_neutral_*.png")
+    files = glob.glob(pattern)
+    if not files:
+        # Try any PNG
+        files = glob.glob(os.path.join(sheet_dir, "*.png"))
+    
+    if not files:
+        return web.Response(status=404, text="No sheet images found")
+    
+    def get_index(f):
+        m = re.search(r'(\d+)', os.path.basename(f))
+        return int(m.group(1)) if m else 0
+    
+    files.sort(key=get_index)
+    best_file = files[-1]
+    
+    # Crop: Sheet is 6x2 grid, get last cell (row 1, col 5)
+    try:
+        img = Image.open(best_file)
+        w, h = img.size
+        item_w = w // 6
+        item_h = h // 2
+        
+        row, col = 1, 5
+        left = col * item_w
+        upper = row * item_h
+        right = left + item_w
+        lower = upper + item_h
+        
+        crop = img.crop((left, upper, right, lower))
+        
+        img_byte_arr = io.BytesIO()
+        crop.save(img_byte_arr, format='PNG')
+        return web.Response(body=img_byte_arr.getvalue(), content_type='image/png')
+    except Exception as e:
+        return web.Response(status=500, text=str(e))
+
+# VNCCS-style emotions API
+@PromptServer.instance.routes.get("/umiapp/emotions")
+async def get_emotions(request):
+    """Get emotions config data (VNCCS-compatible)."""
+    config_path = os.path.join(os.path.dirname(__file__), "emotions-config", "emotions.json")
+    
+    if not os.path.exists(config_path):
+        return web.json_response({"error": "emotions.json not found"}, status=404)
+    
+    import json
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return web.json_response(data)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+# Emotion image server
+@PromptServer.instance.routes.get("/umiapp/emotion/image")
+async def get_emotion_image(request):
+    """Serve emotion image by safe_name."""
+    from urllib.parse import unquote
+    
+    name = request.query.get("name", "")
+    if not name or ".." in name or "/" in name or "\\" in name:
+        return web.Response(status=400)
+    
+    name = unquote(name).strip()
+    image_path = os.path.join(os.path.dirname(__file__), "emotions-config", "images", f"{name}.png")
+    
+    if not os.path.exists(image_path):
+        return web.Response(status=404)
+    
+    return web.FileResponse(image_path)
+
 
 @PromptServer.instance.routes.get("/umiapp/preview")
 async def preview_wildcard(request):
@@ -501,6 +627,13 @@ NODE_CLASS_MAPPINGS = {
     "UmiCaptionGenerator": UmiCaptionGenerator,
     "UmiAutoCaption": UmiAutoCaption,
     "UmiCaptionEnhancer": UmiCaptionEnhancer,
+    "UmiQWENDetailer": UmiQWENDetailer,
+    "UmiBBoxExtractor": UmiBBoxExtractor,
+    "UmiPoseGenerator": UmiPoseGenerator,
+    "UmiEmotionGenerator": UmiEmotionGenerator,
+    "UmiEmotionStudio": UmiEmotionStudio,
+    "UmiCharacterDesigner": UmiCharacterCreator2,
+    "UmiCameraAngleSelector": UmiCameraAngleSelector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -513,6 +646,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiCharacterInfo": "UmiAI Character Info",
     "UmiCameraControl": "UmiAI Camera Control",
     "UmiVisualCameraControl": "UmiAI Visual Camera Control",
+    "UmiCameraAngleSelector": "UmiAI 3D Camera Angle Selector",
     "UmiPoseLibrary": "UmiAI Pose Library",
     "UmiExpressionMixer": "UmiAI Expression Mixer",
     "UmiSceneComposer": "UmiAI Scene Composer",
@@ -522,6 +656,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiCaptionGenerator": "UmiAI Caption Generator",
     "UmiAutoCaption": "UmiAI Auto Caption (Wrapper)",
     "UmiCaptionEnhancer": "UmiAI Caption Enhancer",
+    "UmiQWENDetailer": "Umi QWEN Detailer",
+    "UmiBBoxExtractor": "Umi BBox Extractor",
+    "UmiPoseGenerator": "Umi Pose Generator",
+    "UmiEmotionGenerator": "Umi Emotion Generator",
+    "UmiEmotionStudio": "Umi Emotion Studio",
+    "UmiCharacterDesigner": "Umi Character Designer",
 }
 
 # 3. Expose the web directory

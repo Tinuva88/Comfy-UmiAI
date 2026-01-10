@@ -1356,9 +1356,112 @@ class CharacterReplacer:
         return ", ".join(filter(None, parts))
     
     @classmethod
+    def get_costume_parts(cls, name, costume_name, part=None):
+        """
+        Get costume parts from character data (VNCCS-style).
+        
+        Args:
+            name: Character folder name
+            costume_name: Costume name (e.g., 'school_uniform')
+            part: Specific part (face/head/top/bottom/shoes) or None for all
+            
+        Returns:
+            Prompt string for the costume/part
+        """
+        data = cls.load_character(name)
+        if not data:
+            return ""
+        
+        costumes = data.get('Costumes', data.get('costumes', {}))
+        if not costumes:
+            return ""
+        
+        costume_lower = costume_name.lower()
+        costume_data = None
+        for k, v in costumes.items():
+            if k.lower() == costume_lower:
+                costume_data = v
+                break
+        
+        if not costume_data:
+            return ""
+        
+        if part:
+            # Return specific part
+            part_lower = part.lower()
+            return str(costume_data.get(part_lower, ""))
+        else:
+            # Return all parts combined
+            valid_parts = ['face', 'head', 'top', 'bottom', 'shoes']
+            part_prompts = []
+            for p in valid_parts:
+                val = costume_data.get(p, "")
+                if val:
+                    part_prompts.append(str(val))
+            return ", ".join(part_prompts)
+    
+    @classmethod
+    def get_emotion(cls, name, emotion_name):
+        """
+        Get emotion prompt from character data (VNCCS-style).
+        
+        Args:
+            name: Character folder name
+            emotion_name: Emotion name (e.g., 'happy')
+            
+        Returns:
+            Emotion prompt string
+        """
+        data = cls.load_character(name)
+        if not data:
+            return ""
+        
+        emotions = data.get('Emotions', data.get('emotions', {}))
+        if not emotions:
+            return ""
+        
+        emotion_lower = emotion_name.lower()
+        for k, v in emotions.items():
+            if k.lower() == emotion_lower:
+                if isinstance(v, dict):
+                    return str(v.get('prompt', ''))
+                return str(v)
+        return ""
+    
+    @classmethod
+    def get_info(cls, name, field):
+        """
+        Get character info field (VNCCS-style).
+        
+        Args:
+            name: Character folder name
+            field: Info field (sex/age/race/eyes/hair/face/body/skin_color)
+            
+        Returns:
+            Info field value
+        """
+        data = cls.load_character(name)
+        if not data:
+            return ""
+        
+        info = data.get('Info', data.get('info', {}))
+        if not info:
+            return ""
+        
+        field_lower = field.lower()
+        return str(info.get(field_lower, ""))
+    
+    @classmethod
     def replace(cls, text):
         """
-        Replace all @@character:outfit:emotion@@ patterns in text.
+        Replace all character patterns in text.
+        
+        Supports:
+            @@character:outfit:emotion@@         - Original syntax
+            @@character.costume.name@@           - Full costume
+            @@character.costume.name.part@@      - Specific part
+            @@character.emotion.name@@           - Emotion
+            @@character.info.field@@             - Character info field
         
         Args:
             text: Input text with character references
@@ -1366,11 +1469,36 @@ class CharacterReplacer:
         Returns:
             Text with character references expanded
         """
-        def _replace(match):
+        # Extended pattern for dot-notation: @@char.category.name(.part)?@@
+        dot_pattern = re.compile(r'@@([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)(?:\.([a-zA-Z0-9_-]+))?@@')
+        
+        def _replace_dot(match):
+            char_name = match.group(1)
+            category = match.group(2).lower()  # costume, emotion, info
+            item_name = match.group(3)
+            sub_item = match.group(4)  # May be None (for costume parts)
+            
+            if category == 'costume':
+                return cls.get_costume_parts(char_name, item_name, sub_item)
+            elif category == 'emotion':
+                return cls.get_emotion(char_name, item_name)
+            elif category == 'info':
+                return cls.get_info(char_name, item_name)
+            else:
+                return match.group(0)  # Return unchanged
+        
+        # Original pattern for colon notation: @@char:outfit:emotion@@
+        def _replace_colon(match):
             name = match.group(1)
             outfit = match.group(2)  # May be None
             emotion = match.group(3)  # May be None
             return cls.expand_character(name, outfit, emotion)
         
-        return cls.pattern.sub(_replace, text)
+        # Apply dot notation first (more specific)
+        text = dot_pattern.sub(_replace_dot, text)
+        
+        # Then apply colon notation (original behavior)
+        text = cls.pattern.sub(_replace_colon, text)
+        
+        return text
 

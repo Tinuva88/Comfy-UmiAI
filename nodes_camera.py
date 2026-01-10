@@ -152,15 +152,134 @@ class UmiVisualCameraControl(UmiCameraControl):
 
 
 # ==============================================================================
+# UMI 3D CAMERA ANGLE SELECTOR (From Camerangle)
+# ==============================================================================
+
+# View directions (8 angles)
+VIEW_DIRECTIONS = [
+    "front view",
+    "front-right quarter view",
+    "right side view",
+    "back-right quarter view",
+    "back view",
+    "back-left quarter view",
+    "left side view",
+    "front-left quarter view",
+]
+
+# Height angles (4 types)
+HEIGHT_ANGLES = [
+    "low-angle shot",
+    "eye-level shot",
+    "elevated shot",
+    "high-angle shot",
+]
+
+# Shot sizes (3 types)
+SHOT_SIZES = [
+    "close-up",
+    "medium shot",
+    "wide shot",
+]
+
+# Generate all 96 combinations
+CAMERA_ANGLES = []
+for direction in VIEW_DIRECTIONS:
+    for height in HEIGHT_ANGLES:
+        for size in SHOT_SIZES:
+            CAMERA_ANGLES.append({
+                "direction": direction,
+                "height": height,
+                "size": size,
+                "prompt": f"<sks> {direction} {height} {size}"
+            })
+
+
+class UmiCameraAngleSelector:
+    """
+    3D Camera Angle Selector with interactive Three.js visualization.
+    Select from 96 camera angle combinations with multi-select support.
+    Perfect for QWEN angle LoRA workflows.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "selected_indices": ("STRING", {
+                    "default": "[]",
+                    "multiline": False,
+                }),
+            },
+            "optional": {
+                "trigger_word": ("STRING", {
+                    "default": "<sks>",
+                    "tooltip": "Custom trigger word (default: <sks>)"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("selected_angles",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "execute"
+    CATEGORY = "UmiAI/Camera"
+    DESCRIPTION = "Select camera angles using a 3D visual interface with 96 angle combinations"
+    
+    def execute(self, selected_indices="[]", trigger_word="<sks>"):
+        """
+        Execute the node and return the list of selected prompts.
+        
+        Args:
+            selected_indices: JSON string containing list of selected indices
+            trigger_word: Custom trigger word to use instead of <sks>
+            
+        Returns:
+            Tuple containing list of selected angle prompts
+        """
+        # Parse selected indices
+        try:
+            indices = json.loads(selected_indices)
+        except (json.JSONDecodeError, TypeError):
+            indices = []
+        
+        if not isinstance(indices, list):
+            indices = []
+        
+        # Clamp indices to valid range
+        clamped_indices = []
+        for idx in indices:
+            if isinstance(idx, int):
+                clamped_indices.append(max(0, min(idx, len(CAMERA_ANGLES) - 1)))
+        
+        # Build prompts from clamped indices
+        selected_prompts = []
+        trigger = trigger_word.strip() if trigger_word else "<sks>"
+        
+        for idx in clamped_indices:
+            angle = CAMERA_ANGLES[idx]
+            prompt = f"{trigger} {angle['direction']} {angle['height']} {angle['size']}"
+            selected_prompts.append(prompt)
+        
+        # Return at least empty list
+        if not selected_prompts:
+            selected_prompts = [f"{trigger} front view eye-level shot medium shot"]
+        
+        return (selected_prompts,)
+
+
+# ==============================================================================
 # NODE REGISTRATION
 # ==============================================================================
 
 NODE_CLASS_MAPPINGS = {
     "UmiCameraControl": UmiCameraControl,
     "UmiVisualCameraControl": UmiVisualCameraControl,
+    "UmiCameraAngleSelector": UmiCameraAngleSelector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiCameraControl": "UmiAI Camera Control",
     "UmiVisualCameraControl": "UmiAI Visual Camera Control",
+    "UmiCameraAngleSelector": "UmiAI 3D Camera Angle Selector",
 }

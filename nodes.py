@@ -369,12 +369,22 @@ class TagLoader(TagLoaderBase):
         return None
 
     def build_index(self):
-        if GLOBAL_INDEX['built']:
+        # Check if cache was built with a different use_folder_paths setting
+        cached_setting = GLOBAL_INDEX.get('use_folder_paths', None)
+        if GLOBAL_INDEX['built'] and cached_setting == self.use_folder_paths:
             self.files_index = GLOBAL_INDEX['files']
             self.yaml_entries = GLOBAL_INDEX['entries']
             self.umi_tags = GLOBAL_INDEX.get('tags', set())
             self.index_built = True
             return
+        
+        # Rebuild if setting changed
+        if GLOBAL_INDEX['built'] and cached_setting != self.use_folder_paths:
+            print(f"[UmiAI] Rebuilding index: use_folder_paths changed from {cached_setting} to {self.use_folder_paths}")
+            # Need to rebuild lookup maps with new setting and reset cache
+            self.refresh_maps()
+            GLOBAL_INDEX['built'] = False  # Force rebuild
+            self.index_built = False
 
         if self.index_built:
             return
@@ -417,6 +427,7 @@ class TagLoader(TagLoaderBase):
         GLOBAL_INDEX['entries'] = new_entries
         GLOBAL_INDEX['tags'] = new_tags
         GLOBAL_INDEX['built'] = True
+        GLOBAL_INDEX['use_folder_paths'] = self.use_folder_paths
 
     def load_globals(self):
         merged_globals = {}
@@ -1789,6 +1800,11 @@ class UmiAIWildcardNode:
             'seed': seed,
             'use_folder_paths': use_folder_paths
         }
+        
+        # Sync node toggle to global settings so autocomplete uses same setting
+        if UMI_SETTINGS.get('use_folder_paths', False) != use_folder_paths:
+            UMI_SETTINGS['use_folder_paths'] = use_folder_paths
+            print(f"[UmiAI] Updated global use_folder_paths to: {use_folder_paths}")
 
         all_wildcard_paths = get_all_wildcard_paths()
         tag_loader = TagLoader(all_wildcard_paths, options)
@@ -1977,13 +1993,915 @@ class UmiSaveImage:
 
         return { "ui": { "images": results } }
 
+
+# ==============================================================================
+# UMI POSE GENERATOR (Ported from VNCCS)
+# ==============================================================================
+
+class UmiPoseGenerator:
+    """Pose Generator for creating OpenPose images from JSON pose data.
+    
+    Creates a 6x2 grid of 12 poses in OpenPose format for ControlNet.
+    Compatible with VNCCS 3D pose editor.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        # Import pose utilities
+        try:
+            from .pose_utils.skeleton_512x1536 import DEFAULT_SKELETON, CANVAS_WIDTH, CANVAS_HEIGHT
+            default_skeleton = DEFAULT_SKELETON
+            canvas_w = CANVAS_WIDTH
+            canvas_h = CANVAS_HEIGHT
+        except ImportError:
+            default_skeleton = {}
+            canvas_w = 512
+            canvas_h = 1536
+        
+        # Create default 12 poses JSON
+        default_pose_list = []
+        for _ in range(12):
+            default_pose_list.append({
+                "joints": {name: list(pos) for name, pos in default_skeleton.items()}
+            })
+        default_pose_json = json.dumps({
+            "canvas": {"width": canvas_w, "height": canvas_h},
+            "poses": default_pose_list
+        }, indent=2)
+            
+        return {
+            "required": {
+                "pose_data": ("STRING", {
+                    "default": default_pose_json,
+                    "multiline": True,
+                    "dynamicPrompts": False
+                }),
+                "line_thickness": ("INT", {
+                    "default": 3,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "display": "slider"
+                }),
+                "safe_zone": ("INT", {
+                    "default": 100,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "display": "slider",
+                    "tooltip": "Scale poses toward center (100 = no scaling)"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("openpose_grid",)
+    FUNCTION = "generate"
+    CATEGORY = "UmiAI/pose"
+    
+    def generate(self, pose_data: str, line_thickness: int = 3, safe_zone: int = 100):
+        """Generate OpenPose image grid from pose data."""
+        import torch
+        import numpy as np
+        
+        try:
+            from .pose_utils.skeleton_512x1536 import (
+                DEFAULT_SKELETON, CANVAS_WIDTH, CANVAS_HEIGHT, LEGACY_JOINT_ALIASES
+            )
+            from .pose_utils.pose_renderer import render_openpose, convert_to_comfyui_format
+        except ImportError as e:
+            print(f"[UmiAI Pose] Error importing pose utilities: {e}")
+            # Return black image if imports fail
+            black_img = np.zeros((1536*2, 512*6, 3), dtype=np.float32)
+            return (torch.from_numpy(black_img).unsqueeze(0),)
+        
+        print(f"[UmiAI Pose] Generating pose grid (safe_zone: {safe_zone}%)...")
+        
+        try:
+            data = json.loads(pose_data)
+        except json.JSONDecodeError as exc:
+            print(f"[UmiAI Pose] ERROR: Invalid JSON: {exc}")
+            data = {}
+        
+        # Extract poses list
+        poses_data = data.get("poses", [])
+        if not isinstance(poses_data, list):
+            joints_payload = data.get("joints", {})
+            if joints_payload:
+                poses_data = [{"joints": joints_payload}]
+            else:
+                poses_data = []
+        
+        def _clamp(val, min_val, max_val):
+            return max(min_val, min(max_val, val))
+        
+        def _sanitize_joints(joints_data):
+            sanitized = {}
+            for raw_name, coords in joints_data.items():
+                joint_name = LEGACY_JOINT_ALIASES.get(raw_name, raw_name)
+                if joint_name not in DEFAULT_SKELETON:
+                    continue
+                if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+                    continue
+                try:
+                    x = float(coords[0])
+                    y = float(coords[1])
+                except (TypeError, ValueError):
+                    continue
+                x_int = _clamp(int(round(x)), 0, CANVAS_WIDTH - 1)
+                y_int = _clamp(int(round(y)), 0, CANVAS_HEIGHT - 1)
+                sanitized[joint_name] = (x_int, y_int)
+            for joint_name, default_coords in DEFAULT_SKELETON.items():
+                sanitized.setdefault(joint_name, default_coords)
+            return sanitized
+        
+        # Ensure we have exactly 12 poses
+        poses = []
+        for i in range(12):
+            if i < len(poses_data) and isinstance(poses_data[i], dict):
+                if "joints" in poses_data[i]:
+                    joints_payload = poses_data[i]["joints"]
+                else:
+                    joints_payload = poses_data[i]
+                poses.append(_sanitize_joints(joints_payload))
+            else:
+                poses.append(DEFAULT_SKELETON.copy())
+        
+        # Apply safe zone scaling
+        if safe_zone < 100:
+            scale_factor = safe_zone / 100.0
+            center_x = CANVAS_WIDTH / 2.0
+            center_y = CANVAS_HEIGHT / 2.0
+            
+            scaled_poses = []
+            for pose in poses:
+                scaled_pose = {}
+                for joint_name, coords in pose.items():
+                    if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                        x, y = coords[0], coords[1]
+                        scaled_x = center_x + (x - center_x) * scale_factor
+                        scaled_y = center_y + (y - center_y) * scale_factor
+                        scaled_x = _clamp(int(round(scaled_x)), 0, CANVAS_WIDTH - 1)
+                        scaled_y = _clamp(int(round(scaled_y)), 0, CANVAS_HEIGHT - 1)
+                        scaled_pose[joint_name] = (scaled_x, scaled_y)
+                    else:
+                        scaled_pose[joint_name] = coords
+                scaled_poses.append(scaled_pose)
+            poses = scaled_poses
+        
+        # Grid dimensions (6 columns, 2 rows)
+        w, h = CANVAS_WIDTH, CANVAS_HEIGHT
+        cols, rows = 6, 2
+        grid_w, grid_h = w * cols, h * rows
+        
+        # Create empty grid
+        openpose_grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+        
+        for idx, joints in enumerate(poses):
+            row = idx // cols
+            col = idx % cols
+            x_offset = col * w
+            y_offset = row * h
+            
+            openpose_img = render_openpose(joints, w, h, line_thickness)
+            openpose_grid[y_offset:y_offset+h, x_offset:x_offset+w] = openpose_img
+        
+        # Convert to ComfyUI format
+        openpose_tensor = convert_to_comfyui_format(openpose_grid)
+        openpose_tensor = torch.from_numpy(openpose_tensor)
+        
+        print(f"[UmiAI Pose] Generated grid: {openpose_tensor.shape}")
+        
+        return (openpose_tensor,)
+
+
+# ==============================================================================
+# UMI EMOTION GENERATOR (Ported from VNCCS)
+# ==============================================================================
+
+class UmiEmotionGenerator:
+    """Generate emotion prompts from character YAML data.
+    
+    Reads the Emotions field from character profile and outputs prompts
+    for each selected emotion.
+    """
+    
+    # Common emotion list (VNCCS compatible)
+    EMOTION_LIST = [
+        "neutral", "happy", "sad", "angry", "surprised", "embarrassed",
+        "blushing", "crying", "laughing", "scared", "confused", "disgusted",
+        "sleepy", "excited", "nervous", "determined", "smug", "shy"
+    ]
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .shared_utils import CharacterReplacer
+        characters = CharacterReplacer.list_characters()
+        
+        return {
+            "required": {
+                "character": (characters if characters else ["None"], {}),
+                "emotions": ("STRING", {
+                    "default": "neutral,happy,sad,angry,surprised",
+                    "multiline": True,
+                    "tooltip": "Comma-separated list of emotions"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("emotion_prompts", "emotion_names")
+    OUTPUT_IS_LIST = (True, True)
+    FUNCTION = "generate"
+    CATEGORY = "UmiAI/character"
+    
+    def generate(self, character, emotions):
+        from .shared_utils import CharacterReplacer
+        
+        emotion_list = [e.strip() for e in emotions.split(",") if e.strip()]
+        
+        prompts = []
+        names = []
+        
+        for emotion in emotion_list:
+            prompt = CharacterReplacer.get_emotion(character, emotion)
+            if prompt:
+                prompts.append(prompt)
+                names.append(emotion)
+            else:
+                # Fallback: use emotion name directly as prompt
+                prompts.append(f"({emotion})")
+                names.append(emotion)
+        
+        print(f"[UmiAI Emotion] Generated {len(prompts)} emotion prompts for '{character}'")
+        
+        return (prompts, names)
+
+
+# ==============================================================================
+# UMI CHARACTER CREATOR (Enhanced VNCCS-style)
+# ==============================================================================
+
+# VNCCS-style helper functions
+def umi_age_strength(age):
+    """Calculate LoRA strength based on age (VNCCS method)."""
+    if age < 10:
+        return 1.0
+    elif age < 18:
+        return 0.7
+    elif age < 30:
+        return 0.3
+    elif age < 50:
+        return 0.5
+    else:
+        return 0.8
+
+def umi_ensure_character_structure(char_path, emotions=None, main_dirs=None):
+    """Create VNCCS-compatible folder structure for a character."""
+    import os
+    
+    if emotions is None:
+        emotions = ["neutral", "happy", "sad", "angry", "surprised", "embarrassed", 
+                   "scared", "disgusted", "love", "thinking"]
+    
+    if main_dirs is None:
+        main_dirs = ["Sheets", "Faces", "References"]
+    
+    # Create main directories
+    for dir_name in main_dirs:
+        os.makedirs(os.path.join(char_path, dir_name), exist_ok=True)
+    
+    # Create emotion subdirs in Sheets and Faces
+    for main_dir in ["Sheets", "Faces"]:
+        for emotion in emotions:
+            os.makedirs(os.path.join(char_path, main_dir, "Naked", emotion), exist_ok=True)
+    
+    return True
+
+def umi_build_face_details(info):
+    """Build face details string from character info (VNCCS method)."""
+    parts = []
+    if info.get("eyes"):
+        parts.append(f"({info['eyes']}:1.0)")
+    if info.get("hair"):
+        parts.append(f"({info['hair']}:1.0)")
+    if info.get("face"):
+        parts.append(f"({info['face']}:1.0)")
+    return ", ".join(parts)
+
+
+class UmiCharacterCreator:
+    """Create or update character profiles with VNCCS-compatible structure.
+    
+    Generates folder structure, config, and outputs for downstream nodes.
+    """
+    
+    EMOTIONS = ["neutral", "happy", "sad", "angry", "surprised", "embarrassed", 
+                "scared", "disgusted", "love", "thinking"]
+    MAIN_DIRS = ["Sheets", "Faces", "References"]
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .shared_utils import CharacterReplacer
+        characters = CharacterReplacer.list_characters()
+        char_list = characters if characters else ["None"]
+        
+        return {
+            "required": {
+                "existing_character": (char_list, {"default": char_list[0]}),
+            },
+            "optional": {
+                "new_character_name": ("STRING", {"default": ""}),
+                "background_color": ("STRING", {"default": "green"}),
+                "aesthetics": ("STRING", {"default": "masterpiece, best quality", "multiline": True}),
+                "sex": (["female", "male"], {"default": "female"}),
+                "age": ("INT", {"default": 18, "min": 0, "max": 120}),
+                "race": ("STRING", {"default": "human"}),
+                "eyes": ("STRING", {"default": "blue eyes"}),
+                "hair": ("STRING", {"default": "long black hair"}),
+                "face": ("STRING", {"default": "beautiful face"}),
+                "body": ("STRING", {"default": "slender"}),
+                "skin_color": ("STRING", {"default": "fair skin"}),
+                "additional_details": ("STRING", {"default": "", "multiline": True}),
+                "negative_prompt": ("STRING", {"default": "bad quality, worst quality", "multiline": True}),
+                "lora_prompt": ("STRING", {"default": ""}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "INT", "STRING", "FLOAT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("positive_prompt", "seed", "negative_prompt", "age_lora_strength", 
+                    "sheets_path", "faces_path", "face_details")
+    FUNCTION = "create"
+    CATEGORY = "UmiAI/character"
+    
+    def create(self, existing_character, new_character_name="", background_color="green",
+               aesthetics="masterpiece, best quality", sex="female", age=18, race="human",
+               eyes="blue eyes", hair="long black hair", face="beautiful face", 
+               body="slender", skin_color="fair skin", additional_details="",
+               negative_prompt="bad quality, worst quality", lora_prompt="", seed=0):
+        import os
+        import json
+        
+        # Determine character name
+        character_name = new_character_name.strip() if new_character_name.strip() else existing_character
+        if character_name == "None":
+            character_name = "NewCharacter"
+        
+        # Setup paths
+        node_path = os.path.dirname(os.path.abspath(__file__))
+        char_path = os.path.join(node_path, "characters", character_name)
+        sheets_path = os.path.join(char_path, "Sheets")
+        faces_path = os.path.join(char_path, "Faces")
+        config_path = os.path.join(char_path, "config.json")
+        
+        # Create VNCCS-compatible folder structure
+        umi_ensure_character_structure(char_path, self.EMOTIONS, self.MAIN_DIRS)
+        
+        # Build positive prompt
+        prompt_parts = [aesthetics, "simple background, expressionless"]
+        
+        if background_color:
+            prompt_parts.append(f"{background_color} background")
+        
+        # Apply sex
+        if sex == "female":
+            prompt_parts.append("1girl")
+        else:
+            prompt_parts.append("1boy")
+        
+        # Age handling
+        if age < 10:
+            prompt_parts.append("child")
+        elif age < 18:
+            prompt_parts.append("teenager")
+        elif age > 60:
+            prompt_parts.append("elderly")
+        
+        # Add appearance details
+        if race:
+            prompt_parts.append(f"({race} race:1.0)")
+        if hair:
+            prompt_parts.append(f"({hair} hair:1.0)")
+        if eyes:
+            prompt_parts.append(f"({eyes} eyes:1.0)")
+        if face:
+            prompt_parts.append(f"({face} face:1.0)")
+        if body:
+            prompt_parts.append(f"({body} body:1.0)")
+        if skin_color:
+            prompt_parts.append(f"({skin_color} skin:1.0)")
+        if additional_details:
+            prompt_parts.append(f"({additional_details})")
+        if lora_prompt:
+            prompt_parts.append(lora_prompt)
+        
+        positive_prompt = ", ".join(prompt_parts)
+        
+        # Calculate age LoRA strength
+        age_lora_strength = umi_age_strength(age)
+        
+        # Build face details for downstream nodes
+        info = {"eyes": eyes, "hair": hair, "face": face}
+        face_details = umi_build_face_details(info) + ", (expressionless:1.0)"
+        
+        # Load or create config
+        config = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+            except:
+                pass
+        
+        # Update config
+        config["character_info"] = {
+            "name": character_name,
+            "background_color": background_color,
+            "sex": sex,
+            "age": age,
+            "race": race,
+            "aesthetics": aesthetics,
+            "eyes": eyes,
+            "hair": hair,
+            "face": face,
+            "body": body,
+            "skin_color": skin_color,
+            "additional_details": additional_details,
+            "negative_prompt": negative_prompt,
+            "lora_prompt": lora_prompt,
+            "seed": seed
+        }
+        
+        config["folder_structure"] = {
+            "main_directories": self.MAIN_DIRS,
+            "emotions": self.EMOTIONS
+        }
+        
+        config["character_path"] = char_path
+        config["config_version"] = "2.0"
+        
+        # Preserve existing costumes
+        if "costumes" not in config:
+            config["costumes"] = {"Naked": {"description": "Base nude/underwear"}}
+        
+        # Save config
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+        
+        print(f"[UmiAI Character] Created/updated '{character_name}'")
+        print(f"  Sheets: {sheets_path}")
+        print(f"  Faces: {faces_path}")
+        print(f"  Age LoRA: {age_lora_strength}")
+        
+        return (positive_prompt, seed, negative_prompt, age_lora_strength, 
+                sheets_path, faces_path, face_details)
+
+
+# ==============================================================================
+# UMI SPRITE GENERATOR (Ported from VNCCS)
+# ==============================================================================
+
+class UmiSpriteGenerator:
+    """Collect character sprites from the character folder structure.
+    
+    Scans character's Sheets folder for all costume/emotion combinations.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .shared_utils import CharacterReplacer
+        characters = CharacterReplacer.list_characters()
+        
+        return {
+            "required": {
+                "character": (characters if characters else ["None"], {}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("sprite_paths", "sprite_info")
+    OUTPUT_IS_LIST = (True, True)
+    FUNCTION = "generate"
+    CATEGORY = "UmiAI/character"
+    
+    def generate(self, character):
+        import os
+        from .shared_utils import CharacterReplacer
+        
+        chars_path = CharacterReplacer.get_characters_path()
+        if not chars_path:
+            return ([], [])
+        
+        char_path = os.path.join(chars_path, character)
+        sheets_dir = os.path.join(char_path, "Sheets")
+        
+        if not os.path.exists(sheets_dir):
+            print(f"[UmiAI Sprite] Sheets folder not found: {sheets_dir}")
+            return ([], [])
+        
+        sprite_paths = []
+        sprite_info = []
+        
+        # Scan costumes
+        costumes = [d for d in os.listdir(sheets_dir) 
+                   if os.path.isdir(os.path.join(sheets_dir, d))]
+        
+        for costume in costumes:
+            costume_dir = os.path.join(sheets_dir, costume)
+            
+            # Scan emotions within costume
+            emotions = [d for d in os.listdir(costume_dir) 
+                       if os.path.isdir(os.path.join(costume_dir, d))]
+            
+            for emotion in emotions:
+                emotion_dir = os.path.join(costume_dir, emotion)
+                
+                # Find image files
+                for f in os.listdir(emotion_dir):
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                        sprite_path = os.path.join(emotion_dir, f)
+                        sprite_paths.append(sprite_path)
+                        sprite_info.append(f"{costume}/{emotion}/{f}")
+        
+        print(f"[UmiAI Sprite] Found {len(sprite_paths)} sprites for '{character}'")
+        
+        return (sprite_paths, sprite_info)
+
+
+# ==============================================================================
+# UMI DATASET GENERATOR (Ported from VNCCS)
+# ==============================================================================
+
+class UmiDatasetGenerator:
+    """Create LoRA training dataset from character images.
+    
+    Copies images to a lora folder and generates caption files.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        from .shared_utils import CharacterReplacer
+        characters = CharacterReplacer.list_characters()
+        
+        return {
+            "required": {
+                "character": (characters if characters else ["None"], {}),
+                "trigger_word": ("STRING", {"default": "mycharacter", "tooltip": "LoRA trigger word"}),
+            },
+            "optional": {
+                "additional_caption": ("STRING", {"default": "", "multiline": True}),
+                "include_costume_tags": ("BOOLEAN", {"default": True}),
+                "include_emotion_tags": ("BOOLEAN", {"default": True}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("dataset_path", "file_count")
+    FUNCTION = "generate"
+    CATEGORY = "UmiAI/character"
+    
+    def generate(self, character, trigger_word, additional_caption="",
+                 include_costume_tags=True, include_emotion_tags=True):
+        import os
+        import shutil
+        from .shared_utils import CharacterReplacer
+        
+        chars_path = CharacterReplacer.get_characters_path()
+        if not chars_path:
+            return ("", 0)
+        
+        char_path = os.path.join(chars_path, character)
+        sheets_dir = os.path.join(char_path, "Sheets")
+        lora_dir = os.path.join(char_path, "lora_dataset")
+        
+        os.makedirs(lora_dir, exist_ok=True)
+        
+        # Load character data for captions
+        char_data = CharacterReplacer.load_character(character) or {}
+        
+        processed = 0
+        
+        if not os.path.exists(sheets_dir):
+            print(f"[UmiAI Dataset] Sheets folder not found: {sheets_dir}")
+            return (lora_dir, 0)
+        
+        # Scan costumes
+        costumes = [d for d in os.listdir(sheets_dir) 
+                   if os.path.isdir(os.path.join(sheets_dir, d))]
+        
+        for costume in costumes:
+            costume_dir = os.path.join(sheets_dir, costume)
+            emotions = [d for d in os.listdir(costume_dir) 
+                       if os.path.isdir(os.path.join(costume_dir, d))]
+            
+            for emotion in emotions:
+                emotion_dir = os.path.join(costume_dir, emotion)
+                
+                for f in os.listdir(emotion_dir):
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                        src_path = os.path.join(emotion_dir, f)
+                        dst_name = f"{costume}_{emotion}_{f}"
+                        dst_path = os.path.join(lora_dir, dst_name)
+                        
+                        try:
+                            shutil.copy2(src_path, dst_path)
+                            
+                            # Build caption
+                            caption_parts = [trigger_word]
+                            
+                            # Add character info
+                            info = char_data.get('Info', char_data.get('info', {}))
+                            if info.get('sex'):
+                                caption_parts.append(f"1{info['sex'][0]}irl" if info['sex'] == 'female' else f"1{info['sex']}")
+                            if info.get('hair'):
+                                caption_parts.append(info['hair'])
+                            if info.get('eyes'):
+                                caption_parts.append(info['eyes'])
+                            
+                            # Add costume/emotion tags
+                            if include_costume_tags:
+                                caption_parts.append(costume.replace('_', ' '))
+                            if include_emotion_tags:
+                                caption_parts.append(emotion.replace('_', ' '))
+                            
+                            if additional_caption:
+                                caption_parts.append(additional_caption.strip())
+                            
+                            caption_text = ", ".join(caption_parts)
+                            
+                            # Write caption file
+                            caption_path = os.path.splitext(dst_path)[0] + ".txt"
+                            with open(caption_path, 'w', encoding='utf-8') as cf:
+                                cf.write(caption_text)
+                            
+                            processed += 1
+                        except Exception as e:
+                            print(f"[UmiAI Dataset] Error: {e}")
+        print(f"[UmiAI Dataset] Created {processed} image/caption pairs in {lora_dir}")
+        
+        return (lora_dir, processed)
+
+
+# ==============================================================================
+# UMI EMOTION STUDIO (Ported from VNCCS EmotionGeneratorV2)
+# ==============================================================================
+
+def load_emotions_config():
+    """Load emotions.json from the emotions-config folder."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emotions-config", "emotions.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[UmiAI] Error loading emotions.json: {e}")
+    return {}
+
+class UmiEmotionStudio:
+    """Enhanced Emotion Generator with visual emotion picker.
+    
+    Uses emotions.json config for categorized emotions with descriptions.
+    Supports SDXL and QWEN prompt styles.
+    """
+    
+    EMOTIONS_DATA = None
+    SAFE_NAME_MAP = None
+    
+    @classmethod
+    def _setup_emotions_data(cls):
+        if cls.SAFE_NAME_MAP is not None:
+            return
+        
+        try:
+            data = load_emotions_config()
+            safe_name_map = {}
+            for category, emotion_list in data.items():
+                if isinstance(emotion_list, list):
+                    for emotion in emotion_list:
+                        if isinstance(emotion, dict) and 'safe_name' in emotion:
+                            safe_name_map[emotion['safe_name']] = {
+                                "key": emotion.get('key', emotion['safe_name']),
+                                "description": emotion.get('description', ''),
+                                "natural_prompt": emotion.get('natural_prompt', ''),
+                                "category": category
+                            }
+            cls.SAFE_NAME_MAP = safe_name_map
+            cls.EMOTIONS_DATA = data
+        except Exception as e:
+            print(f"[UmiAI Emotion Studio] Error: {e}")
+            cls.SAFE_NAME_MAP = {}
+            cls.EMOTIONS_DATA = {}
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        cls._setup_emotions_data()
+        
+        from .shared_utils import CharacterReplacer
+        characters = CharacterReplacer.list_characters()
+        if not characters:
+            characters = ["None"]
+        
+        # Get emotion list from config
+        emotions_list = list(cls.SAFE_NAME_MAP.keys()) if cls.SAFE_NAME_MAP else ["neutral", "happy", "sad", "angry"]
+        
+        return {
+            "required": {
+                "prompt_style": (["SDXL Style", "QWEN Style"], {"default": "SDXL Style"}),
+                "character": (characters, {}),
+                "selected_emotions": ("STRING", {
+                    "default": "neutral,happy,sad",
+                    "multiline": True,
+                    "tooltip": "Comma-separated emotion keys from emotions.json"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("emotion_prompts", "emotion_keys", "face_details")
+    OUTPUT_IS_LIST = (True, True, False)
+    FUNCTION = "generate"
+    CATEGORY = "UmiAI/character"
+    
+    def generate(self, prompt_style, character, selected_emotions):
+        self._setup_emotions_data()
+        
+        from .shared_utils import CharacterReplacer
+        
+        emotion_list = [e.strip() for e in selected_emotions.split(",") if e.strip()]
+        
+        prompts = []
+        keys = []
+        
+        # Load character data for face details
+        char_data = CharacterReplacer.load_character(character) or {}
+        info = char_data.get('Info', char_data.get('info', {}))
+        
+        # Build face details
+        face_parts = []
+        if info.get('eyes'):
+            face_parts.append(f"({info['eyes']}:1.0)")
+        if info.get('hair'):
+            face_parts.append(f"({info['hair']}:1.0)")
+        if info.get('face'):
+            face_parts.append(f"({info['face']}:1.0)")
+        face_details = ", ".join(face_parts)
+        
+        for emotion_key in emotion_list:
+            emotion_data = self.SAFE_NAME_MAP.get(emotion_key, {})
+            
+            if emotion_data:
+                description = emotion_data.get('description', emotion_key)
+                natural_prompt = emotion_data.get('natural_prompt', '')
+                
+                if prompt_style == "QWEN Style":
+                    # QWEN format
+                    prompt = f"Change emotion: {emotion_key}. SDXL Styled tags: {description}. Emotion description: {natural_prompt}. Face details: {face_details}"
+                else:
+                    # SDXL format
+                    prompt = f"({emotion_key}, {description}), {face_details}"
+            else:
+                # Fallback for unknown emotions
+                if prompt_style == "QWEN Style":
+                    prompt = f"Change emotion: {emotion_key}. Face details: {face_details}"
+                else:
+                    prompt = f"({emotion_key}), {face_details}"
+            
+            prompts.append(prompt)
+            keys.append(emotion_key)
+        
+        print(f"[UmiAI Emotion Studio] Generated {len(prompts)} emotion prompts for '{character}'")
+        
+        return (prompts, keys, face_details)
+
+
+# ==============================================================================
+# UMI POSITION/CAMERA CONTROL (Ported from VNCCS)
+# ==============================================================================
+
+class UmiPositionControl:
+    """Generate camera position prompts for QWEN-style angle control.
+    
+    Uses azimuth/elevation/distance to create position prompts.
+    """
+    
+    AZIMUTH_MAP = {
+        0: "front view",
+        45: "front-right quarter view",
+        90: "right side view",
+        135: "back-right quarter view",
+        180: "back view",
+        225: "back-left quarter view",
+        270: "left side view",
+        315: "front-left quarter view"
+    }
+    
+    ELEVATION_MAP = {
+        -30: "low-angle shot",
+        0: "eye-level shot",
+        30: "elevated shot",
+        60: "high-angle shot"
+    }
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "azimuth": ("INT", {"default": 0, "min": 0, "max": 360, "step": 45, "display": "slider",
+                                   "tooltip": "Camera angle: 0=Front, 90=Right, 180=Back"}),
+                "elevation": ("INT", {"default": 0, "min": -30, "max": 60, "step": 30, "display": "slider",
+                                     "tooltip": "Vertical angle: -30=Low, 0=Eye level, 60=High"}),
+                "distance": (["close-up", "medium shot", "wide shot"], {"default": "medium shot"}),
+                "include_trigger": ("BOOLEAN", {"default": True, "tooltip": "Include <sks> trigger word"}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "generate"
+    CATEGORY = "UmiAI/camera"
+    
+    def generate(self, azimuth, elevation, distance, include_trigger):
+        azimuth = int(azimuth) % 360
+        
+        # Find closest azimuth
+        if azimuth > 337.5:
+            closest_azimuth = 0
+        else:
+            closest_azimuth = min(self.AZIMUTH_MAP.keys(), key=lambda x: abs(x - azimuth))
+        az_str = self.AZIMUTH_MAP[closest_azimuth]
+        
+        # Find closest elevation
+        closest_elevation = min(self.ELEVATION_MAP.keys(), key=lambda x: abs(x - elevation))
+        el_str = self.ELEVATION_MAP[closest_elevation]
+        
+        # Build prompt
+        parts = []
+        if include_trigger:
+            parts.append("<sks>")
+        parts.append(az_str)
+        parts.append(el_str)
+        parts.append(distance)
+        
+        return (" ".join(parts),)
+
+
+class UmiVisualCameraControl(UmiPositionControl):
+    """Visual camera control with interactive canvas widget.
+    
+    Receives JSON data from the camera widget JS.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "camera_data": ("STRING", {"default": "{}", "hidden": True}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "generate_from_json"
+    CATEGORY = "UmiAI/camera"
+    
+    def generate_from_json(self, camera_data):
+        try:
+            data = json.loads(camera_data)
+        except json.JSONDecodeError:
+            data = {"azimuth": 0, "elevation": 0, "distance": "medium shot", "include_trigger": True}
+        
+        return self.generate(
+            data.get("azimuth", 0),
+            data.get("elevation", 0),
+            data.get("distance", "medium shot"),
+            data.get("include_trigger", True)
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "UmiAIWildcardNode": UmiAIWildcardNode,
-    "UmiSaveImage": UmiSaveImage
+    "UmiSaveImage": UmiSaveImage,
+    "UmiPoseGenerator": UmiPoseGenerator,
+    "UmiEmotionGenerator": UmiEmotionGenerator,
+    "UmiCharacterCreator": UmiCharacterCreator,
+    "UmiSpriteGenerator": UmiSpriteGenerator,
+    "UmiDatasetGenerator": UmiDatasetGenerator,
+    "UmiEmotionStudio": UmiEmotionStudio,
+    "UmiPositionControl": UmiPositionControl,
+    "UmiVisualCameraControl": UmiVisualCameraControl
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiAIWildcardNode": "UmiAI Wildcard Processor",
-    "UmiSaveImage": "Umi Save Image (with metadata)"
+    "UmiSaveImage": "Umi Save Image (with metadata)",
+    "UmiPoseGenerator": "Umi Pose Generator",
+    "UmiEmotionGenerator": "Umi Emotion Generator",
+    "UmiCharacterCreator": "Umi Character Creator",
+    "UmiSpriteGenerator": "Umi Sprite Generator",
+    "UmiDatasetGenerator": "Umi Dataset Generator",
+    "UmiEmotionStudio": "Umi Emotion Studio",
+    "UmiPositionControl": "Umi Position Control",
+    "UmiVisualCameraControl": "Umi Visual Camera Control"
 }
 
 # ==============================================================================
@@ -1992,8 +2910,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 @server.PromptServer.instance.routes.get("/umiapp/wildcards")
 async def get_wildcards(request):
+    # Respect use_folder_paths setting from UMI_SETTINGS (updated by node toggle)
+    use_folder_paths = UMI_SETTINGS.get('use_folder_paths', False)
+    print(f"[UmiAI API] /umiapp/wildcards called. UMI_SETTINGS['use_folder_paths'] = {use_folder_paths}")
+    
     all_paths = get_all_wildcard_paths()
-    options = {'ignore_paths': True, 'verbose': False}
+    options = {'use_folder_paths': use_folder_paths, 'verbose': False}
     loader = TagLoader(all_paths, options)
     loader.build_index()
     
@@ -2009,8 +2931,14 @@ async def get_wildcards(request):
             
         # Scan TXT files (for __ wildcards)
         for filepath in glob.glob(os.path.join(path, '**', '*.txt'), recursive=True):
-            rel_path = os.path.relpath(filepath, path)
-            tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+            if use_folder_paths:
+                # Full path mode: Series/A Centaur's Life
+                rel_path = os.path.relpath(filepath, path)
+                tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+            else:
+                # Filename only mode: A Centaur's Life
+                tag_name = os.path.splitext(os.path.basename(filepath))[0]
+            
             if tag_name not in txt_files:
                 txt_files.append(tag_name)
             
@@ -2021,8 +2949,14 @@ async def get_wildcards(request):
         
         # Scan YAML files (for tags)
         for filepath in glob.glob(os.path.join(path, '**', '*.yaml'), recursive=True):
-            rel_path = os.path.relpath(filepath, path)
-            tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+            if use_folder_paths:
+                # Full path mode
+                rel_path = os.path.relpath(filepath, path)
+                tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+            else:
+                # Filename only mode
+                tag_name = os.path.splitext(os.path.basename(filepath))[0]
+            
             if tag_name not in yaml_files:
                 yaml_files.append(tag_name)
             
@@ -2056,6 +2990,7 @@ async def get_wildcards(request):
         "tags": sorted(list(tags)),
         "basenames": basenames,
         "loras": loras,
+        "use_folder_paths": use_folder_paths,  # Include setting so frontend knows
     })
 
 @server.PromptServer.instance.routes.get("/umiapp/loras")

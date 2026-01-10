@@ -23,6 +23,9 @@ from .shared_utils import (
     CharacterReplacer
 )
 
+# Import UMI_SETTINGS from main nodes for syncing toggle
+from .nodes import UMI_SETTINGS
+
 # ==============================================================================
 # GLOBAL CACHE & SETUP (LITE VERSION - ISOLATED FROM FULL NODE)
 # ==============================================================================
@@ -57,10 +60,21 @@ class TagLoader(TagLoaderBase):
         self.build_index()
 
     def build_index(self):
-        if GLOBAL_INDEX_LITE['built']:
+        # Check if cache was built with a different use_folder_paths setting
+        cached_setting = GLOBAL_INDEX_LITE.get('use_folder_paths', None)
+        if GLOBAL_INDEX_LITE['built'] and cached_setting == self.use_folder_paths:
             self.files_index = GLOBAL_INDEX_LITE['files']
             self.umi_tags = GLOBAL_INDEX_LITE['tags']
             return
+        
+        # Rebuild if setting changed or first build
+        if GLOBAL_INDEX_LITE['built'] and cached_setting != self.use_folder_paths:
+            print(f"[UmiAI Lite] Rebuilding index: use_folder_paths changed from {cached_setting} to {self.use_folder_paths}")
+            GLOBAL_INDEX_LITE['built'] = False  # Force rebuild
+        
+        # Reset for fresh build
+        self.files_index = set()
+        self.umi_tags = set()
 
         for wildcard_path in self.wildcard_paths:
             if not os.path.exists(wildcard_path):
@@ -87,6 +101,7 @@ class TagLoader(TagLoaderBase):
         GLOBAL_INDEX_LITE['built'] = True
         GLOBAL_INDEX_LITE['files'] = self.files_index
         GLOBAL_INDEX_LITE['tags'] = self.umi_tags
+        GLOBAL_INDEX_LITE['use_folder_paths'] = self.use_folder_paths
 
     def scan_yaml_for_tags(self, file_path):
         try:
@@ -168,12 +183,21 @@ class TagLoader(TagLoaderBase):
                         print(f"[UmiAI Lite] File '{file_key}' modified, reloading...")
 
         file_key_lower = file_key.lower()
+        
         for wildcard_path in self.wildcard_paths:
             for root, dirs, files in os.walk(wildcard_path):
                 for file in files:
+                    full_path = os.path.join(root, file)
+                    
+                    # Support both path-based and filename-only matching
                     name_without_ext = os.path.splitext(file)[0]
-                    if name_without_ext.lower() == file_key_lower:
-                        full_path = os.path.join(root, file)
+                    
+                    # Path-based match: relative path from wildcard folder
+                    rel_path = os.path.relpath(full_path, wildcard_path)
+                    path_key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
+                    
+                    # Match against either filename-only or full path
+                    if name_without_ext.lower() == file_key_lower or path_key.lower() == file_key_lower:
                         result = self.load_file(full_path)
                         GLOBAL_CACHE_LITE[cache_key] = result
                         # Cache modification time
@@ -886,8 +910,8 @@ class UmiAIWildcardNodeLite:
 
         lora_tags_behavior = self.get_val(kwargs, "lora_tags_behavior", "Append to Prompt", str)
         lora_cache_limit = self.get_val(kwargs, "lora_cache_limit", 5, int)
-        auto_clean = self.get_val(kwargs, "auto_clean", True, bool) if kwargs.get("auto_clean") is not None else True
-        use_folder_paths = self.get_val(kwargs, "use_folder_paths", False, bool) if kwargs.get("use_folder_paths") is not None else False
+        auto_clean = kwargs.get("auto_clean", True) if "auto_clean" in kwargs else True
+        use_folder_paths = kwargs.get("use_folder_paths", False) if "use_folder_paths" in kwargs else False
         input_negative = self.get_val(kwargs, "input_negative", "", str)
 
         # ============================================================
@@ -922,6 +946,11 @@ class UmiAIWildcardNodeLite:
             'seed': seed,
             'use_folder_paths': use_folder_paths
         }
+        
+        # Sync node toggle to global settings so autocomplete uses same setting
+        if UMI_SETTINGS.get('use_folder_paths', False) != use_folder_paths:
+            UMI_SETTINGS['use_folder_paths'] = use_folder_paths
+            print(f"[UmiAI Lite] Updated global use_folder_paths to: {use_folder_paths}")
 
         all_wildcard_paths = get_all_wildcard_paths()
         tag_loader = TagLoader(all_wildcard_paths, options)

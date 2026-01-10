@@ -807,7 +807,10 @@ function highlightSyntax(text, errors = []) {
     // 13. BREAK keyword - stands out in magenta/pink
     result = result.replace(/\b(BREAK)\b/g, '<span class="umi-hl-break">$1</span>');
 
-    // 14. Character references: @@name:outfit:emotion@@
+    // 14. Character references: @@name:outfit:emotion@@ and @@name.costume.name.part@@
+    // Dot notation (VNCCS-style): @@char.costume.name.part@@, @@char.emotion.name@@, @@char.info.field@@
+    result = result.replace(/(@@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+){2,3}@@)/g, '<span class="umi-hl-character">$1</span>');
+    // Colon notation (original): @@char:outfit:emotion@@
     result = result.replace(/(@@[a-zA-Z0-9_-]+(?::[a-zA-Z0-9_-]+)?(?::[a-zA-Z0-9_-]+)?@@)/g, '<span class="umi-hl-character">$1</span>');
 
     // 15. LoRA trigger words: <sks>, <ohwx>, <lora_trigger>, etc.
