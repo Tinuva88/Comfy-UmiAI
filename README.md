@@ -1067,6 +1067,10 @@ Found a bug? Have a feature request? Open an issue on GitHub!
 ### Credits
 Created and maintained by the Umi AI team.
 
+**Special Thanks:**
+* **VNCCS**: For the inspiration behind the Character System, Emotion Studio, and Project Folder structure.
+* **NickPittas**: For the `camerangle` 3D Camera Angle Selector implementation.
+
 ---
 
 ## 📄 License
