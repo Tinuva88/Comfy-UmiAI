@@ -61,19 +61,26 @@ class ThemeManager {
     applyTheme() {
         const colors = this.getColors();
 
+        this.applyCssVariables(colors);
+        this.applyThemeOverrides();
+
         // Apply to all Umi panels
         const panels = [
             ".umi-lora-browser",
             ".umi-image-browser",
             ".umi-preset-manager",
             ".umi-history-browser",
-            ".umi-shortcuts-panel"
+            ".umi-shortcuts-panel",
+            ".umi-mm-container",
+            ".umi-emotion-studio-panel",
+            ".umi-character-designer-panel",
+            ".vnccs-pose-editor-panel"
         ];
 
         panels.forEach(selector => {
             const panel = document.querySelector(selector);
             if (panel) {
-                this.stylePan(panel, colors);
+                this.stylePanel(panel, colors);
             }
         });
 
@@ -81,6 +88,147 @@ class ThemeManager {
         document.dispatchEvent(new CustomEvent("umi-theme-changed", {
             detail: { theme: this.currentTheme, colors: colors }
         }));
+    }
+
+    applyCssVariables(colors) {
+        const root = document.documentElement;
+        root.style.setProperty("--umi-bg", colors.background);
+        root.style.setProperty("--umi-panel", colors.cardBackground);
+        root.style.setProperty("--umi-border", colors.border);
+        root.style.setProperty("--umi-border-active", colors.borderActive);
+        root.style.setProperty("--umi-text", colors.text);
+        root.style.setProperty("--umi-text-secondary", colors.textSecondary);
+        root.style.setProperty("--umi-accent", colors.textHighlight);
+        root.style.setProperty("--umi-success", colors.success);
+        root.style.setProperty("--umi-warning", colors.warning);
+        root.style.setProperty("--umi-error", colors.error);
+        root.style.setProperty("--umi-info", colors.info);
+        root.style.setProperty("--umi-hover", colors.hover);
+    }
+
+    applyThemeOverrides() {
+        let style = document.getElementById("umi-theme-overrides");
+        if (!style) {
+            style = document.createElement("style");
+            style.id = "umi-theme-overrides";
+            document.head.appendChild(style);
+        }
+
+        style.textContent = `
+            .umi-mm-container,
+            .umi-emotion-studio-panel,
+            .umi-character-designer-panel,
+            .ues-modal,
+            .vnccs-pose-editor-panel,
+            .umi-lora-browser,
+            .umi-image-browser,
+            .umi-preset-manager,
+            .umi-history-browser,
+            .umi-shortcuts-panel {
+                background: var(--umi-bg) !important;
+                color: var(--umi-text) !important;
+                border-color: var(--umi-border) !important;
+            }
+
+            .umi-mm-controls,
+            .umi-mm-status-bar,
+            .umi-mm-model,
+            .ues-selected-display,
+            .ues-modal-content,
+            .ues-modal-header,
+            .ues-modal-footer,
+            .ues-category-filter,
+            .ues-grid-container,
+            .ues-panel,
+            .ucd-header,
+            .ucd-grid,
+            .ucd-btn-row,
+            .vnccs-panel,
+            .vnccs-pose-editor-header,
+            .vnccs-pose-editor-body,
+            .vnccs-pose-editor-sidebar,
+            .vnccs-3d-header,
+            .vnccs-3d-footer {
+                background: var(--umi-panel) !important;
+                border-color: var(--umi-border) !important;
+            }
+
+            .umi-mm-header h2,
+            .umi-mm-status,
+            .umi-mm-status-bar span,
+            .umi-mm-footer,
+            .ues-title,
+            .ues-modal-title,
+            .ues-emotion-label,
+            .ues-placeholder,
+            .ues-subtitle,
+            .ues-label,
+            .ues-section-title,
+            .ucd-header h3,
+            .ucd-label,
+            .ucd-status,
+            .vnccs-pose-editor-title,
+            .vnccs-pose-editor-subtitle,
+            .vnccs-panel h3,
+            .vnccs-panel p {
+                color: var(--umi-text) !important;
+            }
+
+            .umi-mm-controls input,
+            .umi-mm-select,
+            .ues-input,
+            .ues-select,
+            .ues-costume-btn,
+            .ues-category-btn,
+            .ucd-name-input,
+            .ucd-input,
+            .ucd-select,
+            .vnccs-select,
+            .vnccs-input,
+            .vnccs-textarea {
+                background: var(--umi-panel) !important;
+                color: var(--umi-text) !important;
+                border-color: var(--umi-border) !important;
+            }
+
+            .umi-mm-btn,
+            .ues-btn,
+            .ues-close-btn,
+            .ues-btn-secondary,
+            .ues-costume-btn,
+            .ues-category-btn,
+            .ucd-btn,
+            .vnccs-btn,
+            .vnccs-3d-btn {
+                background: var(--umi-panel) !important;
+                color: var(--umi-text) !important;
+                border-color: var(--umi-border) !important;
+            }
+
+            .umi-mm-btn-primary,
+            .ues-btn-primary,
+            .ues-category-btn.active,
+            .ues-costume-btn.selected,
+            .ucd-btn-primary,
+            .vnccs-btn.primary,
+            .vnccs-3d-btn.active {
+                background: var(--umi-accent) !important;
+                color: #fff !important;
+            }
+
+            .ues-tag {
+                background: var(--umi-panel) !important;
+                border-color: var(--umi-accent) !important;
+                color: var(--umi-text) !important;
+            }
+
+            .umi-deps-banner,
+            .umi-mm-deps {
+                background: var(--umi-panel) !important;
+                border-color: var(--umi-warning) !important;
+                color: var(--umi-warning) !important;
+            }
+        `;
     }
 
     stylePanel(panel, colors) {

@@ -420,8 +420,8 @@ class TagSelector(TagSelectorBase):
             if entry.get('csv_row'):
                 csv_row = entry['csv_row']
                 for column_name, column_value in csv_row.items():
-                    var_name = f"${column_name}"
-                    if var_name not in self.variables:
+                    var_name = str(column_name).strip()
+                    if var_name and var_name not in self.variables:
                         self.variables[var_name] = column_value
 
         result = ", ".join(result_parts)
@@ -982,22 +982,32 @@ class UmiAIWildcardNodeLite:
                 print(f"[UmiAI Lite] Problematic prompt fragment: {prompt[:100]}...")
                 break
 
-            prompt_history.append(previous_prompt)
+            prompt_history.append(prompt)
             previous_prompt = prompt
 
             prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
             tag_selector.update_variables(variable_replacer.variables)
             prompt = variable_replacer.replace_variables(prompt)
-            prompt = CharacterReplacer.replace(prompt)  # @@character:outfit:emotion@@
-            prompt = tag_replacer.replace(prompt)
-            prompt = dynamic_replacer.replace(prompt)
+
+            masked_prompt, if_blocks = conditional_replacer.mask_conditionals(prompt)
+            masked_prompt = CharacterReplacer.replace(masked_prompt)  # @@character:outfit:emotion@@
+            masked_prompt = tag_replacer.replace(masked_prompt)
+            masked_prompt = dynamic_replacer.replace(masked_prompt)
+
+            prompt = conditional_replacer.unmask_conditionals(masked_prompt, if_blocks)
+            prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
+
+            # Capture assignments revealed by conditionals in the same iteration
+            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
+            tag_selector.update_variables(variable_replacer.variables)
+            prompt = variable_replacer.replace_variables(prompt)
             iterations += 1
 
         # Warn if we hit the iteration limit
         if iterations >= 50:
             print(f"[UmiAI Lite] WARNING: Reached maximum processing iterations (50). Possible recursive wildcards or variables.")
 
-        # Apply conditional logic
+        # Apply conditional logic (in case any remain after loop)
         prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
 
         # Add prefixes and suffixes

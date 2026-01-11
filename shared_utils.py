@@ -311,8 +311,54 @@ class LogicEvaluator:
     Also supports variable comparisons ($var==value) and boolean checks ($var)
     """
     def __init__(self, expression, variables=None):
-        self.expression = expression.strip()
+        self.expression = self._normalize_expression(expression.strip())
         self.variables = variables or {}
+
+    def _normalize_expression(self, expr):
+        if not expr:
+            return expr
+
+        # Normalize single '=' to '==' outside of quotes.
+        result = []
+        in_quote = False
+        quote_char = ""
+        i = 0
+        while i < len(expr):
+            char = expr[i]
+            if char in ('"', "'"):
+                if in_quote and char == quote_char:
+                    in_quote = False
+                    quote_char = ""
+                elif not in_quote:
+                    in_quote = True
+                    quote_char = char
+                result.append(char)
+                i += 1
+                continue
+
+            if not in_quote and char == '=':
+                prev_char = expr[i - 1] if i > 0 else ""
+                next_char = expr[i + 1] if i + 1 < len(expr) else ""
+                if prev_char not in ('!', '=') and next_char != '=':
+                    result.append('==')
+                else:
+                    result.append(char)
+                i += 1
+                continue
+
+            result.append(char)
+            i += 1
+
+        normalized = "".join(result)
+        # Remove spaces around comparison operators for tokenization stability
+        normalized = re.sub(r'\s*(==|!=)\s*', r'\1', normalized)
+        return normalized
+
+    def _strip_quotes(self, value):
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            return value[1:-1]
+        return value
 
     def evaluate(self, context):
         tokens = self.tokenize(self.expression)
@@ -323,6 +369,8 @@ class LogicEvaluator:
         tokens = []
         current = ""
         i = 0
+        in_quote = False
+        quote_char = ""
         
         def is_word_boundary(pos):
             """Check if position is at a word boundary (start, end, space, or paren)"""
@@ -332,6 +380,21 @@ class LogicEvaluator:
         
         while i < len(expr):
             char = expr[i]
+
+            if in_quote:
+                current += char
+                if char == quote_char:
+                    in_quote = False
+                    quote_char = ""
+                i += 1
+                continue
+
+            if char in ('"', "'"):
+                in_quote = True
+                quote_char = char
+                current += char
+                i += 1
+                continue
 
             if char in '()':
                 if current.strip():
@@ -413,6 +476,41 @@ class LogicEvaluator:
                         current = ""
                     tokens.append('OR')
                     i += 2
+                elif (expr[i:i+2].upper() == 'IN' and 
+                      is_word_boundary(i-1) and is_word_boundary(i+2)):
+                    if current.strip():
+                        tokens.append(current.strip())
+                        current = ""
+                    tokens.append('IN')
+                    i += 2
+                elif (expr[i:i+8].upper() == 'CONTAINS' and 
+                      is_word_boundary(i-1) and is_word_boundary(i+8)):
+                    if current.strip():
+                        tokens.append(current.strip())
+                        current = ""
+                    tokens.append('CONTAINS')
+                    i += 8
+                elif (expr[i:i+7].upper() == 'MATCHES' and 
+                      is_word_boundary(i-1) and is_word_boundary(i+7)):
+                    if current.strip():
+                        tokens.append(current.strip())
+                        current = ""
+                    tokens.append('MATCHES')
+                    i += 7
+                elif (expr[i:i+10].upper() == 'STARTSWITH' and 
+                      is_word_boundary(i-1) and is_word_boundary(i+10)):
+                    if current.strip():
+                        tokens.append(current.strip())
+                        current = ""
+                    tokens.append('STARTSWITH')
+                    i += 10
+                elif (expr[i:i+8].upper() == 'ENDSWITH' and 
+                      is_word_boundary(i-1) and is_word_boundary(i+8)):
+                    if current.strip():
+                        tokens.append(current.strip())
+                        current = ""
+                    tokens.append('ENDSWITH')
+                    i += 8
                 else:
                     current += char
                     i += 1
@@ -423,7 +521,10 @@ class LogicEvaluator:
         return tokens
 
     def to_postfix(self, tokens):
-        precedence = {'NOT': 3, 'AND': 2, 'NAND': 2, 'XOR': 1, 'OR': 1, 'NOR': 1}
+        precedence = {
+            'NOT': 3, 'AND': 2, 'NAND': 2, 'XOR': 1, 'OR': 1, 'NOR': 1,
+            'IN': 4, 'CONTAINS': 4, 'MATCHES': 4, 'STARTSWITH': 4, 'ENDSWITH': 4
+        }
         output = []
         stack = []
 
@@ -452,48 +553,132 @@ class LogicEvaluator:
     def evaluate_postfix(self, postfix, context):
         stack = []
 
+        context_text = None
+        if isinstance(context, str):
+            context_text = context.lower()
+
+        def _coerce_bool(operand):
+            if isinstance(operand, dict):
+                kind = operand.get('kind')
+                if kind == 'var':
+                    val = self.variables.get(operand.get('name', ''), False)
+                    return bool(val) and str(val).lower() not in ['false', '0', 'no', '']
+                if kind == 'quoted':
+                    return bool(operand.get('value', ''))
+                if kind == 'bare':
+                    token_lower = operand.get('value', '').lower()
+                    if context_text is not None:
+                        if re.search(r'\s', token_lower):
+                            return token_lower in context_text
+                        return re.search(r'\b' + re.escape(token_lower) + r'\b', context_text) is not None
+                    return token_lower in context
+                if kind == 'bool':
+                    return bool(operand.get('value'))
+            return bool(operand)
+
+        def _coerce_str(operand):
+            if isinstance(operand, dict):
+                kind = operand.get('kind')
+                if kind == 'var':
+                    return str(self.variables.get(operand.get('name', ''), ''))
+                if kind == 'quoted':
+                    return str(operand.get('value', ''))
+                if kind == 'bare':
+                    return str(operand.get('value', ''))
+                if kind == 'bool':
+                    return str(bool(operand.get('value')))
+            return str(operand)
+
         for token in postfix:
             if token == 'AND':
                 if len(stack) < 2:
                     return False
-                b = stack.pop()
-                a = stack.pop()
+                b = _coerce_bool(stack.pop())
+                a = _coerce_bool(stack.pop())
                 stack.append(a and b)
             elif token == 'OR':
                 if len(stack) < 2:
                     return False
-                b = stack.pop()
-                a = stack.pop()
+                b = _coerce_bool(stack.pop())
+                a = _coerce_bool(stack.pop())
                 stack.append(a or b)
             elif token == 'NOT':
                 if len(stack) < 1:
                     return False
-                a = stack.pop()
+                a = _coerce_bool(stack.pop())
                 stack.append(not a)
             elif token == 'XOR':
                 if len(stack) < 2:
                     return False
-                b = stack.pop()
-                a = stack.pop()
+                b = _coerce_bool(stack.pop())
+                a = _coerce_bool(stack.pop())
                 stack.append(a != b)
             elif token == 'NAND':
                 if len(stack) < 2:
                     return False
-                b = stack.pop()
-                a = stack.pop()
+                b = _coerce_bool(stack.pop())
+                a = _coerce_bool(stack.pop())
                 stack.append(not (a and b))
             elif token == 'NOR':
                 if len(stack) < 2:
                     return False
-                b = stack.pop()
-                a = stack.pop()
+                b = _coerce_bool(stack.pop())
+                a = _coerce_bool(stack.pop())
                 stack.append(not (a or b))
+            elif token == 'IN':
+                if len(stack) < 2:
+                    return False
+                right = _coerce_str(stack.pop()).lower()
+                left = _coerce_str(stack.pop()).lower()
+                if ',' in right or '|' in right:
+                    parts = [p.strip() for p in re.split(r'[,\|]', right) if p.strip()]
+                    stack.append(left in parts)
+                else:
+                    stack.append(left in right)
+            elif token == 'CONTAINS':
+                if len(stack) < 2:
+                    return False
+                right = _coerce_str(stack.pop()).lower()
+                left = _coerce_str(stack.pop()).lower()
+                stack.append(right in left)
+            elif token == 'MATCHES':
+                if len(stack) < 2:
+                    return False
+                pattern = _coerce_str(stack.pop())
+                target = _coerce_str(stack.pop())
+                try:
+                    stack.append(re.search(pattern, target, re.IGNORECASE) is not None)
+                except re.error:
+                    stack.append(False)
+            elif token == 'STARTSWITH':
+                if len(stack) < 2:
+                    return False
+                right = _coerce_str(stack.pop()).lower()
+                left = _coerce_str(stack.pop()).lower()
+                stack.append(left.startswith(right))
+            elif token == 'ENDSWITH':
+                if len(stack) < 2:
+                    return False
+                right = _coerce_str(stack.pop()).lower()
+                left = _coerce_str(stack.pop()).lower()
+                stack.append(left.endswith(right))
             else:
-                # Variable comparison support ($var==value)
-                if '==' in token:
+                # Variable comparison support ($var==value, $var!=value, $var=value)
+                if '!=' in token:
+                    parts = token.split('!=', 1)
+                    left = parts[0].strip()
+                    right = self._strip_quotes(parts[1].strip())
+
+                    if left.startswith('$'):
+                        var_name = left[1:]
+                        var_value = str(self.variables.get(var_name, "")).lower()
+                        stack.append(var_value != right.lower())
+                    else:
+                        stack.append(self._strip_quotes(left).lower() != right.lower())
+                elif '==' in token:
                     parts = token.split('==', 1)
                     left = parts[0].strip()
-                    right = parts[1].strip()
+                    right = self._strip_quotes(parts[1].strip())
 
                     # Check if left side is a variable
                     if left.startswith('$'):
@@ -502,19 +687,28 @@ class LogicEvaluator:
                         stack.append(var_value == right.lower())
                     else:
                         # Regular comparison
-                        stack.append(left.lower() == right.lower())
-                elif token.startswith('$'):
-                    # Boolean variable check ($var means "is var truthy")
-                    var_name = token[1:]
-                    val = self.variables.get(var_name, False)
-                    is_true = bool(val) and str(val).lower() not in ['false', '0', 'no', '']
-                    stack.append(is_true)
-                else:
-                    # Tag existence check
-                    token_lower = token.lower()
-                    stack.append(token_lower in context)
+                        stack.append(self._strip_quotes(left).lower() == right.lower())
+                elif '=' in token:
+                    parts = token.split('=', 1)
+                    left = parts[0].strip()
+                    right = self._strip_quotes(parts[1].strip())
 
-        return stack[0] if stack else False
+                    if left.startswith('$'):
+                        var_name = left[1:]
+                        var_value = str(self.variables.get(var_name, "")).lower()
+                        stack.append(var_value == right.lower())
+                    else:
+                        stack.append(self._strip_quotes(left).lower() == right.lower())
+                elif token.startswith('$'):
+                    stack.append({'kind': 'var', 'name': token[1:]})
+                elif token.startswith(("'", '"')) and token.endswith(("'", '"')) and len(token) >= 2:
+                    stack.append({'kind': 'quoted', 'value': self._strip_quotes(token)})
+                else:
+                    stack.append({'kind': 'bare', 'value': token})
+
+        if not stack:
+            return False
+        return _coerce_bool(stack[0])
 
 
 # ==============================================================================
@@ -656,18 +850,149 @@ class VariableReplacer:
     Supports: nested variable resolution, string methods (.upper, .lower, .clean, etc.)
     """
     def __init__(self):
-        self.assign_regex = re.compile(r'^\$([a-zA-Z0-9_]+)\s*=\s*(.*?)$', re.MULTILINE)
+        # Updated regex to support multiple assignments per line using ';' as separator
+        # Matches $var=val until ';' or end of line/string
+        # greedy match up to the separator to handle spaces correctly
+        self.assign_regex = re.compile(r'\$([a-zA-Z0-9_]+)\s*=\s*([^;]+?)(?:\s*;|(?=\n)|$)', re.MULTILINE)
         self.use_regex = re.compile(r'\$([a-zA-Z0-9_]+)((?:\.[a-zA-Z_]+)*)')
         self.variables = {}
 
     def load_globals(self, globals_dict):
         self.variables.update(globals_dict)
 
+    def find_matching_bracket(self, text, start):
+        """Find the matching closing bracket for the one at text[start]."""
+        depth = 1
+        i = start + 1
+        while i < len(text) and depth > 0:
+            if text[i] == '[':
+                depth += 1
+            elif text[i] == ']':
+                depth -= 1
+            i += 1
+        return i - 1 if depth == 0 else -1
+
     def store_variables(self, text, tag_replacer, dynamic_replacer):
-        def _replace_assign(match):
-            var_name = match.group(1)
-            raw_value = match.group(2).strip()
+        # 1. Mask conditional blocks (e.g. [if ... ]) to prevent premature variable assignment
+        masked_text = text
+        blocks = {}
+        counter = 0
+        if_start = re.compile(r'\[if\s+', re.IGNORECASE)
+
+        while True:
+            # Always search from the beginning of current masked_text
+            match = if_start.search(masked_text)
+            if not match:
+                break
             
+            # Match start is at "[if"
+            bracket_idx = match.start()
+            end = self.find_matching_bracket(masked_text, bracket_idx)
+            
+            if end == -1:
+                # Malformed or unmatched check, just break to be safe
+                break
+                
+            # Extract content including brackets
+            block_content = masked_text[bracket_idx:end+1]
+            token = f"%%UMI_IF_BLOCK_{counter}%%"
+            blocks[token] = block_content
+            
+            # Replace strictly this occurrence
+            masked_text = masked_text[:bracket_idx] + token + masked_text[end+1:]
+            counter += 1
+
+        def _find_matching(text_value, start, open_char, close_char):
+            depth = 1
+            i = start + 1
+            while i < len(text_value) and depth > 0:
+                if text_value[i] == open_char:
+                    depth += 1
+                elif text_value[i] == close_char:
+                    depth -= 1
+                i += 1
+            return i - 1 if depth == 0 else -1
+
+        def _parse_assignment(text_value, idx):
+            if text_value[idx] != '$':
+                return None
+
+            j = idx + 1
+            while j < len(text_value) and (text_value[j].isalnum() or text_value[j] == '_'):
+                j += 1
+            if j == idx + 1:
+                return None
+
+            var_name = text_value[idx + 1:j]
+
+            k = j
+            while k < len(text_value) and text_value[k].isspace():
+                k += 1
+            if k >= len(text_value) or text_value[k] != '=':
+                return None
+
+            k += 1
+            while k < len(text_value) and text_value[k].isspace():
+                k += 1
+            if k >= len(text_value):
+                return None
+
+            value_start = k
+
+            if text_value[k] == '{':
+                end = _find_matching(text_value, k, '{', '}')
+                if end == -1:
+                    end = k
+                value_end = end + 1
+            elif text_value[k] == '[':
+                end = _find_matching(text_value, k, '[', ']')
+                if end == -1:
+                    end = k
+                value_end = end + 1
+            elif text_value[k] in ("'", '"'):
+                quote_char = text_value[k]
+                k += 1
+                while k < len(text_value):
+                    if text_value[k] == quote_char and text_value[k - 1] != '\\':
+                        k += 1
+                        break
+                    k += 1
+                value_end = k
+            elif text_value[k:k + 2] == '__':
+                end = text_value.find('__', k + 2)
+                value_end = end + 2 if end != -1 else len(text_value)
+            elif text_value[k] == '<':
+                end = text_value.find('>', k + 1)
+                value_end = end + 1 if end != -1 else len(text_value)
+            else:
+                k = value_start
+                while k < len(text_value) and text_value[k] not in ';\n':
+                    k += 1
+                value_end = k
+
+            raw_value = text_value[value_start:value_end].strip()
+
+            # Skip a trailing semicolon if present
+            value_end = value_end + 1 if value_end < len(text_value) and text_value[value_end] == ';' else value_end
+
+            return var_name, raw_value, value_end
+
+        # 2. Run assignment on MASKED text
+        processed_parts = []
+        i = 0
+        while i < len(masked_text):
+            if masked_text[i] != '$':
+                processed_parts.append(masked_text[i])
+                i += 1
+                continue
+
+            parsed = _parse_assignment(masked_text, i)
+            if not parsed:
+                processed_parts.append(masked_text[i])
+                i += 1
+                continue
+
+            var_name, raw_value, end_idx = parsed
             resolved_value = raw_value
             for _ in range(10):  # Max iterations to prevent infinite loops
                 prev_value = resolved_value
@@ -675,10 +1000,17 @@ class VariableReplacer:
                 resolved_value = dynamic_replacer.replace(resolved_value)
                 if prev_value == resolved_value:
                     break
-            
+
             self.variables[var_name] = resolved_value
-            return ""  # Remove the assignment line from output
-        return self.assign_regex.sub(_replace_assign, text)
+            i = end_idx
+
+        processed_text = "".join(processed_parts)
+        
+        # 3. Restore blocks
+        for token, content in blocks.items():
+            processed_text = processed_text.replace(token, content)
+            
+        return processed_text
 
     def replace_variables(self, text):
         # Nested variable resolution - resolve variables that reference other variables
@@ -810,10 +1142,39 @@ class ConditionalReplacer:
             i += 1
         return i - 1 if depth == 0 else -1
 
+    def mask_conditionals(self, text):
+        """Mask [if ...] blocks to prevent premature expansion."""
+        masked_text = text
+        blocks = {}
+        counter = 0
+
+        while True:
+            match = self.if_start.search(masked_text)
+            if not match:
+                break
+            bracket_idx = match.start()
+            end = self.find_matching_bracket(masked_text, bracket_idx)
+            if end == -1:
+                break
+
+            block_content = masked_text[bracket_idx:end + 1]
+            token = f"%%UMI_IF_BLOCK_{counter}%%"
+            blocks[token] = block_content
+            masked_text = masked_text[:bracket_idx] + token + masked_text[end + 1:]
+            counter += 1
+
+        return masked_text, blocks
+
+    def unmask_conditionals(self, text, blocks):
+        """Restore masked [if ...] blocks."""
+        for token, content in blocks.items():
+            text = text.replace(token, content)
+        return text
+
     def parse_conditional(self, text, start):
         """
         Parse a conditional starting at position 'start'.
-        Returns (end_pos, condition, true_text, false_text) or None if invalid.
+        Returns (start_pos, end_pos, branches, else_text) or None if invalid.
         """
         # Find the [ position
         bracket_start = text.rfind('[', 0, start + 4)  # [if is 3 chars before content
@@ -836,12 +1197,57 @@ class ConditionalReplacer:
         condition = if_match.group(1).strip()
         rest = inner[if_match.end():]
         
-        # Find the | separator (but not inside nested brackets or braces)
+        def _find_colon(s, start_idx):
+            depth_bracket = 0
+            depth_brace = 0
+            in_quote = False
+            quote_char = ""
+            i = start_idx
+            while i < len(s):
+                c = s[i]
+                if in_quote:
+                    if c == quote_char:
+                        in_quote = False
+                        quote_char = ""
+                    i += 1
+                    continue
+                if c in ("'", '"'):
+                    in_quote = True
+                    quote_char = c
+                    i += 1
+                    continue
+                if c == '[':
+                    depth_bracket += 1
+                elif c == ']':
+                    depth_bracket -= 1
+                elif c == '{':
+                    depth_brace += 1
+                elif c == '}':
+                    depth_brace -= 1
+                elif c == ':' and depth_bracket == 0 and depth_brace == 0:
+                    return i
+                i += 1
+            return -1
+
+        # Find the | or else/elif separators (but not inside nested brackets or braces)
         depth_bracket = 0
         depth_brace = 0
+        in_quote = False
+        quote_char = ""
         pipe_pos = -1
+        else_pos = -1
+        has_elif_else = False
         
         for i, c in enumerate(rest):
+            if in_quote:
+                if c == quote_char:
+                    in_quote = False
+                    quote_char = ""
+                continue
+            if c in ("'", '"'):
+                in_quote = True
+                quote_char = c
+                continue
             if c == '[':
                 depth_bracket += 1
             elif c == ']':
@@ -852,111 +1258,94 @@ class ConditionalReplacer:
                 depth_brace -= 1
             elif c == '|' and depth_bracket == 0 and depth_brace == 0:
                 pipe_pos = i
-                break
+            elif depth_bracket == 0 and depth_brace == 0:
+                if rest[i:i+5].lower() == 'else:' and (i == 0 or rest[i-1].isspace()):
+                    else_pos = i
+                    has_elif_else = True
+                    break
+                if rest[i:i+4].lower() == 'elif' and (i == 0 or rest[i-1].isspace()):
+                    has_elif_else = True
+                    break
         
-        if pipe_pos == -1:
-            true_text = rest
-            false_text = ""
-        else:
-            true_text = rest[:pipe_pos]
-            false_text = rest[pipe_pos + 1:]
-        
-        return (end + 1, condition, true_text.strip(), false_text.strip())
+        if not has_elif_else:
+            if pipe_pos == -1 and else_pos == -1:
+                true_text = rest
+                false_text = ""
+            elif pipe_pos != -1:
+                true_text = rest[:pipe_pos]
+                false_text = rest[pipe_pos + 1:]
+            else:
+                true_text = rest[:else_pos]
+                false_text = rest[else_pos + 5:]
+            branches = [(condition, true_text.strip())]
+            return (bracket_start, end + 1, branches, false_text.strip())
+
+        branches = []
+        current_cond = condition
+        segment_start = 0
+        i = 0
+        depth_bracket = 0
+        depth_brace = 0
+        in_quote = False
+        quote_char = ""
+        while i < len(rest):
+            c = rest[i]
+            if in_quote:
+                if c == quote_char:
+                    in_quote = False
+                    quote_char = ""
+                i += 1
+                continue
+            if c in ("'", '"'):
+                in_quote = True
+                quote_char = c
+                i += 1
+                continue
+            if c == '[':
+                depth_bracket += 1
+                i += 1
+                continue
+            if c == ']':
+                depth_bracket -= 1
+                i += 1
+                continue
+            if c == '{':
+                depth_brace += 1
+                i += 1
+                continue
+            if c == '}':
+                depth_brace -= 1
+                i += 1
+                continue
+
+            if depth_bracket == 0 and depth_brace == 0:
+                if rest[i:i+5].lower() == 'else:' and (i == 0 or rest[i-1].isspace()):
+                    branches.append((current_cond, rest[segment_start:i].strip()))
+                    else_text = rest[i+5:].strip()
+                    return (bracket_start, end + 1, branches, else_text)
+                if rest[i:i+4].lower() == 'elif' and (i == 0 or rest[i-1].isspace()):
+                    branches.append((current_cond, rest[segment_start:i].strip()))
+                    cond_start = i + 4
+                    while cond_start < len(rest) and rest[cond_start].isspace():
+                        cond_start += 1
+                    colon_pos = _find_colon(rest, cond_start)
+                    if colon_pos == -1:
+                        return None
+                    current_cond = rest[cond_start:colon_pos].strip()
+                    segment_start = colon_pos + 1
+                    i = segment_start
+                    continue
+            i += 1
+
+        branches.append((current_cond, rest[segment_start:].strip()))
+        return (bracket_start, end + 1, branches, "")
 
     def evaluate_logic(self, condition, context, variables=None):
         """Evaluate a logical condition against the context."""
         if variables is None: 
             variables = {}
-
-        ops = {'AND': 'and', 'OR': 'or', 'NOT': 'not', 'XOR': '!=', 'NAND': 'nand', 'NOR': 'nor'}
-        tokens = re.split(r'(\(|\)|\bNAND\b|\bNOR\b|\bAND\b|\bOR\b|\bNOT\b|\bXOR\b|&&|\|\||!|\^)', condition, flags=re.IGNORECASE)
-        expression = []
-        
-        for token in tokens:
-            token = token.strip()
-            if not token: 
-                continue
-
-            # Handle symbolic operators
-            if token == '&&':
-                expression.append('and')
-            elif token == '||':
-                expression.append('or')
-            elif token == '!':
-                expression.append('not')
-            elif token == '^':
-                expression.append('!=')
-            elif token in ('(', ')'):
-                expression.append(token)
-            else:
-                upper_token = token.upper()
-                if upper_token in ops:
-                    if upper_token == 'NAND':
-                        expression.append('nand')
-                    elif upper_token == 'NOR':
-                        expression.append('nor')
-                    else:
-                        expression.append(ops[upper_token])
-                elif '!=' in token:
-                    # Handle inequality: $var!=value
-                    left, right = token.split('!=', 1)
-                    left = left.strip()
-                    right = right.strip()
-                    
-                    if left.startswith('$'):
-                        var_name = left[1:]
-                        left_val = str(variables.get(var_name, "")).lower()
-                    else:
-                        left_val = left.lower()
-                    
-                    expression.append(str(left_val != right.lower()))
-                elif '=' in token:
-                    left, right = token.split('=', 1)
-                    left = left.strip()
-                    right = right.strip()
-                    
-                    if left.startswith('$'):
-                        var_name = left[1:]
-                        left_val = str(variables.get(var_name, "")).lower()
-                    else:
-                        left_val = left.lower()
-                    
-                    expression.append(str(left_val == right.lower()))
-                
-                elif token.startswith('$'):
-                    var_name = token[1:]
-                    val = variables.get(var_name, False)
-                    is_true = bool(val) and str(val).lower() not in ['false', '0', 'no']
-                    expression.append(str(is_true))
-                    
-                else:
-                    # Use regex word boundaries to prevent partial matching
-                    pattern = r'\b' + re.escape(token.lower()) + r'\b'
-                    exists = re.search(pattern, context.lower()) is not None
-                    expression.append(str(exists))
-        
-        try:
-            # Post-process to handle NAND and NOR
-            processed_expr = []
-            i = 0
-            while i < len(expression):
-                if expression[i] == 'nand' and i + 2 < len(expression):
-                    a = processed_expr.pop() if processed_expr else 'False'
-                    b = expression[i + 1] if i + 1 < len(expression) else 'False'
-                    processed_expr.append(f'not ({a} and {b})')
-                    i += 2
-                elif expression[i] == 'nor' and i + 2 < len(expression):
-                    a = processed_expr.pop() if processed_expr else 'False'
-                    b = expression[i + 1] if i + 1 < len(expression) else 'False'
-                    processed_expr.append(f'not ({a} or {b})')
-                    i += 2
-                else:
-                    processed_expr.append(expression[i])
-                    i += 1
-
-            return eval(" ".join(processed_expr), {"__builtins__": None}, {})
-        except:
-            return False
+        evaluator = LogicEvaluator(condition, variables)
+        return evaluator.evaluate(context)
 
     def replace(self, prompt, variables=None):
         """Replace conditional tags in the prompt."""
@@ -976,18 +1365,18 @@ class ConditionalReplacer:
                 # Invalid conditional, skip past it
                 break
             
-            end_pos, condition, true_text, false_text = parsed
-            full_tag = prompt[match.start() - 1:end_pos]  # Include the leading [
+            start_pos, end_pos, branches, else_text = parsed
             
             # Clean the context by removing current tag to avoid self-reference
-            context = prompt[:match.start() - 1] + prompt[end_pos:]
+            context = prompt[:start_pos] + prompt[end_pos:]
 
-            if self.evaluate_logic(condition, context, variables):
-                replacement = true_text
-            else:
-                replacement = false_text
+            replacement = else_text
+            for cond, text_value in branches:
+                if self.evaluate_logic(cond, context, variables):
+                    replacement = text_value
+                    break
             
-            prompt = prompt[:match.start() - 1] + replacement + prompt[end_pos:]
+            prompt = prompt[:start_pos] + replacement + prompt[end_pos:]
             iteration += 1
         
         return prompt
@@ -1501,4 +1890,3 @@ class CharacterReplacer:
         text = cls.pattern.sub(_replace_colon, text)
         
         return text
-

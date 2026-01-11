@@ -1,49 +1,65 @@
-/**
- * UmiAI Model Manager
- * Dedicated panel for downloading recommended models for character consistency workflows.
+﻿/**
+ * UmiAI Model Manager (VNCCS-style repo sync)
  */
-
 (function () {
     'use strict';
 
-    // Panel state
     let modelManagerPanel = null;
+    let models = [];
+    let downloadStatuses = {};
+    let pollingInterval = null;
     let isLoading = false;
 
-    // Create and show the Model Manager panel
+    const DEFAULT_REPO_ID = 'Tinuva/Comfy-Umi';
+
+    function resetRepoId() {
+        localStorage.setItem('umi_model_repo', DEFAULT_REPO_ID);
+    }
+
+    function getRepoId() {
+        return localStorage.getItem('umi_model_repo') || DEFAULT_REPO_ID;
+    }
+
+    function setRepoId(value) {
+        localStorage.setItem('umi_model_repo', value);
+    }
+
     function showModelManager() {
         if (modelManagerPanel) {
             modelManagerPanel.style.display = 'flex';
-            loadModelStatus();
+            startPolling();
+            loadModels();
             return;
         }
 
-        // Create panel
         modelManagerPanel = document.createElement('div');
         modelManagerPanel.id = 'umi-model-manager';
         modelManagerPanel.innerHTML = `
             <div class="umi-mm-overlay" onclick="window.umiModelManager.hide()"></div>
             <div class="umi-mm-container">
                 <div class="umi-mm-header">
-                    <h2>📦 UmiAI Model Manager</h2>
-                    <button class="umi-mm-close" onclick="window.umiModelManager.hide()">×</button>
+                    <h2>UmiAI Model Manager</h2>
+                    <button class="umi-mm-close" onclick="window.umiModelManager.hide()">X</button>
+                </div>
+                <div class="umi-mm-controls">
+                    <label>Repo ID</label>
+                    <input id="umi-mm-repo" type="text" placeholder="owner/repo" />
+                    <button id="umi-mm-check" class="umi-mm-btn">Check Models</button>
                 </div>
                 <div class="umi-mm-status-bar">
-                    <span id="umi-mm-status-text">Loading...</span>
-                    <button id="umi-mm-download-all" class="umi-mm-btn-primary" onclick="window.umiModelManager.downloadAllRequired()">
-                        ⬇️ Download All Required
-                    </button>
+                    <span id="umi-mm-status-text">Idle</span>
+                    <button id="umi-mm-download-all" class="umi-mm-btn-primary">Download All Missing/Updates</button>
                 </div>
+                <div class="umi-mm-deps" id="umi-mm-deps" style="display:none;"></div>
                 <div class="umi-mm-content" id="umi-mm-content">
-                    <div class="umi-mm-loading">Loading model status...</div>
+                    <div class="umi-mm-loading">Loading models...</div>
                 </div>
                 <div class="umi-mm-footer">
-                    <p>Models hosted at <a href="https://huggingface.co/Tinuva/Comfy-Umi" target="_blank">Tinuva/Comfy-Umi</a></p>
+                    <span id="umi-mm-repo-label"></span>
                 </div>
             </div>
         `;
 
-        // Add styles
         const style = document.createElement('style');
         style.textContent = `
             #umi-model-manager {
@@ -53,6 +69,7 @@
                 z-index: 10000;
                 align-items: center;
                 justify-content: center;
+                font-family: sans-serif;
             }
             .umi-mm-overlay {
                 position: absolute;
@@ -63,9 +80,9 @@
                 position: relative;
                 background: #1e1e1e;
                 border-radius: 12px;
-                width: 800px;
-                max-width: 90vw;
-                max-height: 80vh;
+                width: 900px;
+                max-width: 92vw;
+                max-height: 82vh;
                 display: flex;
                 flex-direction: column;
                 box-shadow: 0 8px 32px rgba(0,0,0,0.5);
@@ -86,22 +103,40 @@
                 background: none;
                 border: none;
                 color: #888;
-                font-size: 24px;
+                font-size: 20px;
                 cursor: pointer;
             }
             .umi-mm-close:hover { color: #fff; }
-            .umi-mm-status-bar {
+            .umi-mm-controls {
                 display: flex;
-                justify-content: space-between;
+                gap: 10px;
                 align-items: center;
                 padding: 12px 20px;
-                background: #252525;
                 border-bottom: 1px solid #333;
+                background: #252525;
             }
-            #umi-mm-status-text {
+            .umi-mm-controls label {
                 color: #aaa;
-                font-size: 14px;
+                font-size: 12px;
             }
+            .umi-mm-controls input {
+                flex: 1;
+                background: #111;
+                border: 1px solid #444;
+                color: #fff;
+                padding: 6px 8px;
+                border-radius: 6px;
+            }
+            .umi-mm-btn {
+                background: #333;
+                border: 1px solid #555;
+                color: #ddd;
+                padding: 6px 12px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 12px;
+            }
+            .umi-mm-btn:hover { background: #3a3a3a; }
             .umi-mm-btn-primary {
                 background: linear-gradient(135deg, #4a9eff 0%, #3b7ed0 100%);
                 color: white;
@@ -111,292 +146,374 @@
                 cursor: pointer;
                 font-weight: 500;
             }
-            .umi-mm-btn-primary:hover { opacity: 0.9; }
             .umi-mm-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+            .umi-mm-status-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 10px 20px;
+                border-bottom: 1px solid #333;
+            }
+            #umi-mm-status-text {
+                color: #aaa;
+                font-size: 13px;
+            }
             .umi-mm-content {
                 flex: 1;
                 overflow-y: auto;
-                padding: 16px 20px;
+                padding: 14px 20px;
             }
             .umi-mm-loading {
                 text-align: center;
                 color: #888;
                 padding: 40px;
             }
-            .umi-mm-category {
-                margin-bottom: 20px;
-            }
-            .umi-mm-cat-header {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                margin-bottom: 10px;
-            }
-            .umi-mm-cat-header h3 {
-                margin: 0;
-                font-size: 15px;
-                color: #ddd;
-            }
             .umi-mm-model {
-                display: flex;
+                display: grid;
+                grid-template-columns: 1fr 140px 160px 120px;
+                gap: 12px;
                 align-items: center;
-                justify-content: space-between;
                 padding: 10px 12px;
                 background: #2a2a2a;
                 border-radius: 6px;
-                margin-bottom: 6px;
-            }
-            .umi-mm-model-info {
-                display: flex;
-                align-items: center;
-                gap: 10px;
+                margin-bottom: 8px;
+                border: 1px solid #333;
             }
             .umi-mm-model-name {
                 color: #fff;
                 font-size: 14px;
+                font-weight: 600;
             }
-            .umi-mm-model-size {
-                color: #666;
-                font-size: 12px;
-            }
-            .umi-mm-model-required {
-                background: #4a9eff33;
-                color: #4a9eff;
+            .umi-mm-model-desc {
+                color: #888;
                 font-size: 11px;
-                padding: 2px 6px;
-                border-radius: 4px;
+                margin-top: 2px;
             }
-            .umi-mm-status-icon {
-                font-size: 16px;
-            }
-            .umi-mm-btn-download {
-                background: #333;
-                color: #4a9eff;
-                border: 1px solid #4a9eff;
-                padding: 4px 12px;
+            .umi-mm-select {
+                background: #111;
+                border: 1px solid #444;
+                color: #ddd;
+                padding: 4px 6px;
                 border-radius: 4px;
-                cursor: pointer;
                 font-size: 12px;
+                width: 100%;
             }
-            .umi-mm-btn-download:hover { background: #4a9eff22; }
-            .umi-mm-progress {
-                width: 100px;
-                height: 6px;
-                background: #333;
-                border-radius: 3px;
-                overflow: hidden;
-            }
-            .umi-mm-progress-bar {
-                height: 100%;
-                background: linear-gradient(90deg, #4a9eff, #7c3aed);
-                transition: width 0.3s;
+            .umi-mm-status {
+                font-size: 11px;
+                color: #bbb;
             }
             .umi-mm-footer {
-                padding: 12px 20px;
+                padding: 10px 20px;
                 border-top: 1px solid #333;
-                text-align: center;
+                color: #666;
+                font-size: 11px;
             }
-            .umi-mm-footer p { margin: 0; font-size: 12px; color: #666; }
-            .umi-mm-footer a { color: #4a9eff; }
+            .umi-mm-inline {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .umi-mm-deps {
+                padding: 8px 20px;
+                border-bottom: 1px dashed #333;
+                background: #241d12;
+                color: #d6b35c;
+                font-size: 12px;
+            }
         `;
         document.head.appendChild(style);
         document.body.appendChild(modelManagerPanel);
 
-        loadModelStatus();
+        const repoInput = document.getElementById('umi-mm-repo');
+        const checkBtn = document.getElementById('umi-mm-check');
+        const downloadAllBtn = document.getElementById('umi-mm-download-all');
+
+        repoInput.value = getRepoId();
+        repoInput.addEventListener('change', () => setRepoId(repoInput.value.trim()));
+        checkBtn.addEventListener('click', () => loadModels());
+        downloadAllBtn.addEventListener('click', () => downloadAll());
+
+        startPolling();
+        loadModels();
+        updateDependencyStatus();
     }
 
-    // Load and display model status
-    async function loadModelStatus() {
+    function hideModelManager() {
+        if (modelManagerPanel) modelManagerPanel.style.display = 'none';
+    }
+
+    async function loadModels() {
         const content = document.getElementById('umi-mm-content');
         const statusText = document.getElementById('umi-mm-status-text');
+        const repoInput = document.getElementById('umi-mm-repo');
+        const repoLabel = document.getElementById('umi-mm-repo-label');
 
         if (isLoading) return;
         isLoading = true;
+        content.innerHTML = '<div class="umi-mm-loading">Loading models...</div>';
+
+        const repoId = repoInput.value.trim();
+        setRepoId(repoId);
+        repoLabel.textContent = repoId ? `Repo: ${repoId}` : '';
 
         try {
-            const response = await fetch('/umiapp/models/status');
+            const response = await fetch(`/umiapp/models/check?repo_id=${encodeURIComponent(repoId)}`);
             const data = await response.json();
-
             if (data.error) {
                 content.innerHTML = `<div class="umi-mm-loading">Error: ${data.error}</div>`;
+                statusText.textContent = 'Error fetching models';
                 return;
             }
 
-            // Update status bar
-            const summary = data.summary || {};
-            const ready = summary.ready;
-            statusText.innerHTML = ready
-                ? `✅ Ready! ${summary.installed_required}/${summary.total_required} required models installed`
-                : `⚠️ ${summary.installed_required}/${summary.total_required} required models installed`;
-
-            // Render categories
-            let html = '';
-            for (const [catId, category] of Object.entries(data.status || {})) {
-                const installedCount = category.models.filter(m => m.installed).length;
-                const totalCount = category.models.length;
-
-                html += `
-                    <div class="umi-mm-category" data-category="${catId}">
-                        <div class="umi-mm-cat-header">
-                            <h3>${category.name}</h3>
-                            <span class="umi-mm-model-size">(${installedCount}/${totalCount} installed)</span>
-                        </div>
-                `;
-
-                for (const model of category.models) {
-                    const icon = model.installed ? '✅' : '⬇️';
-                    const action = model.installed
-                        ? `<span class="umi-mm-status-icon">✅</span>`
-                        : `<button class="umi-mm-btn-download" onclick="window.umiModelManager.download('${catId}', '${model.name}')">Download</button>`;
-
-                    html += `
-                        <div class="umi-mm-model" data-model="${model.name}">
-                            <div class="umi-mm-model-info">
-                                <span class="umi-mm-model-name">${model.name}</span>
-                                <span class="umi-mm-model-size">${model.size_mb} MB</span>
-                                ${model.required ? '<span class="umi-mm-model-required">Required</span>' : ''}
-                            </div>
-                            <div class="umi-mm-model-action">${action}</div>
-                        </div>
-                    `;
-                }
-
-                html += '</div>';
-            }
-
-            content.innerHTML = html;
+            models = data.models || [];
+            statusText.textContent = `Loaded ${models.length} models`;
+            renderList();
+            await updateStatuses();
+            window.dispatchEvent(new CustomEvent("umi-model-registry-updated"));
 
         } catch (err) {
-            content.innerHTML = `<div class="umi-mm-loading">Error loading status: ${err.message}</div>`;
+            content.innerHTML = `<div class="umi-mm-loading">Error: ${err.message}</div>`;
         } finally {
             isLoading = false;
         }
     }
 
-    // Download a single model
-    async function downloadModel(category, modelName) {
-        const modelEl = document.querySelector(`[data-model="${modelName}"]`);
-        if (modelEl) {
-            const actionEl = modelEl.querySelector('.umi-mm-model-action');
-            actionEl.innerHTML = `
-                <div class="umi-mm-progress">
-                    <div class="umi-mm-progress-bar" style="width: 0%"></div>
-                </div>
-            `;
+    async function updateStatuses() {
+        try {
+            const response = await fetch('/umiapp/models/status');
+            if (response.ok) {
+                downloadStatuses = await response.json();
+                if (models.length > 0) renderList();
+            }
+        } catch (e) {
+        }
+    }
+
+    async function updateDependencyStatus() {
+        const depsBanner = document.getElementById('umi-mm-deps');
+        if (!depsBanner) return;
+        try {
+            const response = await fetch('/umiapp/deps');
+            if (!response.ok) return;
+            const data = await response.json();
+            const missing = data.missing || [];
+            if (missing.length) {
+                depsBanner.textContent = `Missing optional dependencies: ${missing.join(', ')}. Install with: pip install ${missing.join(' ')}`;
+                depsBanner.style.display = 'block';
+            } else {
+                depsBanner.style.display = 'none';
+            }
+        } catch (e) {
+        }
+    }
+
+    function startPolling() {
+        if (pollingInterval) clearInterval(pollingInterval);
+        pollingInterval = setInterval(updateStatuses, 2000);
+    }
+
+    function normalizeVer(v) {
+        return String(v || '').toLowerCase().replace(/^v/, '').trim();
+    }
+
+    function formatVer(v) {
+        if (!v) return '';
+        return String(v).startsWith('v') ? String(v) : `v${v}`;
+    }
+
+    function modelHasVersion(model, version) {
+        const target = normalizeVer(version);
+        return (model.installed_versions || []).some(v => normalizeVer(v) === target);
+    }
+
+    function renderList() {
+        const content = document.getElementById('umi-mm-content');
+        if (!models.length) {
+            content.innerHTML = '<div class="umi-mm-loading">No models found.</div>';
+            return;
         }
 
-        try {
-            const response = await fetch('/umiapp/models/download', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ category, model: modelName })
+        content.innerHTML = '';
+        models.forEach(model => {
+            const status = downloadStatuses[model.name];
+            const activeVer = model.active_version;
+            const latestVer = model.version;
+
+            const row = document.createElement('div');
+            row.className = 'umi-mm-model';
+            row.dataset.modelName = model.name;
+
+            const info = document.createElement('div');
+            info.innerHTML = `
+                <div class="umi-mm-model-name">${model.name}</div>
+                <div class="umi-mm-model-desc">${model.description || ''}</div>
+            `;
+
+            const select = document.createElement('select');
+            select.className = 'umi-mm-select';
+            (model.versions || []).forEach(v => {
+                const option = document.createElement('option');
+                option.value = v.version;
+                option.textContent = formatVer(v.version);
+                select.appendChild(option);
+            });
+            if (activeVer) {
+                select.value = activeVer;
+            } else if (latestVer) {
+                select.value = latestVer;
+            }
+
+            select.addEventListener('change', () => {
+                if (modelHasVersion(model, select.value)) {
+                    setActiveVersion(model.name, select.value);
+                }
+                renderList();
             });
 
-            const data = await response.json();
-            if (data.error) {
-                console.error('Download error:', data.error);
-                return;
+            const statusEl = document.createElement('div');
+            statusEl.className = 'umi-mm-status';
+
+            const action = document.createElement('div');
+            action.className = 'umi-mm-inline';
+
+            let buttonText = '';
+            let actionHandler = null;
+
+            if (status && (status.status === 'downloading' || status.status === 'queued')) {
+                statusEl.textContent = status.message || status.status;
+                buttonText = 'Downloading';
+                actionHandler = null;
+            } else if (status && status.status === 'auth_required') {
+                statusEl.textContent = 'API Key Required';
+                buttonText = 'Enter Key';
+                actionHandler = () => showApiKeyDialog();
+            } else if (status && status.status === 'error') {
+                statusEl.textContent = status.message || 'Download error';
+                buttonText = 'Retry';
+                actionHandler = () => downloadModel(model.name, select.value);
+            } else {
+                const selectedInstalled = modelHasVersion(model, select.value);
+                if (!selectedInstalled) {
+                    statusEl.textContent = model.status === 'missing' ? 'Missing' : 'Update available';
+                    buttonText = 'Download';
+                    actionHandler = () => downloadModel(model.name, select.value);
+                } else if (activeVer && normalizeVer(activeVer) !== normalizeVer(select.value)) {
+                    statusEl.textContent = `Installed (${formatVer(activeVer)})`;
+                    buttonText = 'Set Active';
+                    actionHandler = () => setActiveVersion(model.name, select.value);
+                } else {
+                    statusEl.textContent = 'Installed';
+                    buttonText = '';
+                }
             }
 
-            // Poll for progress
-            const downloadId = data.download_id;
-            pollProgress(downloadId, modelEl);
-
-        } catch (err) {
-            console.error('Download failed:', err);
-        }
-    }
-
-    // Poll download progress
-    async function pollProgress(downloadId, modelEl) {
-        const progressBar = modelEl?.querySelector('.umi-mm-progress-bar');
-
-        const poll = async () => {
-            try {
-                const response = await fetch(`/umiapp/models/progress?id=${downloadId}`);
-                const data = await response.json();
-
-                if (progressBar) {
-                    progressBar.style.width = `${data.progress || 0}%`;
-                }
-
-                if (data.status === 'complete') {
-                    if (modelEl) {
-                        const actionEl = modelEl.querySelector('.umi-mm-model-action');
-                        actionEl.innerHTML = '<span class="umi-mm-status-icon">✅</span>';
-                    }
-                    loadModelStatus(); // Refresh
-                    return;
-                }
-
-                if (data.status === 'error') {
-                    if (modelEl) {
-                        const actionEl = modelEl.querySelector('.umi-mm-model-action');
-                        actionEl.innerHTML = `<span style="color:#f66">Error</span>`;
-                    }
-                    return;
-                }
-
-                // Continue polling
-                setTimeout(poll, 500);
-
-            } catch (err) {
-                console.error('Poll error:', err);
+            if (latestVer && activeVer && normalizeVer(activeVer) !== normalizeVer(latestVer)) {
+                statusEl.textContent += ` | Latest: ${formatVer(latestVer)}`;
             }
-        };
 
-        poll();
+            if (buttonText) {
+                const btn = document.createElement('button');
+                btn.className = 'umi-mm-btn';
+                btn.textContent = buttonText;
+                if (actionHandler) btn.onclick = actionHandler;
+                else btn.disabled = true;
+                action.appendChild(btn);
+            }
+
+            row.appendChild(info);
+            row.appendChild(select);
+            row.appendChild(statusEl);
+            row.appendChild(action);
+            content.appendChild(row);
+        });
     }
 
-    // Download all required models
-    async function downloadAllRequired() {
-        const btn = document.getElementById('umi-mm-download-all');
-        btn.disabled = true;
-        btn.textContent = 'Checking...';
-
+    async function setActiveVersion(modelName, version) {
         try {
-            const response = await fetch('/umiapp/models/download-all', { method: 'POST' });
-            const data = await response.json();
+            await fetch('/umiapp/models/set_active', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_name: modelName, version: version })
+            });
+            await loadModels();
+        } catch (e) {
+        }
+    }
 
-            if (data.queued && data.queued.length > 0) {
-                btn.textContent = `Downloading ${data.queued.length} models...`;
+    async function downloadModel(modelName, version) {
+        const repoId = getRepoId();
+        try {
+            await fetch('/umiapp/models/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repo_id: repoId, model_name: modelName, version: version })
+            });
+            await updateStatuses();
+        } catch (e) {
+        }
+    }
 
-                // Download sequentially
-                for (const item of data.queued) {
-                    await downloadModel(item.category, item.model);
-                    // Wait a bit between downloads
-                    await new Promise(r => setTimeout(r, 1000));
-                }
+    async function downloadAll() {
+        const downloadAllBtn = document.getElementById('umi-mm-download-all');
+        downloadAllBtn.disabled = true;
+        downloadAllBtn.textContent = 'Downloading...';
+
+        for (const model of models) {
+            const targetVer = model.active_version || model.version;
+            if (!modelHasVersion(model, targetVer)) {
+                await downloadModel(model.name, targetVer);
+                await new Promise(r => setTimeout(r, 1000));
             }
-
-            btn.textContent = '⬇️ Download All Required';
-            btn.disabled = false;
-            loadModelStatus();
-
-        } catch (err) {
-            console.error('Download all failed:', err);
-            btn.textContent = 'Error - Try Again';
-            btn.disabled = false;
         }
+
+        downloadAllBtn.textContent = 'Download All Missing/Updates';
+        downloadAllBtn.disabled = false;
+        await loadModels();
     }
 
-    // Hide the panel
-    function hideModelManager() {
-        if (modelManagerPanel) {
-            modelManagerPanel.style.display = 'none';
-        }
+    function showApiKeyDialog() {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position: fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.8); z-index: 10001; display:flex; align-items:center; justify-content:center;';
+
+        const dialog = document.createElement('div');
+        dialog.style.cssText = 'background:#2a2a2a; border:1px solid #555; border-radius:8px; padding:16px; width:360px; display:flex; flex-direction:column; gap:10px;';
+
+        dialog.innerHTML = `
+            <h3 style="margin:0; color:#fff; font-size:14px;">Civitai API Key</h3>
+            <input type="password" id="umi-mm-api-key" placeholder="Paste API Key" style="background:#111; border:1px solid #444; color:#fff; padding:6px; border-radius:4px;" />
+            <div style="display:flex; gap:8px; justify-content:flex-end;">
+                <button id="umi-mm-api-cancel" class="umi-mm-btn">Cancel</button>
+                <button id="umi-mm-api-save" class="umi-mm-btn-primary">Save</button>
+            </div>
+        `;
+
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        dialog.querySelector('#umi-mm-api-cancel').onclick = () => document.body.removeChild(overlay);
+        dialog.querySelector('#umi-mm-api-save').onclick = async () => {
+            const token = dialog.querySelector('#umi-mm-api-key').value.trim();
+            if (!token) return;
+            await fetch('/umiapp/models/save_token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token })
+            });
+            document.body.removeChild(overlay);
+            await updateStatuses();
+        };
     }
 
-    // Expose API
     window.umiModelManager = {
         show: showModelManager,
         hide: hideModelManager,
+        refresh: loadModels,
         download: downloadModel,
-        downloadAllRequired: downloadAllRequired,
-        refresh: loadModelStatus
+        downloadAll
     };
 
-    // Register keyboard shortcut (Ctrl+Shift+M to avoid conflicts)
+    resetRepoId();
+
     document.addEventListener('keydown', (e) => {
         if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'm') {
             e.preventDefault();
@@ -406,6 +523,4 @@
     });
 
     console.log('[UmiAI] Model Manager loaded');
-    console.log('[UmiAI] Open with: Ctrl+Shift+M or run: window.umiModelManager.show()');
 })();
-

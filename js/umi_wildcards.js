@@ -257,6 +257,8 @@ const HELP_HTML = `
                 <table class="umi-table">
                     <tr><td><span class="umi-code">$var={...}</span></td><td>Define variable.</td></tr>
                     <tr><td><span class="umi-code">[if K : A | B]</span></td><td>Logic Gate.</td></tr>
+                    <tr><td><span class="umi-code">[if K : A elif K2 : B else: C]</span></td><td>Elif chain.</td></tr>
+                    <tr><td><span class="umi-code">in / contains / matches / startswith / endswith</span></td><td>String operators.</td></tr>
                     <tr><td><span class="umi-code">[shuffle: a, b]</span></td><td>Randomize order.</td></tr>
                     <tr><td><span class="umi-code">[clean: a, , b]</span></td><td>Fix bad formatting.</td></tr>
                     <tr><td><span class="umi-code">text --neg: bad</span></td><td>Scoped Negative.</td></tr>
@@ -265,6 +267,16 @@ const HELP_HTML = `
                 </table>
             </div>
         </div>
+    </div>
+
+    <div class="umi-section">
+        <h3>Logic Quick Test</h3>
+        <div class="umi-block" style="font-size:12px">$style={retro_film|modern_clean|vintage_35mm}
+[if $style startswith "retro" : film grain, chromatic aberration
+ elif $style contains "clean" : clean lines, minimal noise
+ elif $style matches "35mm$" : halation, soft highlights
+ else: neutral]
+$style</div>
     </div>
 
     <div class="umi-section">

@@ -96,6 +96,13 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 ### Method 2: ComfyUI Manager
 * **Install via Git URL:** Copy the URL of this repository and paste it into ComfyUI Manager.
 
+### Optional: Sheet Tools and QWEN Encoder Dependencies
+The sheet tools (RMBG2, sheet cropper, mask utilities) and QWEN encoder require extra Python packages:
+```bash
+pip install opencv-python torchvision transformers transparent-background
+```
+If these are not installed, the related nodes will report a clear runtime error when used.
+
 ### Optional: Local LLM Support
 For vision and text LLM features, the node will automatically download and install `llama-cpp-python` when you first use these features. The installer detects your CUDA version and installs the appropriate build (CUDA 11.7, 11.8, 12.1, 12.4, or CPU).
 
@@ -178,6 +185,11 @@ UmiAI features a unified logic engine that works in both your **Prompts** and yo
 * **OR**: At least one condition must be true.
 * **NOT**: The condition must be absent/false.
 * **XOR**: Only one condition can be true (Exclusive OR).
+* **IN**: Check if a value is in a list or substring.
+* **CONTAINS**: Check if left contains right.
+* **MATCHES**: Regex match (case-insensitive).
+* **STARTSWITH**: Prefix check.
+* **ENDSWITH**: Suffix check.
 * **()**: Parentheses for grouping complex logic.
 
 ### 1. Logic in Prompts (`[if ...]`)
@@ -190,11 +202,26 @@ You can change the text of your prompt based on other words present in the promp
 // Variable check: If $char is defined as 'robot', add oil.
 [if $char=robot : leaking oil | sweating]
 
+// Elif chains
+[if $style=retro : film grain
+ elif $style=modern : clean lines
+ else: neutral]
+
 // Complex grouping
 [if (scifi OR cyber) AND NOT space : futuristic city | nature landscape]
 
 // Nested conditions
 [if fantasy : [if magic AND NOT tech : wizard | knight | modern soldier]]
+```
+
+### Quick Test Prompt
+```text
+$style={retro_film|modern_clean|vintage_35mm}
+[if $style startswith "retro" : film grain, chromatic aberration
+ elif $style contains "clean" : clean lines, minimal noise
+ elif $style matches "35mm$" : halation, soft highlights
+ else: neutral]
+$style
 ```
 
 ### 2. Logic in Wildcards (`__[ ... ]__`)

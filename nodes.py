@@ -27,7 +27,13 @@ from PIL import Image
 import server
 from aiohttp import web
 
+import importlib
+import sys
+
 # Import shared utilities
+from . import shared_utils
+importlib.reload(shared_utils)
+
 from .shared_utils import (
     escape_unweighted_colons, parse_wildcard_weight, get_all_wildcard_paths, log_prompt_to_history,
     LogicEvaluator, DynamicPromptReplacer, VariableReplacer, NegativePromptGenerator,
@@ -636,8 +642,8 @@ class TagSelector(TagSelectorBase):
                 row = self.rng.choice(tags)
                 # CSV variable injection: directly inject columns into variables dict
                 for k, v in row.items():
-                    var_name = f"${k.strip()}"
-                    if var_name not in self.variables:
+                    var_name = k.strip()
+                    if var_name and var_name not in self.variables:
                         self.variables[var_name] = v.strip()
                 # Also return the old format for backwards compatibility
                 vars_out = []
@@ -1841,26 +1847,38 @@ class UmiAIWildcardNode:
                 print(f"[UmiAI] Problematic prompt fragment: {prompt[:100]}...")
                 break
 
-            prompt_history.append(previous_prompt)
+            prompt_history.append(prompt)
             previous_prompt = prompt
-
-            # Process Vision and LLM tags
-            prompt = vision_replacer.replace(prompt)
-            prompt = llm_replacer.replace(prompt)
 
             prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
             tag_selector.update_variables(variable_replacer.variables)
             prompt = variable_replacer.replace_variables(prompt)
-            prompt = tag_replacer.replace(prompt)
-            prompt = dynamic_replacer.replace(prompt)
-            prompt = danbooru_replacer.replace(prompt, danbooru_threshold, danbooru_max_tags)
+
+            masked_prompt, if_blocks = conditional_replacer.mask_conditionals(prompt)
+
+            # Process Vision and LLM tags (skip conditional blocks)
+            masked_prompt = vision_replacer.replace(masked_prompt)
+            masked_prompt = llm_replacer.replace(masked_prompt)
+
+            masked_prompt = tag_replacer.replace(masked_prompt)
+            masked_prompt = dynamic_replacer.replace(masked_prompt)
+            masked_prompt = danbooru_replacer.replace(masked_prompt, danbooru_threshold, danbooru_max_tags)
+
+            prompt = conditional_replacer.unmask_conditionals(masked_prompt, if_blocks)
+            prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
+
+            # Capture assignments revealed by conditionals in the same iteration
+            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
+            tag_selector.update_variables(variable_replacer.variables)
+            prompt = variable_replacer.replace_variables(prompt)
+
             iterations += 1
 
         # Warn if we hit the iteration limit
         if iterations >= 50:
             print(f"[UmiAI] WARNING: Reached maximum processing iterations (50). Possible recursive wildcards or variables.")
 
-        prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
+
         
         additions = tag_selector.get_prefixes_and_suffixes()
         if additions['prefixes']:

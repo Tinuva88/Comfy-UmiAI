@@ -1,2 +1,8 @@
 requests
 pyyaml
+huggingface_hub
+packaging
+opencv-python
+torchvision
+transformers
+transparent-background

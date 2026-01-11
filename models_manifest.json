@@ -14,7 +14,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/Milamber.safetensors",
                     "size_mb": 6617,
                     "required": false,
-                    "description": "Exclusive Illustrious vPred checkpoint for UmiAI"
+                    "description": "Exclusive Illustrious vPred checkpoint for UmiAI",
+                    "files": [
+                        {
+                            "filename": "Milamber.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/Milamber.safetensors"
+                        }
+                    ]
                 }
             ]
         },
@@ -29,7 +35,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/vn_character_sheet_v4.safetensors",
                     "size_mb": 228,
                     "required": true,
-                    "description": "Main character sheet LoRA for consistency"
+                    "description": "Main character sheet LoRA for consistency",
+                    "files": [
+                        {
+                            "filename": "vn_character_sheet_v4.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/vn_character_sheet_v4.safetensors"
+                        }
+                    ]
                 },
                 {
                     "name": "vn_character_sheet",
@@ -37,7 +49,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/vn_character_sheet.safetensors",
                     "size_mb": 228,
                     "required": false,
-                    "description": "Legacy character sheet LoRA"
+                    "description": "Legacy character sheet LoRA",
+                    "files": [
+                        {
+                            "filename": "vn_character_sheet.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/vn_character_sheet.safetensors"
+                        }
+                    ]
                 }
             ]
         },
@@ -52,7 +70,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/DMD2/dmd2_sdxl_4step_lora_fp16.safetensors",
                     "size_mb": 394,
                     "required": false,
-                    "description": "4-step generation for SDXL"
+                    "description": "4-step generation for SDXL",
+                    "files": [
+                        {
+                            "filename": "dmd2_sdxl_4step_lora_fp16.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/DMD2/dmd2_sdxl_4step_lora_fp16.safetensors"
+                        }
+                    ]
                 }
             ]
         },
@@ -67,7 +91,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/IL/mimimeter.safetensors",
                     "size_mb": 52,
                     "required": false,
-                    "description": "Style consistency LoRA"
+                    "description": "Style consistency LoRA",
+                    "files": [
+                        {
+                            "filename": "mimimeter.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/IL/mimimeter.safetensors"
+                        }
+                    ]
                 }
             ]
         },
@@ -82,7 +112,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/ClothesHelperUltimateV1_000005100.safetensors",
                     "size_mb": 148,
                     "required": false,
-                    "description": "Clothes generation helper"
+                    "description": "Clothes generation helper",
+                    "files": [
+                        {
+                            "filename": "ClothesHelperUltimateV1_000005100.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/ClothesHelperUltimateV1_000005100.safetensors"
+                        }
+                    ]
                 },
                 {
                     "name": "transfer_clothes",
@@ -90,7 +126,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/TransferClothes_000006700.safetensors",
                     "size_mb": 295,
                     "required": false,
-                    "description": "Clothes transfer between characters"
+                    "description": "Clothes transfer between characters",
+                    "files": [
+                        {
+                            "filename": "TransferClothes_000006700.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/TransferClothes_000006700.safetensors"
+                        }
+                    ]
                 },
                 {
                     "name": "poser_helper",
@@ -98,7 +140,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/poser_helper_v2_000004200.safetensors",
                     "size_mb": 295,
                     "required": false,
-                    "description": "Pose consistency helper"
+                    "description": "Pose consistency helper",
+                    "files": [
+                        {
+                            "filename": "poser_helper_v2_000004200.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/loras/qwen/VNCCS/poser_helper_v2_000004200.safetensors"
+                        }
+                    ]
                 }
             ]
         },
@@ -113,7 +161,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/controlnet/SDXL/AnytestV4.safetensors",
                     "size_mb": 2500,
                     "required": true,
-                    "description": "Multi-purpose ControlNet"
+                    "description": "Multi-purpose ControlNet",
+                    "files": [
+                        {
+                            "filename": "AnytestV4.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/controlnet/SDXL/AnytestV4.safetensors"
+                        }
+                    ]
                 },
                 {
                     "name": "illustrious_openpose",
@@ -121,7 +175,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/controlnet/SDXL/IllustriousXL_openpose.safetensors",
                     "size_mb": 2500,
                     "required": true,
-                    "description": "OpenPose for character poses"
+                    "description": "OpenPose for character poses",
+                    "files": [
+                        {
+                            "filename": "IllustriousXL_openpose.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/controlnet/SDXL/IllustriousXL_openpose.safetensors"
+                        }
+                    ]
                 }
             ]
         },
@@ -136,7 +196,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/face_yolov8m.pt",
                     "size_mb": 52,
                     "required": true,
-                    "description": "Face detection (bounding box)"
+                    "description": "Face detection (bounding box)",
+                    "files": [
+                        {
+                            "filename": "face_yolov8m.pt",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/face_yolov8m.pt"
+                        }
+                    ]
                 },
                 {
                     "name": "face_yolov9c",
@@ -144,7 +210,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/face_yolov9c.pt",
                     "size_mb": 52,
                     "required": false,
-                    "description": "Alternate face detection"
+                    "description": "Alternate face detection",
+                    "files": [
+                        {
+                            "filename": "face_yolov9c.pt",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/face_yolov9c.pt"
+                        }
+                    ]
                 },
                 {
                     "name": "foot_yolov8l",
@@ -152,7 +224,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/foot-yolov8l.pt",
                     "size_mb": 88,
                     "required": false,
-                    "description": "Foot detection"
+                    "description": "Foot detection",
+                    "files": [
+                        {
+                            "filename": "foot-yolov8l.pt",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/foot-yolov8l.pt"
+                        }
+                    ]
                 },
                 {
                     "name": "hand_yolov8s",
@@ -160,7 +238,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/hand_yolov8s.pt",
                     "size_mb": 23,
                     "required": false,
-                    "description": "Hand detection"
+                    "description": "Hand detection",
+                    "files": [
+                        {
+                            "filename": "hand_yolov8s.pt",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/bbox/hand_yolov8s.pt"
+                        }
+                    ]
                 }
             ]
         },
@@ -175,7 +259,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/face_yolov8m-seg_60.pt",
                     "size_mb": 55,
                     "required": true,
-                    "description": "Face segmentation"
+                    "description": "Face segmentation",
+                    "files": [
+                        {
+                            "filename": "face_yolov8m-seg_60.pt",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/face_yolov8m-seg_60.pt"
+                        }
+                    ]
                 },
                 {
                     "name": "hair_yolov8n_seg",
@@ -183,7 +273,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/hair_yolov8n-seg_60.pt",
                     "size_mb": 7,
                     "required": false,
-                    "description": "Hair segmentation"
+                    "description": "Hair segmentation",
+                    "files": [
+                        {
+                            "filename": "hair_yolov8n-seg_60.pt",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/hair_yolov8n-seg_60.pt"
+                        }
+                    ]
                 },
                 {
                     "name": "person_yolov8m_seg",
@@ -191,7 +287,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/person_yolov8m-seg.pt",
                     "size_mb": 55,
                     "required": false,
-                    "description": "Person/body segmentation"
+                    "description": "Person/body segmentation",
+                    "files": [
+                        {
+                            "filename": "person_yolov8m-seg.pt",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/ultralytics/segm/person_yolov8m-seg.pt"
+                        }
+                    ]
                 }
             ]
         },
@@ -206,7 +308,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/sams/sam_vit_b_01ec64.pth",
                     "size_mb": 375,
                     "required": true,
-                    "description": "SAM ViT-B for segmentation"
+                    "description": "SAM ViT-B for segmentation",
+                    "files": [
+                        {
+                            "filename": "sam_vit_b_01ec64.pth",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/sams/sam_vit_b_01ec64.pth"
+                        }
+                    ]
                 }
             ]
         },
@@ -221,7 +329,13 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/upscale_models/4x_APISR_GRL_GAN_generator.pth",
                     "size_mb": 7,
                     "required": false,
-                    "description": "4x upscaler"
+                    "description": "4x upscaler",
+                    "files": [
+                        {
+                            "filename": "4x_APISR_GRL_GAN_generator.pth",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/upscale_models/4x_APISR_GRL_GAN_generator.pth"
+                        }
+                    ]
                 },
                 {
                     "name": "2x_apisr",
@@ -229,38 +343,163 @@
                     "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/upscale_models/2x_APISR_RRDB_GAN_generator.pth",
                     "size_mb": 18,
                     "required": false,
-                    "description": "2x upscaler"
+                    "description": "2x upscaler",
+                    "files": [
+                        {
+                            "filename": "2x_APISR_RRDB_GAN_generator.pth",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/upscale_models/2x_APISR_RRDB_GAN_generator.pth"
+                        }
+                    ]
                 }
             ]
         },
-        "captioners": {
-            "name": "Image Captioners & Taggers",
-            "description": "Models for auto-captioning images (for LoRA training)",
-            "target_dir": "clip_vision",
+        "background_removal": {
+            "name": "Background Removal Models",
+            "description": "RMBG/BEN/INSPYRENET assets used by Umi sheet tools",
+            "target_dir": "RMBG",
             "models": [
                 {
-                    "name": "blip_base",
-                    "filename": "model_base_caption_capfilt_large.pth",
-                    "url": "https://huggingface.co/Salesforce/blip-image-captioning-base/resolve/main/model_base_caption_capfilt_large.pth",
-                    "size_mb": 990,
+                    "name": "rmbg-2.0",
                     "required": false,
-                    "description": "BLIP base captioner - natural language captions"
+                    "description": "RMBG-2.0 background removal model files",
+                    "files": [
+                        {
+                            "filename": "config.json",
+                            "local_path": "models/RMBG/RMBG-2.0/config.json",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/RMBG-2.0/config.json"
+                        },
+                        {
+                            "filename": "model.safetensors",
+                            "local_path": "models/RMBG/RMBG-2.0/model.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/RMBG-2.0/model.safetensors"
+                        },
+                        {
+                            "filename": "birefnet.py",
+                            "local_path": "models/RMBG/RMBG-2.0/birefnet.py",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/RMBG-2.0/birefnet.py"
+                        },
+                        {
+                            "filename": "BiRefNet_config.py",
+                            "local_path": "models/RMBG/RMBG-2.0/BiRefNet_config.py",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/RMBG-2.0/BiRefNet_config.py"
+                        }
+                    ]
                 },
                 {
-                    "name": "wd14_vit",
-                    "filename": "wd-v1-4-vit-tagger-v2.onnx",
-                    "url": "https://huggingface.co/SmilingWolf/wd-v1-4-vit-tagger-v2/resolve/main/model.onnx",
-                    "size_mb": 350,
+                    "name": "inspyrenet",
                     "required": false,
-                    "description": "WD14 tagger - anime/booru tag generation"
+                    "description": "Inspyrenet background removal model (requires transparent-background)",
+                    "files": [
+                        {
+                            "filename": "inspyrenet.safetensors",
+                            "local_path": "models/RMBG/INSPYRENET/inspyrenet.safetensors",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/INSPYRENET/inspyrenet.safetensors"
+                        }
+                    ]
                 },
                 {
-                    "name": "florence2_base",
-                    "filename": "florence-2-base.safetensors",
-                    "url": "https://huggingface.co/microsoft/Florence-2-base/resolve/main/model.safetensors",
-                    "size_mb": 460,
+                    "name": "ben",
                     "required": false,
-                    "description": "Florence-2 - versatile vision-language model"
+                    "description": "BEN background removal model files",
+                    "files": [
+                        {
+                            "filename": "model.py",
+                            "local_path": "models/RMBG/BEN/model.py",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/BEN/model.py"
+                        },
+                        {
+                            "filename": "BEN_Base.pth",
+                            "local_path": "models/RMBG/BEN/BEN_Base.pth",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/BEN/BEN_Base.pth"
+                        }
+                    ]
+                },
+                {
+                    "name": "ben2",
+                    "required": false,
+                    "description": "BEN2 background removal model files",
+                    "files": [
+                        {
+                            "filename": "BEN2.py",
+                            "local_path": "models/RMBG/BEN2/BEN2.py",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/BEN2/BEN2.py"
+                        },
+                        {
+                            "filename": "BEN2_Base.pth",
+                            "local_path": "models/RMBG/BEN2/BEN2_Base.pth",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/RMBG/BEN2/BEN2_Base.pth"
+                        }
+                    ]
+                }
+            ]
+        },
+        "llm_models": {
+            "name": "LLM GGUF Models",
+            "description": "Captioning and text refinement models used by Umi nodes",
+            "target_dir": "llm",
+            "models": [
+                {
+                    "name": "joycaption_alpha_two_llama3_q4_k_m",
+                    "required": false,
+                    "description": "JoyCaption Alpha Two GGUF",
+                    "files": [
+                        {
+                            "filename": "JoyCaption-Alpha-Two-Llama3-Q4_K_M.gguf",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/llm/JoyCaption-Alpha-Two-Llama3-Q4_K_M.gguf"
+                        },
+                        {
+                            "filename": "JoyCaption-Alpha-Two-Llama3-mmproj-f16.gguf",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/llm/JoyCaption-Alpha-Two-Llama3-mmproj-f16.gguf"
+                        }
+                    ]
+                },
+                {
+                    "name": "llava_v1_5_7b_q4_k",
+                    "required": false,
+                    "description": "LLaVA v1.5 7B GGUF",
+                    "files": [
+                        {
+                            "filename": "llava-v1.5-7b-Q4_K.gguf",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/llm/llava-v1.5-7b-Q4_K.gguf"
+                        },
+                        {
+                            "filename": "llava-v1.5-7b-mmproj-Q4_0.gguf",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/llm/llava-v1.5-7b-mmproj-Q4_0.gguf"
+                        }
+                    ]
+                },
+                {
+                    "name": "qwen2_5_coder_1_5b_instruct_q4_k_m",
+                    "required": false,
+                    "description": "Qwen2.5 Coder 1.5B Instruct GGUF",
+                    "files": [
+                        {
+                            "filename": "Qwen2.5-Coder-1.5B-Instruct-abliterated-Q4_K_M.gguf",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/llm/Qwen2.5-Coder-1.5B-Instruct-abliterated-Q4_K_M.gguf"
+                        }
+                    ]
+                },
+                {
+                    "name": "dolphin_llama3_1_8b_q4_k_m",
+                    "required": false,
+                    "description": "Dolphin 2.9.4 Llama 3.1 8B GGUF",
+                    "files": [
+                        {
+                            "filename": "dolphin-2.9.4-llama3.1-8b-Q4_K_M.gguf",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/llm/dolphin-2.9.4-llama3.1-8b-Q4_K_M.gguf"
+                        }
+                    ]
+                },
+                {
+                    "name": "wingless_imp_8b_q4_k_m",
+                    "required": false,
+                    "description": "Wingless Imp 8B GGUF",
+                    "files": [
+                        {
+                            "filename": "Wingless_Imp_8B.Q4_K_M.gguf",
+                            "url": "https://huggingface.co/Tinuva/Comfy-Umi/resolve/main/models/llm/Wingless_Imp_8B.Q4_K_M.gguf"
+                        }
+                    ]
                 }
             ]
         }

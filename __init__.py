@@ -9,9 +9,23 @@ from .nodes_power import UmiPoseLibrary, UmiExpressionMixer, UmiSceneComposer, U
 from .nodes_dataset import UmiDatasetExport, UmiCaptionGenerator
 from .nodes_caption import UmiAutoCaption, UmiCaptionEnhancer
 from .nodes_qwen_detailer import UmiQWENDetailer, UmiBBoxExtractor
+from .nodes_qwen_encoder import UmiQWENEncoder
+from .nodes_model_manager import UmiModelManager, UmiModelSelector
+from .nodes_sheet_tools import (
+    VNCCSSheetManager,
+    VNCCSSheetExtractor,
+    VNCCSChromaKey,
+    VNCCS_ColorFix,
+    VNCCS_Resize,
+    VNCCS_MaskExtractor,
+    VNCCS_RMBG2,
+    VNCCS_QuadSplitter,
+)
+from .nodes_sheet_crop import CharacterSheetCropper
 from server import PromptServer
 from aiohttp import web
 import os
+import importlib.util
 import glob
 import yaml
 import folder_paths # New Import for LoRA scanning
@@ -69,6 +83,22 @@ def get_wildcard_data():
         "loras": folder_paths.get_filename_list("loras")
     }
 
+def get_optional_dependency_status():
+    dependencies = {
+        "opencv-python": "cv2",
+        "transformers": "transformers",
+        "torchvision": "torchvision",
+        "transparent-background": "transparent_background"
+    }
+    installed = []
+    missing = []
+    for package_name, module_name in dependencies.items():
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(package_name)
+        else:
+            installed.append(package_name)
+    return {"installed": installed, "missing": missing}
+
 # Register the routes (aligned with nodes.py endpoints)
 @PromptServer.instance.routes.get("/umiapp/wildcards")
 async def fetch_wildcards(request):
@@ -114,6 +144,10 @@ async def fetch_globals(request):
         "variables": variables,
         "count": len(variables)
     })
+
+@PromptServer.instance.routes.get("/umiapp/deps")
+async def get_dependency_status(request):
+    return web.json_response(get_optional_dependency_status())
 
 @PromptServer.instance.routes.get("/umiapp/characters")
 async def fetch_characters(request):
@@ -397,218 +431,441 @@ async def refresh_wildcards(request):
     })
 
 # ==============================================================================
-# MODEL DOWNLOADER API
+# MODEL DOWNLOADER API (VNCCS-STYLE REPO SUPPORT)
 # ==============================================================================
 
 import json
 import asyncio
-import aiohttp
+import threading
+import traceback
+import requests
+import queue
+import urllib.parse
 
-# Download progress tracking
-_download_progress = {}
+try:
+    from huggingface_hub import hf_hub_download, hf_hub_url
+    HF_HUB_AVAILABLE = True
+except Exception:
+    HF_HUB_AVAILABLE = False
 
-def load_model_manifest():
-    """Load the model manifest file."""
-    manifest_path = os.path.join(os.path.dirname(__file__), "models_manifest.json")
-    if os.path.exists(manifest_path):
-        with open(manifest_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return None
+# Universal download queue to avoid contention
+download_queue = queue.Queue()
+download_status = {}
 
-@PromptServer.instance.routes.get("/umiapp/models/manifest")
-async def get_model_manifest(request):
-    """Return the full model manifest."""
-    manifest = load_model_manifest()
-    if not manifest:
-        return web.json_response({"error": "Manifest not found"}, status=404)
-    return web.json_response(manifest)
+def resolve_path(relative_path):
+    base = getattr(folder_paths, "base_path", os.getcwd())
+    return os.path.abspath(os.path.join(base, relative_path))
 
-@PromptServer.instance.routes.get("/umiapp/models/status")
-async def get_models_status(request):
-    """Check which models are installed."""
-    manifest = load_model_manifest()
-    if not manifest:
-        return web.json_response({"error": "Manifest not found"}, status=404)
-    
-    models_dir = folder_paths.models_dir
-    status = {}
-    total_required = 0
-    installed_required = 0
-    
-    for cat_id, category in manifest.get("categories", {}).items():
-        cat_status = {
-            "name": category.get("name", cat_id),
-            "models": []
-        }
-        
-        target_dir = os.path.join(models_dir, category.get("target_dir", ""))
-        
+def get_installed_version_info():
+    registry_path = resolve_path("umi_installed_models.json")
+    if os.path.exists(registry_path):
+        try:
+            with open(registry_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def update_installed_version(model_name, version):
+    registry_path = resolve_path("umi_installed_models.json")
+    data = get_installed_version_info()
+    data[model_name] = version
+    with open(registry_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+def get_umi_config():
+    config_path = resolve_path("umi_user_config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_umi_config(new_data):
+    config_path = resolve_path("umi_user_config.json")
+    data = get_umi_config()
+    data.update(new_data)
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+def _convert_manifest_to_config(manifest):
+    version = str(manifest.get("version", "1.0"))
+    models = []
+    for category in manifest.get("categories", {}).values():
+        target_dir = category.get("target_dir", "")
         for model in category.get("models", []):
             filename = model.get("filename", "")
-            model_path = os.path.join(target_dir, filename)
-            installed = os.path.exists(model_path)
-            
-            if model.get("required", False):
-                total_required += 1
-                if installed:
-                    installed_required += 1
-            
-            cat_status["models"].append({
+            local_path = os.path.join("models", target_dir, filename).replace("\\", "/")
+            files = []
+            if model.get("files"):
+                for f in model.get("files", []):
+                    file_name = f.get("filename") or f.get("name") or ""
+                    file_local = f.get("local_path")
+                    if not file_local and file_name:
+                        file_local = os.path.join("models", target_dir, file_name).replace("\\", "/")
+                    files.append({
+                        "filename": file_name,
+                        "local_path": file_local or "",
+                        "url": f.get("url", ""),
+                        "hf_repo": f.get("hf_repo", model.get("hf_repo", "")),
+                        "hf_path": f.get("hf_path", ""),
+                    })
+            models.append({
                 "name": model.get("name", filename),
-                "filename": filename,
-                "installed": installed,
-                "required": model.get("required", False),
-                "size_mb": model.get("size_mb", 0)
+                "version": version,
+                "local_path": local_path,
+                "description": model.get("description", ""),
+                "url": model.get("url", ""),
+                "hf_repo": model.get("hf_repo", ""),
+                "hf_path": model.get("hf_path", ""),
+                "files": files
             })
-        
-        status[cat_id] = cat_status
-    
-    return web.json_response({
-        "status": status,
-        "summary": {
-            "total_required": total_required,
-            "installed_required": installed_required,
-            "ready": installed_required >= total_required
-        }
-    })
+    return {"models": models}
+
+
+def _fetch_model_config(repo_id):
+    if not HF_HUB_AVAILABLE:
+        raise RuntimeError("huggingface_hub is not installed.")
+
+    try:
+        path = hf_hub_download(repo_id=repo_id, filename="model_updater.json", local_files_only=False)
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        path = hf_hub_download(repo_id=repo_id, filename="models_manifest.json", local_files_only=False)
+        with open(path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+        return _convert_manifest_to_config(manifest)
+
+
+def worker_loop():
+    while True:
+        task = download_queue.get()
+        if task is None:
+            break
+
+        repo_id, model_name, target_model = task
+
+        try:
+            file_entries = target_model.get("files") or []
+            if not file_entries:
+                file_entries = [{
+                    "filename": os.path.basename(target_model.get("local_path", "")),
+                    "local_path": target_model.get("local_path", ""),
+                    "url": target_model.get("url", ""),
+                    "hf_repo": target_model.get("hf_repo", ""),
+                    "hf_path": target_model.get("hf_path", "")
+                }]
+
+            for index, file_entry in enumerate(file_entries):
+                file_name = file_entry.get("filename") or os.path.basename(file_entry.get("local_path", "")) or "file"
+                download_status[model_name] = {
+                    "status": "downloading",
+                    "message": f"Downloading {file_name}...",
+                    "progress": 0,
+                    "file": file_name,
+                    "file_index": index + 1,
+                    "file_count": len(file_entries)
+                }
+
+                url = ""
+                headers = {}
+
+                file_repo_id = file_entry.get("hf_repo") or target_model.get("hf_repo") or repo_id
+                if file_entry.get("url") or target_model.get("url"):
+                    url = file_entry.get("url") or target_model.get("url", "")
+
+                    if "civitai.com/models/" in url and "api/download" not in url:
+                        parsed = urllib.parse.urlparse(url)
+                        qs = urllib.parse.parse_qs(parsed.query)
+                        if "modelVersionId" in qs:
+                            ver_id = qs["modelVersionId"][0]
+                            url = f"https://civitai.com/api/download/models/{ver_id}"
+                            print(f"[UmiAI] Auto-converted Civitai Web Link to API: {url}")
+
+                    if "civitai.com" in url:
+                        user_config = get_umi_config()
+                        civitai_token = user_config.get("civitai_token", "")
+                        if civitai_token:
+                            headers = {"Authorization": f"Bearer {civitai_token}"}
+                else:
+                    if not HF_HUB_AVAILABLE:
+                        raise RuntimeError("huggingface_hub is not installed.")
+
+                    filename = file_entry.get("hf_path") or target_model.get("hf_path", "")
+                    if filename.startswith(f"{file_repo_id}/"):
+                        filename = filename[len(file_repo_id) + 1:]
+                    url = hf_hub_url(file_repo_id, filename)
+                    token = os.environ.get("HF_TOKEN")
+                    if token:
+                        headers = {"Authorization": f"Bearer {token}"}
+
+                response = requests.get(url, headers=headers, stream=True, allow_redirects=True)
+                response.raise_for_status()
+
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+
+                temp_dir = os.path.join(folder_paths.base_path, "temp")
+                os.makedirs(temp_dir, exist_ok=True)
+                sanitized_name = "".join(x for x in model_name if x.isalnum())
+                temp_filename = f"umi_{sanitized_name}_{index + 1}.tmp"
+                temp_path = os.path.join(temp_dir, temp_filename)
+
+                with open(temp_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                mb_done = downloaded / (1024 * 1024)
+                                mb_total = total_size / (1024 * 1024)
+                                msg = f"{file_name}: {mb_done:.1f}/{mb_total:.1f} MB"
+                                download_status[model_name] = {
+                                    "status": "downloading",
+                                    "message": msg,
+                                    "progress": percent,
+                                    "file": file_name,
+                                    "file_index": index + 1,
+                                    "file_count": len(file_entries)
+                                }
+                            else:
+                                mb_done = downloaded / (1024 * 1024)
+                                download_status[model_name] = {
+                                    "status": "downloading",
+                                    "message": f"{file_name}: {mb_done:.1f} MB",
+                                    "progress": 0,
+                                    "file": file_name,
+                                    "file_index": index + 1,
+                                    "file_count": len(file_entries)
+                                }
+
+                download_status[model_name]["message"] = f"Installing {file_name}..."
+                target_rel_path = file_entry.get("local_path") or target_model.get("local_path", "")
+                if not target_rel_path:
+                    raise RuntimeError(f"Missing local_path for {model_name}")
+
+                target_abs_path = resolve_path(target_rel_path)
+                target_dir = os.path.dirname(target_abs_path)
+                os.makedirs(target_dir, exist_ok=True)
+
+                import shutil
+                shutil.move(temp_path, target_abs_path)
+                print(f"[UmiAI] Installed {model_name} -> {target_abs_path}")
+
+            update_installed_version(model_name, target_model.get("version", ""))
+            download_status[model_name] = {"status": "success", "message": "Installed"}
+
+        except Exception as e:
+            is_auth_error = False
+            if isinstance(e, requests.exceptions.HTTPError):
+                if e.response.status_code == 401:
+                    is_auth_error = True
+
+            err_msg = str(e)
+            status_code = "error"
+
+            if is_auth_error:
+                status_code = "auth_required"
+                err_msg = "API Key Required"
+            elif "404" in err_msg or "EntryNotFoundError" in err_msg:
+                err_msg = "File not found (404)"
+
+            download_status[model_name] = {"status": status_code, "message": err_msg}
+            print(f"[UmiAI] Download failed for {model_name}: {err_msg}")
+        finally:
+            download_queue.task_done()
+
+threading.Thread(target=worker_loop, daemon=True).start()
+
+@PromptServer.instance.routes.get("/umiapp/models/status")
+async def get_download_status(request):
+    return web.json_response(download_status)
+
+@PromptServer.instance.routes.post("/umiapp/models/save_token")
+async def save_api_token(request):
+    try:
+        data = await request.json()
+        token = data.get("token", "")
+        save_umi_config({"civitai_token": token})
+        return web.json_response({"status": "saved"})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+@PromptServer.instance.routes.post("/umiapp/models/set_active")
+async def set_active_version(request):
+    try:
+        data = await request.json()
+        model_name = data.get("model_name")
+        version = data.get("version")
+
+        if not model_name or not version:
+            return web.json_response({"error": "Missing parameters"}, status=400)
+
+        update_installed_version(model_name, version)
+        return web.json_response({"status": "updated", "message": f"Set active version for {model_name} to {version}"})
+
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+@PromptServer.instance.routes.get("/umiapp/models/check")
+async def check_models(request):
+    repo_id = request.rel_url.query.get("repo_id", "")
+    if not repo_id:
+        return web.json_response({"error": "No repo_id provided"}, status=400)
+
+    if " " in repo_id or repo_id.strip() == "":
+        return web.json_response({"error": f"Invalid Repo ID format: '{repo_id}'"}, status=400)
+
+    if not HF_HUB_AVAILABLE:
+        return web.json_response({"error": "huggingface_hub is not installed"}, status=500)
+
+    try:
+        def fetch_config():
+            return _fetch_model_config(repo_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+
+        config = await loop.run_in_executor(None, fetch_config)
+
+        active_registry = get_installed_version_info()
+
+        grouped_models = {}
+        for model in config.get("models", []):
+            name = model["name"]
+            grouped_models.setdefault(name, []).append(model)
+
+        models_status = []
+        for name, variants in grouped_models.items():
+            try:
+                from packaging import version
+                variants.sort(key=lambda x: version.parse(x["version"]), reverse=True)
+            except Exception:
+                variants.sort(key=lambda x: str(x["version"]), reverse=True)
+
+            latest = variants[0]
+            active_ver = active_registry.get(name, None)
+
+            installed_versions = []
+            for v in variants:
+                files = v.get("files") or []
+                if files:
+                    all_found = True
+                    for f in files:
+                        file_path = f.get("local_path") or ""
+                        if not file_path:
+                            all_found = False
+                            break
+                        if not os.path.exists(resolve_path(file_path)):
+                            all_found = False
+                            break
+                    if all_found:
+                        installed_versions.append(v["version"])
+                else:
+                    full_path = resolve_path(v.get("local_path", ""))
+                    if os.path.exists(full_path):
+                        installed_versions.append(v["version"])
+
+            if active_ver and active_ver not in installed_versions:
+                active_ver = None
+
+            if not active_ver and installed_versions:
+                for v in variants:
+                    if v["version"] in installed_versions:
+                        active_ver = v["version"]
+                        break
+
+            status = "missing"
+            if active_ver:
+                status = "installed" if active_ver == latest["version"] else "outdated"
+            elif installed_versions:
+                status = "outdated"
+
+            models_status.append({
+                "name": name,
+                "status": status,
+                "active_version": active_ver,
+                "installed_versions": installed_versions,
+                "version": latest["version"],
+                "versions": variants,
+                "description": latest.get("description", "")
+            })
+
+        return web.json_response({"models": models_status})
+
+    except Exception as e:
+        err_msg = str(e)
+        if "HFValidationError" in err_msg or "Repo id" in err_msg:
+            return web.json_response({"error": f"Invalid Repo ID: {repo_id}"}, status=400)
+        if "404" in err_msg or "NotFound" in err_msg:
+            return web.json_response({"error": "Repository or config not found"}, status=404)
+
+        traceback.print_exc()
+        return web.json_response({"error": f"{str(e)}"}, status=500)
 
 @PromptServer.instance.routes.post("/umiapp/models/download")
 async def download_model(request):
-    """Start downloading a model."""
-    global _download_progress
-    
     try:
         data = await request.json()
-    except:
-        return web.json_response({"error": "Invalid JSON"}, status=400)
-    
-    category_id = data.get("category")
-    model_name = data.get("model")
-    
-    if not category_id or not model_name:
-        return web.json_response({"error": "category and model required"}, status=400)
-    
-    manifest = load_model_manifest()
-    if not manifest:
-        return web.json_response({"error": "Manifest not found"}, status=404)
-    
-    # Find the model
-    category = manifest.get("categories", {}).get(category_id)
-    if not category:
-        return web.json_response({"error": "Category not found"}, status=404)
-    
-    model = None
-    for m in category.get("models", []):
-        if m.get("name") == model_name:
-            model = m
-            break
-    
-    if not model:
-        return web.json_response({"error": "Model not found"}, status=404)
-    
-    # Prepare download
-    models_dir = folder_paths.models_dir
-    target_dir = os.path.join(models_dir, category.get("target_dir", ""))
-    os.makedirs(target_dir, exist_ok=True)
-    
-    target_path = os.path.join(target_dir, model.get("filename", ""))
-    url = model.get("url", "")
-    
-    if not url:
-        return web.json_response({"error": "No download URL"}, status=400)
-    
-    # Start async download
-    download_id = f"{category_id}_{model_name}"
-    _download_progress[download_id] = {
-        "status": "starting",
-        "progress": 0,
-        "total": model.get("size_mb", 0) * 1024 * 1024,
-        "downloaded": 0
-    }
-    
-    async def do_download():
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    repo_id = data.get("repo_id")
+    model_name = data.get("model_name")
+    target_version = data.get("version")
+
+    if not repo_id or " " in repo_id:
+        return web.json_response({"error": "Invalid Repo ID"}, status=400)
+
+    if not HF_HUB_AVAILABLE:
+        return web.json_response({"error": "huggingface_hub is not installed"}, status=500)
+
+    try:
+        def fetch_config_sync():
+            return _fetch_model_config(repo_id)
+
         try:
-            _download_progress[download_id]["status"] = "downloading"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        _download_progress[download_id]["status"] = "error"
-                        _download_progress[download_id]["error"] = f"HTTP {response.status}"
-                        return
-                    
-                    total = int(response.headers.get('content-length', 0))
-                    _download_progress[download_id]["total"] = total
-                    
-                    # Create parent directories if needed
-                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    
-                    with open(target_path, 'wb') as f:
-                        downloaded = 0
-                        async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            _download_progress[download_id]["downloaded"] = downloaded
-                            if total > 0:
-                                _download_progress[download_id]["progress"] = int(downloaded / total * 100)
-            
-            _download_progress[download_id]["status"] = "complete"
-            _download_progress[download_id]["progress"] = 100
-            print(f"[UmiAI] Downloaded: {target_path}")
-            
-        except Exception as e:
-            _download_progress[download_id]["status"] = "error"
-            _download_progress[download_id]["error"] = str(e)
-            print(f"[UmiAI] Download error: {e}")
-    
-    asyncio.create_task(do_download())
-    
-    return web.json_response({
-        "download_id": download_id,
-        "status": "started",
-        "target": target_path
-    })
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+
+        config = await loop.run_in_executor(None, fetch_config_sync)
+
+        target_model = next((m for m in config["models"]
+                             if m["name"] == model_name and m["version"] == target_version), None)
+
+        if not target_model:
+            target_model = next((m for m in config["models"] if m["name"] == model_name), None)
+
+        if not target_model:
+            return web.json_response({"error": f"Model '{model_name}' (v{target_version}) not found in config"}, status=404)
+
+        download_status[model_name] = {"status": "queued", "message": "Queued in backend..."}
+        download_queue.put((repo_id, model_name, target_model))
+
+        return web.json_response({"status": "queued", "message": f"Download queued for {model_name}"})
+
+    except Exception as e:
+        if "HFValidationError" in str(e):
+            return web.json_response({"error": "Invalid Repo ID"}, status=400)
+        traceback.print_exc()
+        return web.json_response({"error": str(e)}, status=500)
 
 @PromptServer.instance.routes.get("/umiapp/models/progress")
 async def get_download_progress(request):
-    """Get download progress."""
     download_id = request.query.get("id", "")
-    
-    if download_id and download_id in _download_progress:
-        return web.json_response(_download_progress[download_id])
-    
-    # Return all progress
-    return web.json_response(_download_progress)
-
-@PromptServer.instance.routes.post("/umiapp/models/download-all")
-async def download_all_required(request):
-    """Download all required models."""
-    manifest = load_model_manifest()
-    if not manifest:
-        return web.json_response({"error": "Manifest not found"}, status=404)
-    
-    queued = []
-    for cat_id, category in manifest.get("categories", {}).items():
-        for model in category.get("models", []):
-            if model.get("required", False):
-                # Check if already installed
-                models_dir = folder_paths.models_dir
-                target_dir = os.path.join(models_dir, category.get("target_dir", ""))
-                target_path = os.path.join(target_dir, model.get("filename", ""))
-                
-                if not os.path.exists(target_path):
-                    queued.append({
-                        "category": cat_id,
-                        "model": model.get("name")
-                    })
-    
-    return web.json_response({
-        "queued": queued,
-        "count": len(queued)
-    })
+    if download_id and download_id in download_status:
+        return web.json_response(download_status[download_id])
+    return web.json_response(download_status)
 
 # 2. Mappings
-NODE_CLASS_MAPPINGS = {
+CORE_NODE_CLASS_MAPPINGS = {
     "UmiAIWildcardNode": UmiAIWildcardNode,
     "UmiAIWildcardNodeLite": UmiAIWildcardNodeLite,
     "UmiSaveImage": UmiSaveImage,
@@ -629,14 +886,29 @@ NODE_CLASS_MAPPINGS = {
     "UmiCaptionEnhancer": UmiCaptionEnhancer,
     "UmiQWENDetailer": UmiQWENDetailer,
     "UmiBBoxExtractor": UmiBBoxExtractor,
+    "UmiQWENEncoder": UmiQWENEncoder,
     "UmiPoseGenerator": UmiPoseGenerator,
     "UmiEmotionGenerator": UmiEmotionGenerator,
     "UmiEmotionStudio": UmiEmotionStudio,
     "UmiCharacterDesigner": UmiCharacterCreator2,
     "UmiCameraAngleSelector": UmiCameraAngleSelector,
+    "UmiModelManager": UmiModelManager,
+    "UmiModelSelector": UmiModelSelector,
 }
 
-NODE_DISPLAY_NAME_MAPPINGS = {
+SHEET_NODE_CLASS_MAPPINGS = {
+    "UmiSheetManager": VNCCSSheetManager,
+    "UmiSheetExtractor": VNCCSSheetExtractor,
+    "UmiChromaKey": VNCCSChromaKey,
+    "UmiColorFix": VNCCS_ColorFix,
+    "UmiResize": VNCCS_Resize,
+    "UmiMaskExtractor": VNCCS_MaskExtractor,
+    "UmiRMBG2": VNCCS_RMBG2,
+    "UmiQuadSplitter": VNCCS_QuadSplitter,
+    "UmiCharacterSheetCropper": CharacterSheetCropper,
+}
+
+CORE_NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiAIWildcardNode": "UmiAI Wildcard Processor",
     "UmiAIWildcardNodeLite": "UmiAI Wildcard Processor (Lite)",
     "UmiSaveImage": "Umi Save Image (with metadata)",
@@ -658,11 +930,34 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiCaptionEnhancer": "UmiAI Caption Enhancer",
     "UmiQWENDetailer": "Umi QWEN Detailer",
     "UmiBBoxExtractor": "Umi BBox Extractor",
+    "UmiQWENEncoder": "Umi QWEN Encoder",
     "UmiPoseGenerator": "Umi Pose Generator",
     "UmiEmotionGenerator": "Umi Emotion Generator",
     "UmiEmotionStudio": "Umi Emotion Studio",
     "UmiCharacterDesigner": "Umi Character Designer",
+    "UmiModelManager": "Umi Model Manager",
+    "UmiModelSelector": "Umi Model Selector",
 }
+
+SHEET_NODE_DISPLAY_NAME_MAPPINGS = {
+    "UmiSheetManager": "Umi Sheet Manager",
+    "UmiSheetExtractor": "Umi Sheet Extractor",
+    "UmiChromaKey": "Umi Chroma Key",
+    "UmiColorFix": "Umi Color Fix",
+    "UmiResize": "Umi Resize",
+    "UmiMaskExtractor": "Umi Mask Extractor",
+    "UmiRMBG2": "Umi RMBG2",
+    "UmiQuadSplitter": "Umi Quad Splitter",
+    "UmiCharacterSheetCropper": "Umi Character Sheet Cropper",
+}
+
+NODE_CLASS_MAPPINGS = {}
+NODE_CLASS_MAPPINGS.update(CORE_NODE_CLASS_MAPPINGS)
+NODE_CLASS_MAPPINGS.update(SHEET_NODE_CLASS_MAPPINGS)
+
+NODE_DISPLAY_NAME_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS.update(CORE_NODE_DISPLAY_NAME_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(SHEET_NODE_DISPLAY_NAME_MAPPINGS)
 
 # 3. Expose the web directory
 WEB_DIRECTORY = "./js"

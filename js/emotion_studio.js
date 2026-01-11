@@ -34,6 +34,7 @@ class UmiEmotionStudioWidget {
         this.injectStyles();
         this.buildUI();
         this.loadEmotions();
+        this.updateDependencyStatus();
 
         // Initial positioning
         this.updatePosition();
@@ -366,6 +367,17 @@ class UmiEmotionStudioWidget {
                 color: #fff;
                 border-color: rgba(255,255,255,0.3);
             }
+
+            .umi-deps-banner {
+                display: none;
+                margin: 8px 0 12px;
+                padding: 8px 10px;
+                border-radius: 6px;
+                background: rgba(229, 192, 123, 0.12);
+                border: 1px solid rgba(229, 192, 123, 0.35);
+                color: #e5c07b;
+                font-size: 12px;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -376,6 +388,8 @@ class UmiEmotionStudioWidget {
                 <span class="ues-title">🎭 Emotion Studio</span>
                 <button class="ues-btn ues-btn-primary" id="ues-open">📋 Open Picker</button>
             </div>
+
+            <div class="umi-deps-banner" id="ues-deps"></div>
             
             <div class="ues-costume-row" id="ues-costumes"></div>
             
@@ -464,6 +478,24 @@ class UmiEmotionStudioWidget {
             this.buildCategoryFilter();
         } catch (e) {
             console.error("[UmiAI Emotion Studio] Failed to load emotions:", e);
+        }
+    }
+
+    async updateDependencyStatus() {
+        const banner = this.panel.querySelector("#ues-deps");
+        if (!banner) return;
+        try {
+            const response = await api.fetchApi("/umiapp/deps");
+            if (!response.ok) return;
+            const data = await response.json();
+            const missing = data.missing || [];
+            if (missing.length) {
+                banner.textContent = `Missing optional dependencies: ${missing.join(", ")}. Install with: pip install ${missing.join(" ")}`;
+                banner.style.display = "block";
+            } else {
+                banner.style.display = "none";
+            }
+        } catch (e) {
         }
     }
 

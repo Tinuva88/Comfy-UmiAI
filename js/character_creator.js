@@ -32,6 +32,7 @@ class UmiCharacterDesignerWidget {
 
         this.injectStyles();
         this.buildUI();
+        this.updateDependencyStatus();
 
         // Initial positioning
         this.updatePosition();
@@ -234,6 +235,17 @@ class UmiCharacterDesignerWidget {
                 color: #f87171;
                 border: 1px solid rgba(239, 68, 68, 0.2);
             }
+
+            .umi-deps-banner {
+                display: none;
+                margin: 8px 0 12px;
+                padding: 8px 10px;
+                border-radius: 6px;
+                background: rgba(229, 192, 123, 0.12);
+                border: 1px solid rgba(229, 192, 123, 0.35);
+                color: #e5c07b;
+                font-size: 12px;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -244,6 +256,8 @@ class UmiCharacterDesignerWidget {
                 <span class="ucd-icon">✨</span>
                 <h3>Character Designer</h3>
             </div>
+
+            <div class="umi-deps-banner" id="ucd-deps"></div>
             
             <input type="text" class="ucd-name-input" placeholder="Enter character name..." data-key="name">
             
@@ -326,6 +340,24 @@ class UmiCharacterDesignerWidget {
 
         this.panel.querySelector("#ucd-create").addEventListener("click", () => this.createCharacter());
         this.panel.querySelector("#ucd-load").addEventListener("click", () => this.loadCharacter());
+    }
+
+    async updateDependencyStatus() {
+        const banner = this.panel.querySelector("#ucd-deps");
+        if (!banner) return;
+        try {
+            const response = await api.fetchApi("/umiapp/deps");
+            if (!response.ok) return;
+            const data = await response.json();
+            const missing = data.missing || [];
+            if (missing.length) {
+                banner.textContent = `Missing optional dependencies: ${missing.join(", ")}. Install with: pip install ${missing.join(" ")}`;
+                banner.style.display = "block";
+            } else {
+                banner.style.display = "none";
+            }
+        } catch (e) {
+        }
     }
 
     updatePosition() {
