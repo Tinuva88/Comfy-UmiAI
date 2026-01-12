@@ -981,6 +981,9 @@ function applyHighlighting(textareaEl, widget = null) {
         // Clean up any double spaces created
         cleaned = cleaned.replace(/  +/g, ' ');
 
+        // Remove leading whitespace per line
+        cleaned = cleaned.replace(/^[\t ]+/gm, '');
+
         // Remove leading/trailing commas from lines
         cleaned = cleaned.split('\n').map(line => line.trim().replace(/^,+\s*|\s*,+$/g, '').trim()).join('\n');
 

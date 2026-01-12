@@ -1,27 +1,9 @@
-from .nodes import (UmiAIWildcardNode, UmiSaveImage, UmiPoseGenerator, UmiEmotionGenerator, 
-                    UmiEmotionStudio, UmiCharacterCreator as UmiCharacterCreator2, 
+from .nodes import (UmiAIWildcardNode, UmiSaveImage, UmiPoseGenerator, UmiEmotionGenerator,
+                    UmiEmotionStudio, UmiCharacterCreator as UmiCharacterCreator2,
                     UmiSpriteGenerator as UmiSpriteGenerator2, UmiDatasetGenerator as UmiDatasetGenerator2,
                     UmiPositionControl as UmiPositionControl2, UmiVisualCameraControl as UmiVisualCameraControl2)
 from .nodes_lite import UmiAIWildcardNodeLite
-from .nodes_character import UmiCharacterManager, UmiCharacterBatch, UmiSpriteExport, UmiCharacterInfo
-from .nodes_camera import UmiCameraControl, UmiVisualCameraControl, UmiCameraAngleSelector
-from .nodes_power import UmiPoseLibrary, UmiExpressionMixer, UmiSceneComposer, UmiLoraAnimator, UmiPromptTemplate
-from .nodes_dataset import UmiDatasetExport, UmiCaptionGenerator
-from .nodes_caption import UmiAutoCaption, UmiCaptionEnhancer
-from .nodes_qwen_detailer import UmiQWENDetailer, UmiBBoxExtractor
-from .nodes_qwen_encoder import UmiQWENEncoder
 from .nodes_model_manager import UmiModelManager, UmiModelSelector
-from .nodes_sheet_tools import (
-    VNCCSSheetManager,
-    VNCCSSheetExtractor,
-    VNCCSChromaKey,
-    VNCCS_ColorFix,
-    VNCCS_Resize,
-    VNCCS_MaskExtractor,
-    VNCCS_RMBG2,
-    VNCCS_QuadSplitter,
-)
-from .nodes_sheet_crop import CharacterSheetCropper
 from server import PromptServer
 from aiohttp import web
 import os
@@ -30,7 +12,78 @@ import glob
 import yaml
 import folder_paths # New Import for LoRA scanning
 
+try:
+    from . import umi_utilities as _umi_utilities
+except Exception:
+    try:
+        import umi_utilities as _umi_utilities
+    except Exception:
+        _umi_utilities = None
+
 # 1. Setup the API Route
+def _resolve_umi_asset_path(*parts):
+    base_dir = os.path.dirname(__file__)
+    util_path = os.path.join(base_dir, "umi_utilities", *parts)
+    if os.path.exists(util_path):
+        return util_path
+    return os.path.join(base_dir, *parts)
+
+def _get_umi_character_loader():
+    if _umi_utilities is None:
+        return None
+    try:
+        from .umi_utilities.nodes_character import CharacterLoader
+        return CharacterLoader
+    except Exception:
+        return None
+
+UTILITIES_MODEL_CATEGORIES = {
+    "background_removal",
+    "face_detection",
+    "llm_models",
+    "qwen_loras",
+    "sam",
+    "segmentation",
+}
+
+UTILITIES_MODEL_PREFIXES = {
+    "models/loras/qwen/": "qwen_loras",
+    "models/ultralytics/bbox/": "face_detection",
+    "models/segmentation/": "segmentation",
+    "models/sam/": "sam",
+    "models/RMBG/": "background_removal",
+    "models/llm/": "llm_models",
+}
+
+def _infer_model_category(model):
+    category = model.get("category")
+    if category:
+        return category
+    local_path = model.get("local_path") or ""
+    if local_path:
+        norm_path = local_path.replace("\\", "/")
+        for prefix, cat in UTILITIES_MODEL_PREFIXES.items():
+            if norm_path.startswith(prefix):
+                return cat
+    for f in model.get("files") or []:
+        file_path = f.get("local_path") or ""
+        norm_path = file_path.replace("\\", "/")
+        for prefix, cat in UTILITIES_MODEL_PREFIXES.items():
+            if norm_path.startswith(prefix):
+                return cat
+    return None
+
+def _filter_models_for_core(config):
+    if _umi_utilities is not None:
+        return config
+    filtered = []
+    for model in config.get("models", []):
+        category = _infer_model_category(model)
+        if category in UTILITIES_MODEL_CATEGORIES:
+            continue
+        filtered.append(model)
+    return {**config, "models": filtered}
+
 def get_wildcard_data():
     wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
     txt_files = []      # For __ autocomplete (txt files only)
@@ -149,18 +202,28 @@ async def fetch_globals(request):
 async def get_dependency_status(request):
     return web.json_response(get_optional_dependency_status())
 
+@PromptServer.instance.routes.get("/umiapp/utilities/status")
+async def get_utilities_status(request):
+    return web.json_response({"installed": _umi_utilities is not None})
+
 @PromptServer.instance.routes.get("/umiapp/characters")
 async def fetch_characters(request):
     """Fetch available characters and their profiles for autocomplete and external tools."""
-    from .nodes_character import CharacterLoader
+    character_loader = _get_umi_character_loader()
+    if character_loader is None:
+        return web.json_response({
+            "characters": [],
+            "profiles": {},
+            "count": 0
+        })
     
-    characters = CharacterLoader.list_characters()
+    characters = character_loader.list_characters()
     character_data = {}
     
     for char_name in characters:
         if char_name == "none":
             continue
-        data = CharacterLoader.load_character(char_name)
+        data = character_loader.load_character(char_name)
         if data:
             character_data[char_name] = {
                 "name": data.get('name', char_name),
@@ -185,7 +248,7 @@ async def get_character_costumes(request):
     if not character:
         return web.json_response([])
     
-    chars_path = os.path.join(os.path.dirname(__file__), "characters", character)
+    chars_path = _resolve_umi_asset_path("characters", character)
     sheets_path = os.path.join(chars_path, "Sheets")
     
     costumes = []
@@ -208,7 +271,7 @@ async def get_character_preview(request):
     if not character:
         return web.Response(status=404, text="No character specified")
     
-    chars_path = os.path.join(os.path.dirname(__file__), "characters", character)
+    chars_path = _resolve_umi_asset_path("characters", character)
     
     # Try to find a sheet image
     sheet_dir = os.path.join(chars_path, "Sheets", "Naked", "neutral")
@@ -267,7 +330,7 @@ async def get_character_preview(request):
 @PromptServer.instance.routes.get("/umiapp/emotions")
 async def get_emotions(request):
     """Get emotions config data (VNCCS-compatible)."""
-    config_path = os.path.join(os.path.dirname(__file__), "emotions-config", "emotions.json")
+    config_path = _resolve_umi_asset_path("emotions-config", "emotions.json")
     
     if not os.path.exists(config_path):
         return web.json_response({"error": "emotions.json not found"}, status=404)
@@ -291,7 +354,7 @@ async def get_emotion_image(request):
         return web.Response(status=400)
     
     name = unquote(name).strip()
-    image_path = os.path.join(os.path.dirname(__file__), "emotions-config", "images", f"{name}.png")
+    image_path = _resolve_umi_asset_path("emotions-config", "images", f"{name}.png")
     
     if not os.path.exists(image_path):
         return web.Response(status=404)
@@ -493,7 +556,7 @@ def save_umi_config(new_data):
 def _convert_manifest_to_config(manifest):
     version = str(manifest.get("version", "1.0"))
     models = []
-    for category in manifest.get("categories", {}).values():
+    for category_key, category in manifest.get("categories", {}).items():
         target_dir = category.get("target_dir", "")
         for model in category.get("models", []):
             filename = model.get("filename", "")
@@ -520,6 +583,7 @@ def _convert_manifest_to_config(manifest):
                 "url": model.get("url", ""),
                 "hf_repo": model.get("hf_repo", ""),
                 "hf_path": model.get("hf_path", ""),
+                "category": category_key,
                 "files": files
             })
     return {"models": models}
@@ -733,6 +797,7 @@ async def check_models(request):
             loop = asyncio.get_event_loop()
 
         config = await loop.run_in_executor(None, fetch_config)
+        config = _filter_models_for_core(config)
 
         active_registry = get_installed_version_info()
 
@@ -869,68 +934,18 @@ CORE_NODE_CLASS_MAPPINGS = {
     "UmiAIWildcardNode": UmiAIWildcardNode,
     "UmiAIWildcardNodeLite": UmiAIWildcardNodeLite,
     "UmiSaveImage": UmiSaveImage,
-    "UmiCharacterManager": UmiCharacterManager,
-    "UmiCharacterBatch": UmiCharacterBatch,
-    "UmiSpriteExport": UmiSpriteExport,
-    "UmiCharacterInfo": UmiCharacterInfo,
-    "UmiCameraControl": UmiCameraControl,
-    "UmiVisualCameraControl": UmiVisualCameraControl,
-    "UmiPoseLibrary": UmiPoseLibrary,
-    "UmiExpressionMixer": UmiExpressionMixer,
-    "UmiSceneComposer": UmiSceneComposer,
-    "UmiLoraAnimator": UmiLoraAnimator,
-    "UmiPromptTemplate": UmiPromptTemplate,
-    "UmiDatasetExport": UmiDatasetExport,
-    "UmiCaptionGenerator": UmiCaptionGenerator,
-    "UmiAutoCaption": UmiAutoCaption,
-    "UmiCaptionEnhancer": UmiCaptionEnhancer,
-    "UmiQWENDetailer": UmiQWENDetailer,
-    "UmiBBoxExtractor": UmiBBoxExtractor,
-    "UmiQWENEncoder": UmiQWENEncoder,
     "UmiPoseGenerator": UmiPoseGenerator,
     "UmiEmotionGenerator": UmiEmotionGenerator,
     "UmiEmotionStudio": UmiEmotionStudio,
     "UmiCharacterDesigner": UmiCharacterCreator2,
-    "UmiCameraAngleSelector": UmiCameraAngleSelector,
     "UmiModelManager": UmiModelManager,
     "UmiModelSelector": UmiModelSelector,
-}
-
-SHEET_NODE_CLASS_MAPPINGS = {
-    "UmiSheetManager": VNCCSSheetManager,
-    "UmiSheetExtractor": VNCCSSheetExtractor,
-    "UmiChromaKey": VNCCSChromaKey,
-    "UmiColorFix": VNCCS_ColorFix,
-    "UmiResize": VNCCS_Resize,
-    "UmiMaskExtractor": VNCCS_MaskExtractor,
-    "UmiRMBG2": VNCCS_RMBG2,
-    "UmiQuadSplitter": VNCCS_QuadSplitter,
-    "UmiCharacterSheetCropper": CharacterSheetCropper,
 }
 
 CORE_NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiAIWildcardNode": "UmiAI Wildcard Processor",
     "UmiAIWildcardNodeLite": "UmiAI Wildcard Processor (Lite)",
     "UmiSaveImage": "Umi Save Image (with metadata)",
-    "UmiCharacterManager": "UmiAI Character Manager",
-    "UmiCharacterBatch": "UmiAI Character Batch Generator",
-    "UmiSpriteExport": "UmiAI Sprite Export",
-    "UmiCharacterInfo": "UmiAI Character Info",
-    "UmiCameraControl": "UmiAI Camera Control",
-    "UmiVisualCameraControl": "UmiAI Visual Camera Control",
-    "UmiCameraAngleSelector": "UmiAI 3D Camera Angle Selector",
-    "UmiPoseLibrary": "UmiAI Pose Library",
-    "UmiExpressionMixer": "UmiAI Expression Mixer",
-    "UmiSceneComposer": "UmiAI Scene Composer",
-    "UmiLoraAnimator": "UmiAI LoRA Strength Animator",
-    "UmiPromptTemplate": "UmiAI Prompt Template",
-    "UmiDatasetExport": "UmiAI Dataset Export (LoRA Training)",
-    "UmiCaptionGenerator": "UmiAI Caption Generator",
-    "UmiAutoCaption": "UmiAI Auto Caption (Wrapper)",
-    "UmiCaptionEnhancer": "UmiAI Caption Enhancer",
-    "UmiQWENDetailer": "Umi QWEN Detailer",
-    "UmiBBoxExtractor": "Umi BBox Extractor",
-    "UmiQWENEncoder": "Umi QWEN Encoder",
     "UmiPoseGenerator": "Umi Pose Generator",
     "UmiEmotionGenerator": "Umi Emotion Generator",
     "UmiEmotionStudio": "Umi Emotion Studio",
@@ -939,25 +954,15 @@ CORE_NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiModelSelector": "Umi Model Selector",
 }
 
-SHEET_NODE_DISPLAY_NAME_MAPPINGS = {
-    "UmiSheetManager": "Umi Sheet Manager",
-    "UmiSheetExtractor": "Umi Sheet Extractor",
-    "UmiChromaKey": "Umi Chroma Key",
-    "UmiColorFix": "Umi Color Fix",
-    "UmiResize": "Umi Resize",
-    "UmiMaskExtractor": "Umi Mask Extractor",
-    "UmiRMBG2": "Umi RMBG2",
-    "UmiQuadSplitter": "Umi Quad Splitter",
-    "UmiCharacterSheetCropper": "Umi Character Sheet Cropper",
-}
-
 NODE_CLASS_MAPPINGS = {}
 NODE_CLASS_MAPPINGS.update(CORE_NODE_CLASS_MAPPINGS)
-NODE_CLASS_MAPPINGS.update(SHEET_NODE_CLASS_MAPPINGS)
+if _umi_utilities is not None:
+    NODE_CLASS_MAPPINGS.update(_umi_utilities.NODE_CLASS_MAPPINGS)
 
 NODE_DISPLAY_NAME_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS.update(CORE_NODE_DISPLAY_NAME_MAPPINGS)
-NODE_DISPLAY_NAME_MAPPINGS.update(SHEET_NODE_DISPLAY_NAME_MAPPINGS)
+if _umi_utilities is not None:
+    NODE_DISPLAY_NAME_MAPPINGS.update(_umi_utilities.NODE_DISPLAY_NAME_MAPPINGS)
 
 # 3. Expose the web directory
 WEB_DIRECTORY = "./js"

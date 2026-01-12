@@ -20,7 +20,7 @@ from .shared_utils import (
     escape_unweighted_colons, parse_wildcard_weight, log_prompt_to_history,
     LogicEvaluator, DynamicPromptReplacer, VariableReplacer, NegativePromptGenerator,
     ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase,
-    CharacterReplacer
+    CharacterReplacer, resolve_lora_alias
 )
 
 # Import UMI_SETTINGS from main nodes for syncing toggle
@@ -212,7 +212,10 @@ class TagLoader(TagLoaderBase):
 
     def load_prompt_file(self, file_key):
         """Phase 6: Load entire .txt file content as a prompt (no parsing)"""
-        file_key_lower = file_key.lower()
+        key = self.resolve_wildcard_alias(file_key.strip())
+        if key.lower().endswith('.txt'):
+            key = key[:-4]
+        file_key_lower = key.lower()
         for wildcard_path in self.wildcard_paths:
             for root, dirs, files in os.walk(wildcard_path):
                 for file in files:
@@ -244,7 +247,22 @@ class TagLoader(TagLoaderBase):
 
     def load_txt_file(self, file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
-            lines = [line.strip() for line in f if line.strip()]
+            raw_lines = f.read().splitlines()
+        lines = []
+        for line in raw_lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                continue
+            if '//' in line:
+                line = re.sub(r'(?<!:)//[^,\n]*', '', line).strip()
+                if not line:
+                    continue
+            if '#' in line:
+                line = line.split('#')[0].strip()
+            if line:
+                lines.append(line)
 
         # Parse using shared utility function
         entries = []
@@ -323,7 +341,7 @@ class TagSelector(TagSelectorBase):
     def update_variables(self, variables):
         self.variables = variables
 
-    def _weighted_sample(self, entries, count):
+    def _weighted_sample(self, entries, count, rng=None):
         """Fix 13: Weighted random selection based on entry weights"""
         if count >= len(entries):
             return entries
@@ -344,7 +362,7 @@ class TagSelector(TagSelectorBase):
             available_total = sum(available_weights)
 
             # Pick random value in weight range
-            rand_val = self.random.random() * available_total
+            rand_val = (rng or self.random).random() * available_total
             cumsum = 0
 
             for idx, i in enumerate(available_indices):
@@ -357,12 +375,23 @@ class TagSelector(TagSelectorBase):
         return selected
 
     def select(self, tag_key, count=1, logic_filter=None, sequential=False):
+        self.init_debug_context()
+        self.init_trace_context()
+        scope_override = None
+        if tag_key.startswith('@') and ':' in tag_key:
+            scope_override, tag_key = tag_key[1:].split(':', 1)
+            scope_override = scope_override.strip()
+            tag_key = tag_key.strip()
+        rng = self.get_rng(scope_override or tag_key)
+        tag_key = self.tag_loader.resolve_wildcard_alias(tag_key)
         entries = self.tag_loader.load_from_file(tag_key)
 
         if not entries:
             # Fix 11: Better error messages - provide helpful feedback for missing wildcards
             error_msg = f"[WILDCARD_NOT_FOUND: {tag_key}]"
             print(f"[UmiAI Lite] WARNING: Wildcard file '{tag_key}' not found or is empty.")
+            if self.is_failfast_enabled():
+                return f"<<ERROR_WILDCARD_NOT_FOUND:{tag_key}>>"
             return error_msg
 
         if tag_key in self.seeded_values and not logic_filter and not sequential:
@@ -370,10 +399,22 @@ class TagSelector(TagSelectorBase):
 
         # Phase 6: Sequential selection - use seed to pick same index
         if sequential and entries:
-            idx = self.seed % len(entries)
+            if self.rng_streams_enabled:
+                idx = self.get_scoped_index(scope_override or tag_key, len(entries))
+            else:
+                idx = self.seed % len(entries)
             selected_entry = entries[idx]
             result = selected_entry['value']
             self.seeded_values[tag_key] = result
+            if self.is_debug_enabled():
+                self.variables['debug_last_type'] = "wildcard"
+                self.variables['debug_last_source'] = tag_key
+                self.variables['debug_last_pick'] = str(result)
+            self.set_trace_info({
+                "trace_last_type": "wildcard",
+                "trace_last_source": tag_key,
+                "trace_last_pick": str(result),
+            })
             return result
 
         # Phase 5: Filter entries by logic expression if provided
@@ -389,6 +430,8 @@ class TagSelector(TagSelectorBase):
             if not filtered_entries:
                 error_msg = f"[NO_MATCHES: {logic_filter} in {tag_key}]"
                 print(f"[UmiAI Lite] WARNING: No entries in '{tag_key}' matched logic '{logic_filter}'.")
+                if self.is_failfast_enabled():
+                    return f"<<ERROR_NO_MATCHES:{logic_filter} in {tag_key}>>"
                 return error_msg
 
             entries = filtered_entries
@@ -398,10 +441,10 @@ class TagSelector(TagSelectorBase):
 
         if has_weights:
             # Weighted random selection
-            selected_entries = self._weighted_sample(entries, min(count, len(entries)))
+            selected_entries = self._weighted_sample(entries, min(count, len(entries)), rng=rng)
         else:
             # Normal random selection
-            selected_entries = self.random.sample(entries, min(count, len(entries)))
+            selected_entries = rng.sample(entries, min(count, len(entries)))
 
         result_parts = []
         for entry in selected_entries:
@@ -423,8 +466,32 @@ class TagSelector(TagSelectorBase):
                     var_name = str(column_name).strip()
                     if var_name and var_name not in self.variables:
                         self.variables[var_name] = column_value
+                    if var_name and UMI_SETTINGS.get('csv_namespace', True):
+                        namespaced = f"csv_{var_name}"
+                        if namespaced not in self.variables:
+                            self.variables[namespaced] = column_value
+                if self.is_debug_enabled():
+                    self.variables['debug_last_type'] = "csv"
+                    self.variables['debug_last_source'] = tag_key
+                    if 'id' in csv_row:
+                        self.variables['debug_row_id'] = str(csv_row.get('id'))
+                self.set_trace_info({
+                    "trace_last_type": "csv",
+                    "trace_last_source": tag_key,
+                    "trace_row_id": str(csv_row.get('id')) if 'id' in csv_row else "",
+                })
 
         result = ", ".join(result_parts)
+        if self.is_debug_enabled():
+            self.variables['debug_last_type'] = self.variables.get('debug_last_type', "wildcard")
+            self.variables['debug_last_source'] = tag_key
+            self.variables['debug_last_pick'] = result
+            self.variables['debug_last_count'] = str(len(selected_entries))
+        self.set_trace_info({
+            "trace_last_type": self.variables.get('debug_last_type', "wildcard"),
+            "trace_last_source": tag_key,
+            "trace_last_pick": result,
+        })
         self.seeded_values[tag_key] = result
         return result
 
@@ -434,6 +501,7 @@ class TagSelector(TagSelectorBase):
             return self.seeded_values[cache_key]
 
         evaluator = LogicEvaluator(logic_expression, self.variables)
+        rng = self.get_rng(logic_expression)
 
         # Debug logging - VERBOSE
         total_tags = len(GLOBAL_INDEX_LITE['entries'])
@@ -478,6 +546,9 @@ class TagSelector(TagSelectorBase):
                             'suffix': entry_data.get('Suffix', [''])[0] if isinstance(entry_data.get('Suffix'), list) else '',
                             'neg_prefix': entry_data.get('Neg_Prefix', [''])[0] if isinstance(entry_data.get('Neg_Prefix'), list) else '',
                             'neg_suffix': entry_data.get('Neg_Suffix', [''])[0] if isinstance(entry_data.get('Neg_Suffix'), list) else '',
+                            'entry_key': entry_info.get('entry_key'),
+                            'tags': entry_tags,
+                            'description': entry_data.get('Description', [''])[0] if isinstance(entry_data.get('Description'), list) else entry_data.get('Description', ''),
                         })
 
         if not matching_entries:
@@ -486,10 +557,12 @@ class TagSelector(TagSelectorBase):
             print(f"[UmiAI Lite DEBUG] Loop complete: checked {total_entries_checked} entries, found {len(matching_entries)} matches for '{logic_expression}'")
             print(f"[UmiAI Lite] WARNING: No YAML entries matched logic expression '{logic_expression}'.")
             sys.stdout.flush()
+            if self.is_failfast_enabled():
+                error_msg = f"<<ERROR_NO_MATCHES:{logic_expression}>>"
             self.seeded_values[cache_key] = error_msg
             return error_msg
 
-        selected = self.random.choice(matching_entries)
+        selected = rng.choice(matching_entries)
 
         if selected.get('prefix'):
             self.prefixes.append(selected['prefix'])
@@ -499,6 +572,22 @@ class TagSelector(TagSelectorBase):
             self.neg_prefixes.append(selected['neg_prefix'])
         if selected.get('neg_suffix'):
             self.neg_suffixes.append(selected['neg_suffix'])
+
+        self.set_trace_info({
+            "trace_yaml_entry": str(selected.get('entry_key') or ""),
+            "trace_last_type": "yaml",
+            "trace_last_source": logic_expression,
+            "trace_last_pick": str(selected.get('value', '')),
+        })
+        if UMI_SETTINGS.get('yaml_namespace', True):
+            if selected.get('entry_key'):
+                self.variables['yaml_title'] = str(selected.get('entry_key'))
+            tags = selected.get('tags') or []
+            if tags:
+                self.variables['yaml_tags'] = ", ".join(str(t) for t in tags)
+            description = selected.get('description')
+            if description:
+                self.variables['yaml_description'] = str(description)
 
         result = selected['value']
         self.seeded_values[cache_key] = result
@@ -535,7 +624,11 @@ class TagReplacer(TagReplacerBase):
             max_val = int(match.group(2))
             tag_key = match.group(3)
 
-            count = self.tag_selector.random.randint(min_val, max_val)
+            scope_key = tag_key
+            if tag_key.startswith('@') and ':' in tag_key:
+                scope_key = tag_key[1:].split(':', 1)[0].strip()
+            rng = self.tag_selector.get_rng(scope_key)
+            count = rng.randint(min_val, max_val)
             return self.tag_selector.select(tag_key, count)
 
         text = re.sub(pattern, range_replacer, text)
@@ -587,7 +680,7 @@ class TagReplacer(TagReplacerBase):
                 sequential = True
                 tag_key = tag_key[1:]
             # Phase 6: Support @prompt file prefix
-            if tag_key.startswith('@'):
+            if tag_key.startswith('@') and ':' not in tag_key:
                 try:
                     file_content = self.tag_selector.tag_loader.load_prompt_file(tag_key[1:])
                     if file_content:
@@ -608,6 +701,99 @@ class TagReplacer(TagReplacerBase):
         text = text.replace(ESCAPED_CHOICE, '{')
 
         return text
+
+
+def append_debug_summary(prompt, variables):
+    summary = variables.get('debug_summary')
+    if not summary or str(summary).strip() in ("0", "false", "False"):
+        return prompt
+
+    def _level(val):
+        if val is None:
+            return 1
+        if isinstance(val, (int, float)):
+            return max(0, int(val))
+        s = str(val).strip()
+        if s.isdigit():
+            return int(s)
+        if s.lower() in ("true", "yes", "on"):
+            return 1
+        return 0
+
+    level = _level(variables.get('debug'))
+    parts = [
+        "DBG",
+        f"seed={variables.get('debug_seed', '')}",
+        f"run={variables.get('debug_run_id', '')}",
+    ]
+    if variables.get('debug_last_type'):
+        parts.append(f"type={variables.get('debug_last_type')}")
+    if variables.get('debug_last_source'):
+        parts.append(f"src={variables.get('debug_last_source')}")
+    if variables.get('debug_last_pick'):
+        parts.append(f"pick={variables.get('debug_last_pick')}")
+    if level >= 2:
+        if variables.get('debug_last_count'):
+            parts.append(f"count={variables.get('debug_last_count')}")
+        if variables.get('debug_row_id'):
+            parts.append(f"row_id={variables.get('debug_row_id')}")
+        if variables.get('debug_row_index'):
+            parts.append(f"row={variables.get('debug_row_index')}")
+        if variables.get('debug_yaml_entry'):
+            parts.append(f"yaml={variables.get('debug_yaml_entry')}")
+        if variables.get('debug_last_roll') and variables.get('debug_last_total_weight'):
+            parts.append(f"roll={variables.get('debug_last_roll')}/{variables.get('debug_last_total_weight')}")
+
+    dbg_line = "<<{}>>".format(" | ".join(p for p in parts if p))
+    return f"{dbg_line}\n{prompt}"
+
+def append_trace_summary(prompt, variables):
+    summary = variables.get('trace_summary')
+    if not summary or str(summary).strip() in ("0", "false", "False"):
+        return prompt
+
+    def _level(val):
+        if val is None:
+            return 1
+        if isinstance(val, (int, float)):
+            return max(0, int(val))
+        s = str(val).strip()
+        if s.isdigit():
+            return int(s)
+        if s.lower() in ("true", "yes", "on"):
+            return 1
+        return 0
+
+    level = _level(variables.get('trace'))
+    parts = [
+        "TRACE",
+        f"seed={variables.get('trace_seed', '')}",
+        f"run={variables.get('trace_run_id', '')}",
+    ]
+    if variables.get('trace_last_type'):
+        parts.append(f"type={variables.get('trace_last_type')}")
+    if variables.get('trace_last_source'):
+        parts.append(f"src={variables.get('trace_last_source')}")
+    if variables.get('trace_last_pick'):
+        parts.append(f"pick={variables.get('trace_last_pick')}")
+    if level >= 2:
+        if variables.get('trace_row_id'):
+            parts.append(f"row_id={variables.get('trace_row_id')}")
+        if variables.get('trace_row_index'):
+            parts.append(f"row={variables.get('trace_row_index')}")
+        if variables.get('trace_yaml_entry'):
+            parts.append(f"yaml={variables.get('trace_yaml_entry')}")
+        if variables.get('trace_last_roll') and variables.get('trace_last_total_weight'):
+            parts.append(f"roll={variables.get('trace_last_roll')}/{variables.get('trace_last_total_weight')}")
+        if variables.get('trace_last_condition'):
+            parts.append(f"cond={variables.get('trace_last_condition')}")
+        if variables.get('trace_last_branch'):
+            parts.append(f"branch={variables.get('trace_last_branch')}")
+        if variables.get('trace_last_var') and variables.get('trace_last_var_source'):
+            parts.append(f"var={variables.get('trace_last_var')}:{variables.get('trace_last_var_source')}")
+
+    trace_line = "<<{}>>".format(" | ".join(p for p in parts if p))
+    return f"{trace_line}\n{prompt}"
 
 
 
@@ -638,6 +824,8 @@ class LoRAHandler(LoRAHandlerBase):
             except ValueError:
                 print(f"[UmiAI Lite] ERROR: Invalid LoRA strength '{strength_str}' for '{lora_name}'. Using 1.0 as default.")
                 strength = 1.0
+
+            lora_name = resolve_lora_alias(lora_name, get_all_wildcard_paths())
 
             if model is not None and clip is not None:
                 model, clip = self.load_lora(model, clip, lora_name, strength, cache_limit)
@@ -944,7 +1132,8 @@ class UmiAIWildcardNodeLite:
         options = {
             'verbose': False,
             'seed': seed,
-            'use_folder_paths': use_folder_paths
+            'use_folder_paths': use_folder_paths,
+            'rng_streams': UMI_SETTINGS.get('rng_streams', False),
         }
         
         # Sync node toggle to global settings so autocomplete uses same setting
@@ -1033,6 +1222,11 @@ class UmiAIWildcardNodeLite:
         else:
             prompt = re.sub(r',\s*,', ',', prompt)
             prompt = re.sub(r'\s+', ' ', prompt).strip().strip(',')
+
+        if tag_selector.is_trace_enabled():
+            prompt = append_trace_summary(prompt, variable_replacer.variables)
+        if tag_selector.is_debug_enabled():
+            prompt = append_debug_summary(prompt, variable_replacer.variables)
 
         # Extract and load LoRAs
         prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(prompt, model, clip, lora_tags_behavior, lora_cache_limit)

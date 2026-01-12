@@ -10,6 +10,7 @@ import re
 import yaml
 import csv
 import fnmatch
+import hashlib
 from datetime import datetime
 import folder_paths
 
@@ -24,6 +25,70 @@ ALL_KEY = 'all_files_index'
 GLOBAL_CACHE = {}
 GLOBAL_INDEX = {'built': False, 'files': set(), 'entries': {}, 'tags': set()}
 FILE_MTIME_CACHE = {}
+ALIAS_CACHE = {}
+
+
+def _normalize_aliases(data):
+    wildcards = {}
+    loras = {}
+
+    if not isinstance(data, dict):
+        return {'wildcards': wildcards, 'loras': loras}
+
+    if 'wildcards' in data or 'loras' in data:
+        wild_map = data.get('wildcards', {})
+        lora_map = data.get('loras', {})
+    else:
+        wild_map = data
+        lora_map = {}
+
+    if isinstance(wild_map, dict):
+        for k, v in wild_map.items():
+            if isinstance(v, str):
+                wildcards[str(k).strip().lower()] = v.strip()
+
+    if isinstance(lora_map, dict):
+        for k, v in lora_map.items():
+            if isinstance(v, str):
+                loras[str(k).strip().lower()] = v.strip()
+
+    return {'wildcards': wildcards, 'loras': loras}
+
+
+def load_aliases_from_paths(paths):
+    combined = {'wildcards': {}, 'loras': {}}
+    for path in paths:
+        alias_path = os.path.join(path, 'aliases.yaml')
+        if not os.path.exists(alias_path):
+            continue
+        try:
+            mtime = os.path.getmtime(alias_path)
+        except OSError:
+            continue
+
+        cached = ALIAS_CACHE.get(alias_path)
+        if cached and cached.get('mtime') == mtime:
+            data = cached.get('data', {})
+        else:
+            try:
+                with open(alias_path, 'r', encoding='utf-8') as f:
+                    raw = yaml.safe_load(f) or {}
+            except Exception:
+                raw = {}
+            data = _normalize_aliases(raw)
+            ALIAS_CACHE[alias_path] = {'mtime': mtime, 'data': data}
+
+        combined['wildcards'].update(data.get('wildcards', {}))
+        combined['loras'].update(data.get('loras', {}))
+
+    return combined
+
+
+def resolve_lora_alias(name, wildcard_paths):
+    if not name:
+        return name
+    aliases = load_aliases_from_paths(wildcard_paths)
+    return aliases.get('loras', {}).get(str(name).strip().lower(), name)
 
 
 def escape_unweighted_colons(prompt):
@@ -229,6 +294,10 @@ def read_file_lines(file):
             continue
         if line.startswith('#'):
             continue
+        if '//' in line:
+            line = re.sub(r'(?<!:)//[^,\n]*', '', line).strip()
+            if not line:
+                continue
         if '#' in line:
             line = line.split('#')[0].strip()
 
@@ -314,9 +383,50 @@ class LogicEvaluator:
         self.expression = self._normalize_expression(expression.strip())
         self.variables = variables or {}
 
+    def _strip_line_comments(self, expr):
+        if not expr:
+            return expr
+
+        result = []
+        i = 0
+        in_quote = False
+        quote_char = ""
+        while i < len(expr):
+            char = expr[i]
+            if in_quote:
+                result.append(char)
+                if char == quote_char:
+                    in_quote = False
+                    quote_char = ""
+                i += 1
+                continue
+
+            if char in ('"', "'"):
+                in_quote = True
+                quote_char = char
+                result.append(char)
+                i += 1
+                continue
+
+            if char == '/' and i + 1 < len(expr) and expr[i + 1] == '/':
+                prev_char = expr[i - 1] if i > 0 else ""
+                if prev_char != ':':
+                    # Skip until newline
+                    i += 2
+                    while i < len(expr) and expr[i] != '\n':
+                        i += 1
+                    continue
+
+            result.append(char)
+            i += 1
+
+        return "".join(result)
+
     def _normalize_expression(self, expr):
         if not expr:
             return expr
+
+        expr = self._strip_line_comments(expr)
 
         # Normalize single '=' to '==' outside of quotes.
         result = []
@@ -855,7 +965,10 @@ class VariableReplacer:
         # greedy match up to the separator to handle spaces correctly
         self.assign_regex = re.compile(r'\$([a-zA-Z0-9_]+)\s*=\s*([^;]+?)(?:\s*;|(?=\n)|$)', re.MULTILINE)
         self.use_regex = re.compile(r'\$([a-zA-Z0-9_]+)((?:\.[a-zA-Z_]+)*)')
+        self.default_regex = re.compile(r'\$\{([a-zA-Z0-9_]+)\|([^}]*)\}')
+        self.coalesce_regex = re.compile(r'coalesce\(([^)]+)\)', re.IGNORECASE)
         self.variables = {}
+        self.variable_sources = {}
 
     def load_globals(self, globals_dict):
         self.variables.update(globals_dict)
@@ -1002,6 +1115,9 @@ class VariableReplacer:
                     break
 
             self.variables[var_name] = resolved_value
+            self.variable_sources[var_name] = self._infer_source(raw_value)
+            self.variables['trace_last_var'] = var_name
+            self.variables['trace_last_var_source'] = self.variable_sources[var_name]
             i = end_idx
 
         processed_text = "".join(processed_parts)
@@ -1040,6 +1156,103 @@ class VariableReplacer:
         original_vars = self.variables.copy()
         self.variables.update(resolved_vars)
 
+        def _split_fallbacks(value):
+            parts = []
+            current = ""
+            in_quote = False
+            quote_char = ""
+            for c in value:
+                if in_quote:
+                    current += c
+                    if c == quote_char:
+                        in_quote = False
+                        quote_char = ""
+                    continue
+                if c in ("'", '"'):
+                    in_quote = True
+                    quote_char = c
+                    current += c
+                    continue
+                if c == '|':
+                    parts.append(current.strip())
+                    current = ""
+                else:
+                    current += c
+            parts.append(current.strip())
+            return parts
+
+        def _normalize_literal(val):
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                return val[1:-1]
+            return val
+
+        def _get_value_or_literal(token):
+            token = token.strip()
+            if not token:
+                return ""
+            if token.startswith('$'):
+                return str(self.variables.get(token[1:], ""))
+            return _normalize_literal(token)
+
+        def _replace_default(match):
+            var_name = match.group(1)
+            fallback_raw = match.group(2).strip()
+
+            value = self.variables.get(var_name)
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                fallbacks = _split_fallbacks(fallback_raw)
+                for fb in fallbacks:
+                    fb_val = _get_value_or_literal(fb)
+                    if fb_val.strip() != "":
+                        return fb_val
+                return ""
+            return str(value)
+
+        def _split_args(value):
+            parts = []
+            current = ""
+            in_quote = False
+            quote_char = ""
+            depth = 0
+            for c in value:
+                if in_quote:
+                    current += c
+                    if c == quote_char:
+                        in_quote = False
+                        quote_char = ""
+                    continue
+                if c in ("'", '"'):
+                    in_quote = True
+                    quote_char = c
+                    current += c
+                    continue
+                if c == '(':
+                    depth += 1
+                    current += c
+                    continue
+                if c == ')':
+                    depth = max(0, depth - 1)
+                    current += c
+                    continue
+                if c == ',' and depth == 0:
+                    parts.append(current.strip())
+                    current = ""
+                else:
+                    current += c
+            if current.strip():
+                parts.append(current.strip())
+            return parts
+
+        def _replace_coalesce(match):
+            content = match.group(1)
+            args = _split_args(content)
+            for arg in args:
+                val = _get_value_or_literal(arg)
+                if val.strip() != "":
+                    return val
+            return ""
+
         def _replace_use(match):
             var_name = match.group(1)
             methods_str = match.group(2)
@@ -1064,9 +1277,25 @@ class VariableReplacer:
 
             return value
 
-        result = self.use_regex.sub(_replace_use, text)
+        result = self.default_regex.sub(_replace_default, text)
+        result = self.coalesce_regex.sub(_replace_coalesce, result)
+        result = self.use_regex.sub(_replace_use, result)
         self.variables = original_vars  # Restore original for next iteration
         return result
+
+    def _infer_source(self, raw_value):
+        raw = raw_value.strip()
+        if raw.startswith(('{', '[')) and '|' in raw:
+            return "choice"
+        if raw.startswith('__@') or '__@' in raw:
+            return "prompt_file"
+        if '__[' in raw or '<[' in raw:
+            return "yaml"
+        if '__' in raw:
+            return "wildcard"
+        if raw.startswith(("'", '"')) and raw.endswith(("'", '"')):
+            return "literal"
+        return "literal"
 
 
 # ==============================================================================
@@ -1129,6 +1358,112 @@ class ConditionalReplacer:
     def __init__(self):
         # Simple pattern to find [if starts - we'll parse brackets manually
         self.if_start = re.compile(r'\[if\s+', re.IGNORECASE)
+        self.local_assign_prefix = "$@"
+
+    def _parse_local_assignment(self, text_value, idx):
+        if text_value[idx:idx + 2] != self.local_assign_prefix:
+            return None
+
+        j = idx + 2
+        while j < len(text_value) and (text_value[j].isalnum() or text_value[j] == '_'):
+            j += 1
+        if j == idx + 2:
+            return None
+
+        var_name = text_value[idx + 2:j]
+
+        k = j
+        while k < len(text_value) and text_value[k].isspace():
+            k += 1
+        if k >= len(text_value) or text_value[k] != '=':
+            return None
+
+        k += 1
+        while k < len(text_value) and text_value[k].isspace():
+            k += 1
+        if k >= len(text_value):
+            return None
+
+        value_start = k
+
+        def _find_matching(text_src, start, open_char, close_char):
+            depth = 1
+            i = start + 1
+            while i < len(text_src) and depth > 0:
+                if text_src[i] == open_char:
+                    depth += 1
+                elif text_src[i] == close_char:
+                    depth -= 1
+                i += 1
+            return i - 1 if depth == 0 else -1
+
+        if text_value[k] == '{':
+            end = _find_matching(text_value, k, '{', '}')
+            if end == -1:
+                end = k
+            value_end = end + 1
+        elif text_value[k] == '[':
+            end = _find_matching(text_value, k, '[', ']')
+            if end == -1:
+                end = k
+            value_end = end + 1
+        elif text_value[k] in ("'", '"'):
+            quote_char = text_value[k]
+            k += 1
+            while k < len(text_value):
+                if text_value[k] == quote_char and text_value[k - 1] != '\\':
+                    k += 1
+                    break
+                k += 1
+            value_end = k
+        elif text_value[k:k + 2] == '__':
+            end = text_value.find('__', k + 2)
+            value_end = end + 2 if end != -1 else len(text_value)
+        elif text_value[k] == '<':
+            end = text_value.find('>', k + 1)
+            value_end = end + 1 if end != -1 else len(text_value)
+        else:
+            k = value_start
+            while k < len(text_value) and text_value[k] not in ';\n':
+                k += 1
+            value_end = k
+
+        raw_value = text_value[value_start:value_end].strip()
+        value_end = value_end + 1 if value_end < len(text_value) and text_value[value_end] == ';' else value_end
+
+        return var_name, raw_value, value_end
+
+    def _apply_local_vars(self, text_value, variables):
+        local_vars = {}
+        output = []
+        i = 0
+        while i < len(text_value):
+            if text_value[i:i + 2] != self.local_assign_prefix:
+                output.append(text_value[i])
+                i += 1
+                continue
+
+            parsed = self._parse_local_assignment(text_value, i)
+            if not parsed:
+                output.append(text_value[i])
+                i += 1
+                continue
+
+            var_name, raw_value, end_idx = parsed
+            local_vars[var_name] = raw_value
+
+            if isinstance(variables, dict):
+                trace_val = variables.get('trace')
+                if str(trace_val).strip().lower() in ("1", "true", "yes", "on"):
+                    variables['trace_last_var'] = var_name
+                    variables['trace_last_var_source'] = "local"
+            i = end_idx
+
+        cleaned = "".join(output)
+        for name, value in local_vars.items():
+            pattern = r'\$@' + re.escape(name) + r'(?!\w)'
+            cleaned = re.sub(pattern, value, cleaned)
+        return cleaned
 
     def find_matching_bracket(self, text, start):
         """Find the closing ] that matches the opening [ at start, accounting for nested brackets."""
@@ -1370,10 +1705,14 @@ class ConditionalReplacer:
             # Clean the context by removing current tag to avoid self-reference
             context = prompt[:start_pos] + prompt[end_pos:]
 
-            replacement = else_text
-            for cond, text_value in branches:
+            replacement = self._apply_local_vars(else_text, variables) if else_text else else_text
+            for idx, (cond, text_value) in enumerate(branches):
                 if self.evaluate_logic(cond, context, variables):
-                    replacement = text_value
+                    replacement = self._apply_local_vars(text_value, variables)
+                    trace_val = variables.get('trace')
+                    if str(trace_val).strip().lower() in ("1", "true", "yes", "on"):
+                        variables['trace_last_condition'] = cond
+                        variables['trace_last_branch'] = str(idx)
                     break
             
             prompt = prompt[:start_pos] + replacement + prompt[end_pos:]
@@ -1400,6 +1739,17 @@ class TagLoaderBase:
         self.verbose = options.get('verbose', False)
         self.files_index = set()
         self.umi_tags = set()
+        self.aliases = load_aliases_from_paths(self.wildcard_paths)
+
+    def resolve_wildcard_alias(self, name):
+        if not name:
+            return name
+        return self.aliases.get('wildcards', {}).get(str(name).strip().lower(), name)
+
+    def resolve_lora_alias(self, name):
+        if not name:
+            return name
+        return self.aliases.get('loras', {}).get(str(name).strip().lower(), name)
 
     def load_globals(self):
         """Load global variables from globals.yaml files."""
@@ -1422,8 +1772,11 @@ class TagLoaderBase:
 
     def load_prompt_file(self, file_key):
         """Load entire .txt file content as a prompt (no parsing)."""
+        key = self.resolve_wildcard_alias(file_key.strip())
+        if key.lower().endswith('.txt'):
+            key = key[:-4]
         for location in self.wildcard_paths:
-            file_path = os.path.join(location, f"{file_key}.txt")
+            file_path = os.path.join(location, f"{key}.txt")
             if os.path.exists(file_path):
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
@@ -1459,9 +1812,59 @@ class TagSelectorBase:
         self.verbose = options.get('verbose', False)
         self.seed = options.get('seed', 0)
         self.rng = random.Random(self.seed)
+        self.rng_streams_enabled = options.get('rng_streams', False)
+        self.rng_streams_cache = {}
         self.variables = {}
         self.seeded_values = {}
         self.scoped_negatives = []
+
+    def is_debug_enabled(self):
+        val = self.variables.get('debug')
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(val)
+
+    def is_trace_enabled(self):
+        val = self.variables.get('trace')
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(val)
+
+    def is_failfast_enabled(self):
+        val = self.variables.get('fail_fast')
+        if val is None:
+            val = self.variables.get('failfast')
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        return bool(val)
+
+    def init_debug_context(self):
+        if not self.is_debug_enabled():
+            return
+        if 'debug_seed' not in self.variables:
+            self.variables['debug_seed'] = str(self.seed)
+        if 'debug_run_id' not in self.variables:
+            run_id = f"{self.seed}-{int(datetime.now().timestamp() * 1000)}"
+            self.variables['debug_run_id'] = run_id
+        if 'debug_summary' not in self.variables:
+            self.variables['debug_summary'] = "1"
+
+    def init_trace_context(self):
+        if not self.is_trace_enabled():
+            return
+        if 'trace_seed' not in self.variables:
+            self.variables['trace_seed'] = str(self.seed)
+        if 'trace_run_id' not in self.variables:
+            run_id = f"{self.seed}-{int(datetime.now().timestamp() * 1000)}"
+            self.variables['trace_run_id'] = run_id
+        if 'trace_summary' not in self.variables:
+            self.variables['trace_summary'] = "1"
+
+    def set_trace_info(self, info):
+        if not self.is_trace_enabled():
+            return
+        for k, v in info.items():
+            self.variables[k] = v
 
     def update_variables(self, variables):
         """Update the variables dictionary."""
@@ -1472,16 +1875,43 @@ class TagSelectorBase:
         self.seeded_values = {}
         self.scoped_negatives = []
 
-    def _weighted_choice(self, items):
+    def get_rng(self, scope=None):
+        if not self.rng_streams_enabled:
+            return self.rng
+
+        scope_prefix = str(self.variables.get('rng_scope', '')).strip()
+        if scope_prefix and scope:
+            scope_key = f"{scope_prefix}:{scope}"
+        elif scope_prefix:
+            scope_key = scope_prefix
+        else:
+            scope_key = scope or ""
+
+        if scope_key not in self.rng_streams_cache:
+            seed_key = f"{self.seed}:{scope_key}"
+            seed_int = int(hashlib.md5(seed_key.encode("utf-8")).hexdigest(), 16) % (2 ** 32)
+            self.rng_streams_cache[scope_key] = random.Random(seed_int)
+
+        return self.rng_streams_cache[scope_key]
+
+    def get_scoped_index(self, scope, count):
+        if count <= 0:
+            return 0
+        scope_key = scope or ""
+        seed_key = f"{self.seed}:{scope_key}:index"
+        seed_int = int(hashlib.md5(seed_key.encode("utf-8")).hexdigest(), 16) % (2 ** 32)
+        return seed_int % count
+
+    def _weighted_choice(self, items, rng=None):
         """Weighted random selection for lists with weights."""
         has_weights = all(isinstance(item, dict) and 'weight' in item for item in items)
 
         if not has_weights:
-            return self.rng.choice(items)
+            return (rng or self.rng).choice(items)
 
         weights = [item.get('weight', 1.0) for item in items]
         total_weight = sum(weights)
-        rand_val = self.rng.random() * total_weight
+        rand_val = (rng or self.rng).random() * total_weight
         cumsum = 0
 
         for item in items:
@@ -1576,6 +2006,11 @@ class TagReplacerBase:
         # Use more flexible patterns that can handle content with brackets
         self.clean_regex = re.compile(r'\[clean:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
         self.shuffle_regex = re.compile(r'\[shuffle:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
+        self.require_regex = re.compile(r'\[require:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
+        self.forbid_regex = re.compile(r'\[forbid:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
+        self.prefer_regex = re.compile(r'\[prefer:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
+        self.assert_regex = re.compile(r'\[assert:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
+        self.warn_regex = re.compile(r'\[warn:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
 
     def replace_functions(self, text):
         """Process [shuffle:] and [clean:] tags."""
@@ -1602,8 +2037,121 @@ class TagReplacerBase:
             # Remove leading/trailing commas and spaces
             return content.strip(', ')
 
+        def _require(match):
+            content = match.group(1).strip()
+            if not content:
+                return ""
+            var_part = content
+            label = None
+            if '|' in content:
+                var_part, label = [s.strip() for s in content.split('|', 1)]
+            var_name = var_part[1:] if var_part.startswith('$') else var_part
+            if not var_name:
+                return ""
+
+            variables = getattr(self.tag_selector, 'variables', {}) or {}
+            value = variables.get(var_name)
+            missing = value is None or (isinstance(value, str) and value.strip() == "")
+            if missing:
+                return f"<<ERROR_MISSING:{label or var_name}>>"
+            return ""
+
+        def _split_forbid(content):
+            in_quote = False
+            quote_char = ""
+            for i, c in enumerate(content):
+                if in_quote:
+                    if c == quote_char:
+                        in_quote = False
+                        quote_char = ""
+                    continue
+                if c in ("'", '"'):
+                    in_quote = True
+                    quote_char = c
+                    continue
+                if c == '|':
+                    prev_c = content[i - 1] if i > 0 else ""
+                    next_c = content[i + 1] if i + 1 < len(content) else ""
+                    if (prev_c.isspace() or prev_c == "") and (next_c.isspace() or next_c == ""):
+                        return content[:i].strip(), content[i + 1:].strip()
+            return "", ""
+
+        def _forbid(match):
+            content = match.group(1).strip()
+            if not content:
+                return ""
+            condition, neg_text = _split_forbid(content)
+            if not condition or not neg_text:
+                return ""
+
+            variables = getattr(self.tag_selector, 'variables', {}) or {}
+            evaluator = LogicEvaluator(condition, variables)
+            if not evaluator.evaluate(text):
+                return ""
+
+            parts = [t.strip() for t in neg_text.split(',') if t.strip()]
+            return " ".join(f"**{t}**" for t in parts)
+
+        def _prefer(match):
+            content = match.group(1).strip()
+            if not content:
+                return ""
+            condition, pos_text = _split_forbid(content)
+            if not condition or not pos_text:
+                return ""
+
+            variables = getattr(self.tag_selector, 'variables', {}) or {}
+            evaluator = LogicEvaluator(condition, variables)
+            if not evaluator.evaluate(text):
+                return ""
+
+            parts = [t.strip() for t in pos_text.split(',') if t.strip()]
+            return ", ".join(parts)
+
+        def _assert(match):
+            content = match.group(1).strip()
+            if not content:
+                return ""
+            condition, label = _split_forbid(content)
+            if not condition:
+                return ""
+            if not label:
+                label = condition
+
+            variables = getattr(self.tag_selector, 'variables', {}) or {}
+            evaluator = LogicEvaluator(condition, variables)
+            if evaluator.evaluate(text):
+                return ""
+            return f"<<ERROR_ASSERT:{label}>>"
+
+        def _warn(match):
+            content = match.group(1).strip()
+            if not content:
+                return ""
+            condition, message = _split_forbid(content)
+            if not condition:
+                return ""
+            if not message:
+                message = condition
+
+            variables = getattr(self.tag_selector, 'variables', {}) or {}
+            trace = variables.get('trace')
+            debug = variables.get('debug')
+            enabled = str(trace).strip().lower() in ("1", "true", "yes", "on") or str(debug).strip().lower() in ("1", "true", "yes", "on")
+            if not enabled:
+                return ""
+            evaluator = LogicEvaluator(condition, variables)
+            if evaluator.evaluate(text):
+                return f"<<WARN:{message}>>"
+            return ""
+
         text = self.shuffle_regex.sub(_shuffle, text)
         text = self.clean_regex.sub(_clean, text)
+        text = self.require_regex.sub(_require, text)
+        text = self.forbid_regex.sub(_forbid, text)
+        text = self.prefer_regex.sub(_prefer, text)
+        text = self.assert_regex.sub(_assert, text)
+        text = self.warn_regex.sub(_warn, text)
         return text
 
     def get_prompt_file_content(self, filename):
@@ -1644,6 +2192,9 @@ class CharacterReplacer:
         """Get the path to the characters folder."""
         # Check in the UmiAI custom node folder
         node_path = os.path.dirname(os.path.abspath(__file__))
+        util_chars_path = os.path.join(node_path, "umi_utilities", "characters")
+        if os.path.isdir(util_chars_path):
+            return util_chars_path
         chars_path = os.path.join(node_path, "characters")
         if os.path.isdir(chars_path):
             return chars_path

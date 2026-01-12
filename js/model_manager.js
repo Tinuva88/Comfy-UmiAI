@@ -24,6 +24,29 @@
         localStorage.setItem('umi_model_repo', value);
     }
 
+    async function updateUtilitiesBadge() {
+        const badge = document.getElementById('umi-mm-mode');
+        if (!badge) {
+            return;
+        }
+        try {
+            const response = await fetch('/umiapp/utilities/status');
+            if (!response.ok) {
+                throw new Error('status');
+            }
+            const data = await response.json();
+            if (data && data.installed) {
+                badge.textContent = 'Core + Utilities';
+                badge.title = 'umi_utilities detected. Showing full model catalog.';
+                return;
+            }
+        } catch (error) {
+            // Keep default label if status is unavailable.
+        }
+        badge.textContent = 'Core models only';
+        badge.title = 'Utilities-only models are hidden unless umi_utilities is installed.';
+    }
+
     function showModelManager() {
         if (modelManagerPanel) {
             modelManagerPanel.style.display = 'flex';
@@ -48,6 +71,7 @@
                 </div>
                 <div class="umi-mm-status-bar">
                     <span id="umi-mm-status-text">Idle</span>
+                    <span id="umi-mm-mode" class="umi-mm-mode" title="Utilities-only models are hidden unless umi_utilities is installed.">Core models only</span>
                     <button id="umi-mm-download-all" class="umi-mm-btn-primary">Download All Missing/Updates</button>
                 </div>
                 <div class="umi-mm-deps" id="umi-mm-deps" style="display:none;"></div>
@@ -70,6 +94,16 @@
                 align-items: center;
                 justify-content: center;
                 font-family: sans-serif;
+            }
+            .umi-mm-mode {
+                font-size: 12px;
+                color: #9ad0ff;
+                background: rgba(74, 158, 255, 0.15);
+                border: 1px solid rgba(74, 158, 255, 0.35);
+                padding: 4px 8px;
+                border-radius: 999px;
+                margin-right: 8px;
+                white-space: nowrap;
             }
             .umi-mm-overlay {
                 position: absolute;
@@ -236,6 +270,7 @@
         startPolling();
         loadModels();
         updateDependencyStatus();
+        updateUtilitiesBadge();
     }
 
     function hideModelManager() {

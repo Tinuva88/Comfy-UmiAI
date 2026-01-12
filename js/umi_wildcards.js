@@ -570,6 +570,7 @@ A portrait with $theme_outfit
 
     <div class="umi-section">
         <h3>👤 Character Consistency System</h3>
+        <p style="font-size:12px; margin-top:4px; color:#a9c7ff">Requires the <code>umi_utilities</code> custom node.</p>
         <p>Maintain consistent characters across generations with YAML profiles!</p>
 
         <div class="umi-grid-2">
@@ -593,7 +594,7 @@ A portrait with $theme_outfit
         </div>
 
         <div class="callout callout-info" style="margin-top:10px">
-            <strong>💡 Create profiles in:</strong> <code>characters/name/profile.yaml</code>
+            <strong>💡 Create profiles in:</strong> <code>umi_utilities/characters/name/profile.yaml</code>
         </div>
     </div>
 
@@ -627,7 +628,7 @@ A portrait with $theme_outfit
                 <div>
                     <h4 style="margin-top:0">Pose Library</h4>
                     <p style="font-size:12px">30+ poses: standing, sitting, action, expressive, lying, kneeling</p>
-                    <p style="font-size:12px">Edit <code>presets/poses.yaml</code> to add custom poses!</p>
+                    <p style="font-size:12px">Edit <code>umi_utilities/presets/poses.yaml</code> to add custom poses!</p>
                 </div>
                 <div>
                     <h4 style="margin-top:0">Expression Mixer</h4>
@@ -645,7 +646,7 @@ A portrait with $theme_outfit
                 <li>11 lighting styles (natural, dramatic, neon, cinematic)</li>
                 <li>10 atmosphere presets (cheerful, mysterious, romantic)</li>
             </ul>
-            <p style="font-size:12px">Edit <code>presets/scenes.yaml</code> to add custom scenes!</p>
+            <p style="font-size:12px">Edit <code>umi_utilities/presets/scenes.yaml</code> to add custom scenes!</p>
         </details>
 
         <details>
@@ -880,7 +881,7 @@ Ctrl+L → LoRA Browser
 Ctrl+I → Image Browser
 Ctrl+P → Preset Manager
 Ctrl+H → Prompt History
-Ctrl+Y → YAML Tag Manager
+Ctrl+Shift+Y → YAML Tag Manager
 Ctrl+E → File Editor
 Ctrl+? → This shortcuts panel
 
@@ -930,10 +931,10 @@ Light Theme:
         </details>
 
         <details>
-            <summary>🏷️ YAML Tag Manager (Ctrl+Y)</summary>
+            <summary>🏷️ YAML Tag Manager (Ctrl+Shift+Y)</summary>
             <p>Analyze, export, and manage your YAML tags with statistics dashboard!</p>
 
-            <div class="umi-block">Press Ctrl+Y to open YAML Tag Manager
+            <div class="umi-block">Press Ctrl+Shift+Y to open YAML Tag Manager
 
 Statistics Dashboard:
 📝 Total Entries
@@ -1045,7 +1046,7 @@ Full Logic Support:
                 <tr><td><code>Ctrl+I</code></td><td>Open Image Browser</td></tr>
                 <tr><td><code>Ctrl+P</code></td><td>Open Preset Manager</td></tr>
                 <tr><td><code>Ctrl+H</code></td><td>Open Prompt History</td></tr>
-                <tr><td><code>Ctrl+Y</code></td><td>Open YAML Tag Manager</td></tr>
+                <tr><td><code>Ctrl+Shift+Y</code></td><td>Open YAML Tag Manager</td></tr>
                 <tr><td><code>Ctrl+E</code></td><td>Open File Editor</td></tr>
                 <tr><td><code>Ctrl+?</code> or <code>Ctrl+/</code></td><td>Show Shortcuts Panel</td></tr>
                 <tr><td><code>Ctrl+S</code></td><td>Save File (in editor)</td></tr>

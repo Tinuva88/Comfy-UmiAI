@@ -1,0 +1,18 @@
+Missing models for HF repo (present in models_manifest.json but not found in repo):
+models/RMBG/BEN/BEN_Base.pth
+models/RMBG/BEN/model.py
+models/RMBG/BEN2/BEN2.py
+models/RMBG/BEN2/BEN2_Base.pth
+models/RMBG/INSPYRENET/inspyrenet.safetensors
+models/RMBG/RMBG-2.0/BiRefNet_config.py
+models/RMBG/RMBG-2.0/birefnet.py
+models/RMBG/RMBG-2.0/config.json
+models/RMBG/RMBG-2.0/model.safetensors
+models/checkpoints/Milamber.safetensors
+models/llm/JoyCaption-Alpha-Two-Llama3-Q4_K_M.gguf
+models/llm/JoyCaption-Alpha-Two-Llama3-mmproj-f16.gguf
+models/llm/Qwen2.5-Coder-1.5B-Instruct-abliterated-Q4_K_M.gguf
+models/llm/Wingless_Imp_8B.Q4_K_M.gguf
+models/llm/dolphin-2.9.4-llama3.1-8b-Q4_K_M.gguf
+models/llm/llava-v1.5-7b-Q4_K.gguf
+models/llm/llava-v1.5-7b-mmproj-Q4_0.gguf

@@ -38,7 +38,7 @@ from .shared_utils import (
     escape_unweighted_colons, parse_wildcard_weight, get_all_wildcard_paths, log_prompt_to_history,
     LogicEvaluator, DynamicPromptReplacer, VariableReplacer, NegativePromptGenerator,
     ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase,
-    CharacterReplacer
+    CharacterReplacer, resolve_lora_alias
 )
 
 # ==============================================================================
@@ -206,6 +206,9 @@ def load_umi_settings():
     settings_path = os.path.join(os.path.dirname(__file__), "umi_settings.json")
     defaults = {
         'use_folder_paths': False,  # False = __MyFile__, True = __Series/MyFile__
+        'csv_namespace': True,  # Add $csv_ prefixed variables for CSV columns
+        'yaml_namespace': True,  # Add $yaml_ prefixed variables for YAML entries
+        'rng_streams': False,  # Use deterministic RNG streams per scope/tag
     }
     
     if os.path.exists(settings_path):
@@ -246,6 +249,10 @@ def read_file_lines(file):
             continue
         if line.startswith('#'):
             continue
+        if '//' in line:
+            line = re.sub(r'(?<!:)//[^,\n]*', '', line).strip()
+            if not line:
+                continue
         if '#' in line:
             line = line.split('#')[0].strip()
 
@@ -254,6 +261,98 @@ def read_file_lines(file):
         lines.append(parsed)
 
     return lines
+
+def append_trace_summary(prompt, variables):
+    summary = variables.get('trace_summary')
+    if not summary or str(summary).strip() in ("0", "false", "False"):
+        return prompt
+
+    def _level(val):
+        if val is None:
+            return 1
+        if isinstance(val, (int, float)):
+            return max(0, int(val))
+        s = str(val).strip()
+        if s.isdigit():
+            return int(s)
+        if s.lower() in ("true", "yes", "on"):
+            return 1
+        return 0
+
+    level = _level(variables.get('trace'))
+    parts = [
+        "TRACE",
+        f"seed={variables.get('trace_seed', '')}",
+        f"run={variables.get('trace_run_id', '')}",
+    ]
+    if variables.get('trace_last_type'):
+        parts.append(f"type={variables.get('trace_last_type')}")
+    if variables.get('trace_last_source'):
+        parts.append(f"src={variables.get('trace_last_source')}")
+    if variables.get('trace_last_pick'):
+        parts.append(f"pick={variables.get('trace_last_pick')}")
+    if level >= 2:
+        if variables.get('trace_row_id'):
+            parts.append(f"row_id={variables.get('trace_row_id')}")
+        if variables.get('trace_row_index'):
+            parts.append(f"row={variables.get('trace_row_index')}")
+        if variables.get('trace_yaml_entry'):
+            parts.append(f"yaml={variables.get('trace_yaml_entry')}")
+        if variables.get('trace_last_roll') and variables.get('trace_last_total_weight'):
+            parts.append(f"roll={variables.get('trace_last_roll')}/{variables.get('trace_last_total_weight')}")
+        if variables.get('trace_last_condition'):
+            parts.append(f"cond={variables.get('trace_last_condition')}")
+        if variables.get('trace_last_branch'):
+            parts.append(f"branch={variables.get('trace_last_branch')}")
+        if variables.get('trace_last_var') and variables.get('trace_last_var_source'):
+            parts.append(f"var={variables.get('trace_last_var')}:{variables.get('trace_last_var_source')}")
+
+    trace_line = "<<{}>>".format(" | ".join(p for p in parts if p))
+    return f"{trace_line}\n{prompt}"
+
+def append_debug_summary(prompt, variables):
+    summary = variables.get('debug_summary')
+    if not summary or str(summary).strip() in ("0", "false", "False"):
+        return prompt
+
+    def _level(val):
+        if val is None:
+            return 1
+        if isinstance(val, (int, float)):
+            return max(0, int(val))
+        s = str(val).strip()
+        if s.isdigit():
+            return int(s)
+        if s.lower() in ("true", "yes", "on"):
+            return 1
+        return 0
+
+    level = _level(variables.get('debug'))
+    parts = [
+        "DBG",
+        f"seed={variables.get('debug_seed', '')}",
+        f"run={variables.get('debug_run_id', '')}",
+    ]
+    if variables.get('debug_last_type'):
+        parts.append(f"type={variables.get('debug_last_type')}")
+    if variables.get('debug_last_source'):
+        parts.append(f"src={variables.get('debug_last_source')}")
+    if variables.get('debug_last_pick'):
+        parts.append(f"pick={variables.get('debug_last_pick')}")
+    if level >= 2:
+        if variables.get('debug_last_count'):
+            parts.append(f"count={variables.get('debug_last_count')}")
+        if variables.get('debug_row_id'):
+            parts.append(f"row_id={variables.get('debug_row_id')}")
+        if variables.get('debug_row_index'):
+            parts.append(f"row={variables.get('debug_row_index')}")
+        if variables.get('debug_yaml_entry'):
+            parts.append(f"yaml={variables.get('debug_yaml_entry')}")
+        if variables.get('debug_last_roll') and variables.get('debug_last_total_weight'):
+            parts.append(f"roll={variables.get('debug_last_roll')}/{variables.get('debug_last_total_weight')}")
+
+    dbg_line = "<<{}>>".format(" | ".join(p for p in parts if p))
+    return f"{dbg_line}\n{prompt}"
 
 def parse_wildcard_range(range_str, num_variants):
     if range_str is None:
@@ -361,17 +460,25 @@ class TagLoader(TagLoaderBase):
 
     def load_prompt_file(self, file_key):
         """Phase 6: Load entire .txt file content as a prompt (no parsing)"""
-        key_lower = file_key.lower()
-        if key_lower in self.txt_lookup:
-            full_path = self.txt_lookup[key_lower]
-            try:
-                with open(full_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                return content
-            except Exception as e:
-                if self.verbose:
-                    print(f"[UmiAI] Error reading prompt file {full_path}: {e}")
-                return None
+        key = file_key.strip()
+        if key.lower().endswith('.txt'):
+            key = key[:-4]
+        key_lower = key.lower()
+        lookup_keys = [key_lower]
+        if '/' in key_lower:
+            lookup_keys.append(key_lower.split('/')[-1])
+
+        for lookup_key in lookup_keys:
+            if lookup_key in self.txt_lookup:
+                full_path = self.txt_lookup[lookup_key]
+                try:
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        content = f.read().strip()
+                    return content
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[UmiAI] Error reading prompt file {full_path}: {e}")
+                    return None
         return None
 
     def build_index(self):
@@ -589,6 +696,24 @@ class TagSelector(TagSelectorBase):
         self.resolved_seeds = {}
         self.selected_entries = {} 
 
+    def _set_yaml_vars(self, title, entry_details):
+        if not UMI_SETTINGS.get('yaml_namespace', True):
+            return
+        if title:
+            self.variables['yaml_title'] = str(title)
+        tags = entry_details.get('tags', [])
+        if tags:
+            self.variables['yaml_tags'] = ", ".join(str(t) for t in tags)
+        description = entry_details.get('description')
+        if description:
+            self.variables['yaml_description'] = str(description)
+        prefixes = entry_details.get('prefixes', [])
+        if prefixes:
+            self.variables['yaml_prefixes'] = ", ".join(str(p) for p in prefixes)
+        suffixes = entry_details.get('suffixes', [])
+        if suffixes:
+            self.variables['yaml_suffixes'] = ", ".join(str(s) for s in suffixes)
+
     def update_variables(self, variables):
         self.variables = variables
 
@@ -599,20 +724,28 @@ class TagSelector(TagSelectorBase):
         self.selected_entries.clear()
         self.scoped_negatives = []
 
-    def _weighted_choice(self, items):
+    def _weighted_choice(self, items, rng=None):
         """Fix 13: Weighted random selection for lists with weights"""
         # Check if items have weights
         has_weights = all(isinstance(item, dict) and 'weight' in item for item in items)
 
         if not has_weights:
             # Fall back to normal choice for strings or unweighted dicts
-            return self.rng.choice(items)
+            return (rng or self.rng).choice(items)
 
         # Weighted selection
         weights = [item.get('weight', 1.0) for item in items]
         total_weight = sum(weights)
-        rand_val = self.rng.random() * total_weight
+        rand_val = (rng or self.rng).random() * total_weight
         cumsum = 0
+
+        if self.is_debug_enabled():
+            self.variables['debug_last_roll'] = f"{rand_val:.6f}"
+            self.variables['debug_last_total_weight'] = f"{total_weight:.6f}"
+        self.set_trace_info({
+            "trace_last_roll": f"{rand_val:.6f}",
+            "trace_last_total_weight": f"{total_weight:.6f}",
+        })
 
         for item in items:
             cumsum += item.get('weight', 1.0)
@@ -633,18 +766,38 @@ class TagSelector(TagSelectorBase):
             return positive
         return text
 
-    def get_tag_choice(self, parsed_tag, tags, logic_filter=None):
+    def get_tag_choice(self, parsed_tag, tags, logic_filter=None, rng=None):
+        rng = rng or self.get_rng(parsed_tag)
         if isinstance(tags, list) and len(tags) > 0 and isinstance(tags[0], dict):
             # Check if it's a CSV file (has non-tag/weight keys)
             first_entry = tags[0]
             if not ('value' in first_entry or 'weight' in first_entry or 'tags' in first_entry):
                 # This is CSV data
-                row = self.rng.choice(tags)
+                row_index = rng.randrange(len(tags))
+                row = tags[row_index]
                 # CSV variable injection: directly inject columns into variables dict
+                if self.is_debug_enabled():
+                    self.variables['debug_last_type'] = "csv"
+                    self.variables['debug_last_source'] = parsed_tag
+                    self.variables['debug_row_index'] = str(row_index)
+                    self.variables['debug_last_pick'] = str(row_index)
+                    if isinstance(row, dict) and 'id' in row:
+                        self.variables['debug_row_id'] = str(row.get('id'))
+                self.set_trace_info({
+                    "trace_last_type": "csv",
+                    "trace_last_source": parsed_tag,
+                    "trace_row_index": str(row_index),
+                    "trace_last_pick": str(row_index),
+                    "trace_row_id": str(row.get('id')) if isinstance(row, dict) and 'id' in row else "",
+                })
                 for k, v in row.items():
                     var_name = k.strip()
                     if var_name and var_name not in self.variables:
                         self.variables[var_name] = v.strip()
+                    if var_name and UMI_SETTINGS.get('csv_namespace', True):
+                        namespaced = f"csv_{var_name}"
+                        if namespaced not in self.variables:
+                            self.variables[namespaced] = v.strip()
                 # Also return the old format for backwards compatibility
                 vars_out = []
                 for k, v in row.items():
@@ -672,6 +825,8 @@ class TagSelector(TagSelectorBase):
             if not filtered_tags:
                 if self.verbose:
                     print(f"[UmiAI] WARNING: No entries in '{parsed_tag}' matched logic '{logic_filter}'.")
+                if self.is_failfast_enabled():
+                    return f"<<ERROR_NO_MATCHES:{logic_filter} in {parsed_tag}>>"
                 return f"[NO_MATCHES: {logic_filter} in {parsed_tag}]"
 
             tags = filtered_tags
@@ -679,7 +834,7 @@ class TagSelector(TagSelectorBase):
         seed_match = re.match(r'#([0-9|]+)\$\$(.*)', parsed_tag)
         if seed_match:
             seed_options = seed_match.group(1).split('|')
-            chosen_seed = self.rng.choice(seed_options)
+            chosen_seed = rng.choice(seed_options)
             
             if chosen_seed in self.seeded_values:
                 selected = self.seeded_values[chosen_seed]
@@ -687,7 +842,7 @@ class TagSelector(TagSelectorBase):
             
             unused = [t for t in tags if t not in self.used_values]
             # Fix 13: Use weighted choice if tags have weights
-            selected = self._weighted_choice(unused) if unused else self._weighted_choice(tags)
+            selected = self._weighted_choice(unused, rng=rng) if unused else self._weighted_choice(tags, rng=rng)
 
             self.seeded_values[chosen_seed] = selected
             self.used_values[selected] = True
@@ -699,7 +854,7 @@ class TagSelector(TagSelectorBase):
         else:
             unused = [t for t in tags if t not in self.used_values]
             # Fix 13: Use weighted choice if tags have weights
-            selected = self._weighted_choice(unused) if unused else self._weighted_choice(tags)
+            selected = self._weighted_choice(unused, rng=rng) if unused else self._weighted_choice(tags, rng=rng)
 
         if selected:
             # Fix 13: Extract value if selected is a weighted dict
@@ -709,14 +864,32 @@ class TagSelector(TagSelectorBase):
                 selected_key = selected
 
             self.used_values[selected_key] = True
+            entry_title = selected_key
             entry_details = self.tag_loader.get_entry_details(selected_key)
             if entry_details:
                 self.selected_entries[parsed_tag] = entry_details
+                self._set_yaml_vars(entry_title, entry_details)
+                if self.is_debug_enabled():
+                    self.variables['debug_yaml_entry'] = str(entry_title)
+                self.set_trace_info({
+                    "trace_yaml_entry": str(entry_title),
+                    "trace_last_type": "yaml",
+                    "trace_last_source": parsed_tag,
+                })
                 if entry_details['prompts']:
-                    selected_key = self.rng.choice(entry_details['prompts'])
+                    selected_key = rng.choice(entry_details['prompts'])
             if isinstance(selected_key, str) and '#' in selected_key:
                 selected_key = selected_key.split('#')[0].strip()
             selected_key = self.process_scoped_negative(selected_key)
+            if self.is_debug_enabled():
+                self.variables['debug_last_type'] = "wildcard"
+                self.variables['debug_last_source'] = parsed_tag
+                self.variables['debug_last_pick'] = str(selected_key)
+            self.set_trace_info({
+                "trace_last_type": "wildcard",
+                "trace_last_source": parsed_tag,
+                "trace_last_pick": str(selected_key),
+            })
 
             return selected_key
 
@@ -742,9 +915,11 @@ class TagSelector(TagSelectorBase):
             return resolved
         return value
 
-    def get_tag_group_choice(self, parsed_tag, groups, tags):
+    def get_tag_group_choice(self, parsed_tag, groups, tags, rng=None):
         if not isinstance(tags, dict):
             return ""
+        rng = rng or self.get_rng(parsed_tag)
+        rng = self.get_rng(parsed_tag)
 
         resolved_groups = []
         for g in groups:
@@ -781,7 +956,7 @@ class TagSelector(TagSelectorBase):
             seed_match = re.match(r'#([0-9|]+)\$\$(.*)', parsed_tag)
             seed_id = seed_match.group(1) if seed_match else None
             
-            selected_title = self.rng.choice(candidates)
+            selected_title = rng.choice(candidates)
             if seed_id and seed_id in self.seeded_values:
                 selected_title = self.seeded_values[seed_id]
             elif seed_id:
@@ -790,8 +965,35 @@ class TagSelector(TagSelectorBase):
             entry_details = self.tag_loader.get_entry_details(selected_title)
             if entry_details:
                 self.selected_entries[parsed_tag] = entry_details
+                self._set_yaml_vars(selected_title, entry_details)
+                if self.is_debug_enabled():
+                    self.variables['debug_yaml_entry'] = str(selected_title)
+                self.set_trace_info({
+                    "trace_yaml_entry": str(selected_title),
+                    "trace_last_type": "yaml",
+                    "trace_last_source": parsed_tag,
+                })
                 if entry_details['prompts']:
-                    return self.resolve_wildcard_recursively(self.rng.choice(entry_details['prompts']), seed_id)
+                    chosen_prompt = rng.choice(entry_details['prompts'])
+                    if self.is_debug_enabled():
+                        self.variables['debug_last_type'] = "yaml"
+                        self.variables['debug_last_source'] = parsed_tag
+                        self.variables['debug_last_pick'] = str(chosen_prompt)
+                    self.set_trace_info({
+                        "trace_last_type": "yaml",
+                        "trace_last_source": parsed_tag,
+                        "trace_last_pick": str(chosen_prompt),
+                    })
+                    return self.resolve_wildcard_recursively(chosen_prompt, seed_id)
+            if self.is_debug_enabled():
+                self.variables['debug_last_type'] = "yaml"
+                self.variables['debug_last_source'] = parsed_tag
+                self.variables['debug_last_pick'] = str(selected_title)
+            self.set_trace_info({
+                "trace_last_type": "yaml",
+                "trace_last_source": parsed_tag,
+                "trace_last_pick": str(selected_title),
+            })
             return self.resolve_wildcard_recursively(selected_title, seed_id)
 
         # Fix 11: Better error messages - show which logic expression failed to match
@@ -807,11 +1009,19 @@ class TagSelector(TagSelectorBase):
         
         self.previously_selected_tags[tag] += 1
         parsed_tag = parse_tag(tag)
+        self.init_debug_context()
+        self.init_trace_context()
+        scope_override = None
+        if parsed_tag.startswith('@') and ':' in parsed_tag:
+            scope_override, parsed_tag = parsed_tag[1:].split(':', 1)
+            scope_override = scope_override.strip()
+            parsed_tag = parsed_tag.strip()
+        rng = self.get_rng(scope_override or parsed_tag)
         
         if '*' in parsed_tag or '?' in parsed_tag:
             matches = self.tag_loader.get_glob_matches(parsed_tag)
             if matches:
-                self.rng.shuffle(matches)
+                rng.shuffle(matches)
                 for selected_key in matches:
                     result = self.select(selected_key, groups)
                     if result and str(result).strip():
@@ -819,6 +1029,8 @@ class TagSelector(TagSelectorBase):
             # Fix 11: Better error messages - indicate glob pattern found no matches
             if self.verbose:
                 print(f"[UmiAI] WARNING: Glob pattern '{parsed_tag}' matched no wildcard files.")
+            if self.is_failfast_enabled():
+                return f"<<ERROR_GLOB_NO_MATCHES:{parsed_tag}>>"
             return f"[GLOB_NO_MATCHES: {parsed_tag}]"
 
         sequential = False
@@ -826,12 +1038,33 @@ class TagSelector(TagSelectorBase):
             sequential = True
             parsed_tag = parsed_tag[1:]
 
+        if parsed_tag.startswith('@'):
+            filename = parsed_tag[1:].strip()
+            file_content = self.tag_loader.load_prompt_file(filename)
+            if file_content:
+                if self.is_debug_enabled():
+                    self.variables['debug_last_type'] = "prompt_file"
+                    self.variables['debug_last_source'] = parsed_tag
+                    self.variables['debug_last_pick'] = filename
+                self.set_trace_info({
+                    "trace_last_type": "prompt_file",
+                    "trace_last_source": parsed_tag,
+                    "trace_last_pick": filename,
+                })
+                return file_content
+            return f"[PROMPT_FILE_NOT_FOUND: {filename}]"
+
+        if not parsed_tag.startswith('#') and '*' not in parsed_tag and '?' not in parsed_tag:
+            parsed_tag = self.tag_loader.resolve_wildcard_alias(parsed_tag)
+
         if '$$' in parsed_tag and not parsed_tag.startswith('#'):
             range_part, file_part = parsed_tag.split('$$', 1)
             if any(c.isdigit() for c in range_part) or '-' in range_part:
+                if '*' not in file_part and '?' not in file_part:
+                    file_part = self.tag_loader.resolve_wildcard_alias(file_part)
                 tags = self.tag_loader.load_tags(file_part, self.verbose)
                 if isinstance(tags, list):
-                    return process_wildcard_range(parsed_tag, tags, self.rng)
+                    return process_wildcard_range(parsed_tag, tags, rng)
 
         if parsed_tag.startswith('#'):
             # Tag-based selection: #tag or #seed$$tag
@@ -851,14 +1084,17 @@ class TagSelector(TagSelectorBase):
 
                 # Filter by tag and convert to format expected by get_tag_group_choice
                 if isinstance(tags, dict):
-                    return self.get_tag_group_choice(parsed_tag, [tag_name], tags)
+                    return self.get_tag_group_choice(parsed_tag, [tag_name], tags, rng=rng)
             if isinstance(tags, list):
-                return self.get_tag_choice(parsed_tag, tags)
+                return self.get_tag_choice(parsed_tag, tags, rng=rng)
 
         tags = self.tag_loader.load_tags(parsed_tag, self.verbose)
         
         if sequential and isinstance(tags, list) and tags:
-            idx = self.global_seed % len(tags)
+            if self.rng_streams_enabled:
+                idx = self.get_scoped_index(scope_override or parsed_tag, len(tags))
+            else:
+                idx = self.global_seed % len(tags)
             selected = tags[idx]
             if isinstance(selected, dict):
                  vars_out = []
@@ -868,16 +1104,27 @@ class TagSelector(TagSelectorBase):
             if '#' in selected:
                 selected = selected.split('#')[0].strip()
             selected = self.process_scoped_negative(selected)
+            if self.is_debug_enabled():
+                self.variables['debug_last_type'] = "wildcard"
+                self.variables['debug_last_source'] = parsed_tag
+                self.variables['debug_last_pick'] = str(selected)
+            self.set_trace_info({
+                "trace_last_type": "wildcard",
+                "trace_last_source": parsed_tag,
+                "trace_last_pick": str(selected),
+            })
             return self.resolve_wildcard_recursively(selected, self.global_seed)
 
         if groups:
-            return self.get_tag_group_choice(parsed_tag, groups, tags)
+            return self.get_tag_group_choice(parsed_tag, groups, tags, rng=rng)
         if tags:
-            return self.get_tag_choice(parsed_tag, tags)
+            return self.get_tag_choice(parsed_tag, tags, rng=rng)
 
         # Fix 11: Better error messages - provide helpful feedback for missing wildcards
         if self.verbose:
             print(f"[UmiAI] WARNING: Wildcard '{parsed_tag}' not found or is empty.")
+        if self.is_failfast_enabled():
+            return f"<<ERROR_WILDCARD_NOT_FOUND:{parsed_tag}>>"
         return f"[WILDCARD_NOT_FOUND: {parsed_tag}]" 
 
     def get_prefixes_and_suffixes(self):
@@ -1010,7 +1257,7 @@ class TagReplacer(TagReplacerBase):
             return ""
 
         # Phase 6: Support @filename to load full prompt file
-        if match.startswith('@'):
+        if match.startswith('@') and ':' not in match:
             filename = match[1:]
             return self.get_prompt_file_content(filename)
 
@@ -1300,6 +1547,8 @@ class LoRAHandler:
             else:
                 name = content
                 strength = 1.0
+
+            name = resolve_lora_alias(name, get_all_wildcard_paths())
 
             lora_path = folder_paths.get_full_path("loras", name)
             if not lora_path:
@@ -1804,7 +2053,8 @@ class UmiAIWildcardNode:
         options = {
             'verbose': False, 
             'seed': seed,
-            'use_folder_paths': use_folder_paths
+            'use_folder_paths': use_folder_paths,
+            'rng_streams': UMI_SETTINGS.get('rng_streams', False),
         }
         
         # Sync node toggle to global settings so autocomplete uses same setting
@@ -1896,6 +2146,11 @@ class UmiAIWildcardNode:
         prompt = neg_gen.strip_negative_tags(prompt)
         prompt = re.sub(r',\s*,', ',', prompt)
         prompt = re.sub(r'\s+', ' ', prompt).strip().strip(',')
+
+        if tag_selector.is_trace_enabled():
+            prompt = append_trace_summary(prompt, variable_replacer.variables)
+        if tag_selector.is_debug_enabled():
+            prompt = append_debug_summary(prompt, variable_replacer.variables)
 
         prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(prompt, model, clip, lora_tags_behavior, lora_cache_limit, lora_max_tags)
 
@@ -2307,6 +2562,13 @@ def umi_build_face_details(info):
         parts.append(f"({info['face']}:1.0)")
     return ", ".join(parts)
 
+def _resolve_umi_asset_path(*parts):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    util_path = os.path.join(base_dir, "umi_utilities", *parts)
+    if os.path.exists(util_path):
+        return util_path
+    return os.path.join(base_dir, *parts)
+
 
 class UmiCharacterCreator:
     """Create or update character profiles with VNCCS-compatible structure.
@@ -2367,8 +2629,8 @@ class UmiCharacterCreator:
             character_name = "NewCharacter"
         
         # Setup paths
-        node_path = os.path.dirname(os.path.abspath(__file__))
-        char_path = os.path.join(node_path, "characters", character_name)
+        char_root = _resolve_umi_asset_path("characters")
+        char_path = os.path.join(char_root, character_name)
         sheets_path = os.path.join(char_path, "Sheets")
         faces_path = os.path.join(char_path, "Faces")
         config_path = os.path.join(char_path, "config.json")
@@ -2667,7 +2929,7 @@ class UmiDatasetGenerator:
 
 def load_emotions_config():
     """Load emotions.json from the emotions-config folder."""
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emotions-config", "emotions.json")
+    config_path = _resolve_umi_asset_path("emotions-config", "emotions.json")
     if os.path.exists(config_path):
         try:
             with open(config_path, 'r', encoding='utf-8') as f:

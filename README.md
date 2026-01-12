@@ -15,6 +15,7 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 ### 🔋 Prompt Processing & Logic
 * **🔀 Advanced Logic Engine:** Full support for `AND`, `OR`, `NOT`, `XOR`, and `( )` grouping. Use it to filter wildcards or conditionally change prompt text.
 * **🧠 Persistent Variables:** Define a choice once (`$hair={Red|Blue}`) and reuse it (`$hair`) anywhere to ensure consistency across your prompt.
+* **🧩 Defaults + Debug:** Use `${var|fallback}` for null-safe variables and `$debug={0|1}` for quick diagnostics.
 * **🎲 Dynamic Wildcards:** Replace `__tagname__` with random selections from text files, with support for weighted ranges (`1-3$$tagname`).
 * **🔄 Random Choices:** Use `{option1|option2|option3}` to randomly pick variants within your prompt.
 * **📊 Weighted Choices:** Use `{25%Red|75%Blue}` for precise probability control over random selections.
@@ -35,6 +36,8 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 * **🔍 Prompt Linting:** Automatic error detection with expandable error panel. Click the lint bar to see all issues.
 * **🔧 Syntax Fix:** Click Fix buttons to automatically repair broken syntax (brackets, wildcards, YAML tags).
 * **🧹 Auto-Clean:** Toggle button to automatically clean up spaces, commas, and format BREAK keywords.
+* **🧪 Debug Summary:** Set `$debug={1}` to auto-prepend a compact `<<DBG ...>>` line with seed/run and last pick info (disable with `$debug_summary=0`).
+* **🧭 Trace Mode:** Set `$trace={1}` to include provenance (`<<TRACE ...>>`) like branch, source, and variable origins (disable with `$trace_summary=0`).
 * **💡 Smart Autocomplete:** Type trigger characters for suggestions:
   - `__` → Wildcard files
   - `<[` → YAML tags
@@ -61,12 +64,14 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 * **🖼️ Image Browser (Ctrl+I):** Booru-style gallery for generated images with metadata extraction and prompt copying.
 * **💾 Preset Manager (Ctrl+P):** Save and load complete node configurations instantly.
 * **📜 Prompt History (Ctrl+H):** Automatic tracking of all prompts with search and one-click restore.
-* **🏷️ YAML Tag Manager (Ctrl+Y):** Analyze and export your YAML tag database.
+* **🏷️ YAML Tag Manager (Ctrl+Shift+Y):** Analyze and export your YAML tag database.
 * **📝 File Editor (Ctrl+E):** Edit wildcards and YAML files directly in ComfyUI.
 
 ### 📁 Data & File Support
 * **📊 CSV Data Injection:** Load spreadsheet data (.csv) and map columns to variables (e.g., $name, $outfit) for complex character handling.
+  - Namespaced CSV helpers: `$csv_name`, `$csv_outfit` (toggle via `csv_namespace`).
 * **📝 Multiple File Formats:** Support for TXT (line-by-line lists), YAML (structured cards with metadata), and CSV (tabular data).
+  - YAML helpers from tag logic: `$yaml_title`, `$yaml_tags`, `$yaml_description` (toggle via `yaml_namespace`).
 * **🌍 Global Presets:** Automatically load variables from `wildcards/globals.yaml` into *every* prompt.
 * **🗂️ Hierarchical YAML:** Support for nested category structures with Prefix/Suffix systems.
 
@@ -75,6 +80,9 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 * **➖ Scoped Negatives:** Use `--neg: negative text` syntax to embed negative prompts directly in your workflow.
 * **🔁 Recursive Processing:** Iterative prompt refinement with cycle detection (max 50 passes).
 * **🎯 Seeded Determinism:** Reproducible random selections via seed control for consistent results.
+* **🧭 RNG Streams:** Optional deterministic sub-streams per tag/scope (toggle `rng_streams`, use `$rng_scope` to group or `__@scope:tag__` per pick).
+* **⚙️ Settings File:** Configure `use_folder_paths`, `csv_namespace`, `yaml_namespace`, and `rng_streams` in `umi_settings.json`.
+* **🧷 Aliases:** Add `aliases.yaml` in any wildcards folder to map wildcard/LoRA aliases.
 
 ---
 
@@ -96,7 +104,9 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 ### Method 2: ComfyUI Manager
 * **Install via Git URL:** Copy the URL of this repository and paste it into ComfyUI Manager.
 
-### Optional: Sheet Tools and QWEN Encoder Dependencies
+### Optional: Utilities Node (sheet tools, QWEN, dataset helpers)
+Utilities live in a separate custom node folder called `umi_utilities`. Install it only if you want the VNCCS-inspired tools (sheet tools, QWEN detailer/encoder, dataset helpers, character manager, presets).
+
 The sheet tools (RMBG2, sheet cropper, mask utilities) and QWEN encoder require extra Python packages:
 ```bash
 pip install opencv-python torchvision transformers transparent-background
@@ -147,8 +157,20 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 | **Logic (Wildcard)**| `__[Logic]__` | `__[fire OR (ice AND magic)]__` |
 | **Operators** | `AND`, `OR`, `NOT`, `XOR` | `[if (A OR B) AND NOT C : ...]` |
 | **Variables** | `$var={opts}` | `$hair={Red\|Blue}` |
+| **Local Variables** | `$@var=...` | `[if $style: $@tone=soft; $@tone lighting | neutral]` |
+| **Default Value** | `${var\|fallback}` | `${style\|neutral}` |
+| **Coalesce** | `coalesce($a,$b,"x")` | `coalesce($style,$theme,"neutral")` |
 | **Equality Check** | `$var=val` | `[if $hair=Red : Fire Magic]` |
+| **Require Var** | `[require:$var\|LABEL]` | `[require:$style\|STYLE]` |
+| **Assert** | `[assert: cond \| LABEL]` | `[assert: $style \| STYLE_MISSING]` |
+| **Warn** | `[warn: cond \| message]` | `[warn: $style==\"\" \| style empty]` |
+| **Fail-Fast** | `$fail_fast=1` | `$fail_fast=1` |
+| **Forbid Tags** | `[forbid: cond \| tag1, tag2]` | `[forbid: $style==clean \| grain]` |
+| **Prefer Tags** | `[prefer: cond \| tag1, tag2]` | `[prefer: $style==clean \| crisp]` |
+| **CSV Namespace** | `$csv_name` | `$csv_outfit` |
+| **YAML Namespace** | `$yaml_title` | `$yaml_tags` |
 | **Wildcards** | `__filename__` | `__colors__` |
+| **Scoped RNG Wildcard** | `__@scope:tag__` | `__@style:colors__` |
 | **Weighted Range** | `1-3$$filename` | `2-4$$accessories__` |
 | **YAML Tags** | `<[tagname]>` | `<[Demihuman]>` |
 | **Character** | `@@name:outfit:emotion@@` | `@@elena:casual:happy@@` |
@@ -158,6 +180,9 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 | **Set Size** | `@@w=X, h=Y@@` | `@@width=1024, height=1536@@` |
 | **Negative Prompt** | `--neg: text` | `--neg: blurry, low quality` |
 | **Comments** | `//` or `#` | `// This is a comment` |
+| **Debug Toggle** | `$debug={0\|1\|2}` | `$debug={2}` |
+| **Trace Toggle** | `$trace={0\|1\|2}` | `$trace={2}` |
+| **RNG Scope** | `$rng_scope=group` | `$rng_scope=style` |
 
 ### ⌨️ Keyboard Shortcuts
 
@@ -167,7 +192,7 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 | **Ctrl+I** | Open Image Browser |
 | **Ctrl+P** | Open Preset Manager |
 | **Ctrl+H** | Open Prompt History |
-| **Ctrl+Y** | Open YAML Tag Manager |
+| **Ctrl+Shift+Y** | Open YAML Tag Manager |
 | **Ctrl+E** | Open File Editor |
 | **Ctrl+?** | Open Shortcuts & Syntax Reference |
 | **Ctrl+M** | Open Model Manager |
@@ -191,9 +216,18 @@ UmiAI features a unified logic engine that works in both your **Prompts** and yo
 * **STARTSWITH**: Prefix check.
 * **ENDSWITH**: Suffix check.
 * **()**: Parentheses for grouping complex logic.
+* **Quotes + Comments**: Use `"multi word"` tags and `//` comments inside logic blocks.
 
 ### 1. Logic in Prompts (`[if ...]`)
 You can change the text of your prompt based on other words present in the prompt (or variables).
+
+Constraint helpers (optional sugar):
+* `[require:$var|LABEL]` to emit `<<ERROR_MISSING:LABEL>>` when a variable is missing.
+* `[assert: cond | LABEL]` to emit `<<ERROR_ASSERT:LABEL>>` when a condition fails.
+* `[warn: cond | message]` to emit `<<WARN:message>>` when a condition is true (only in debug/trace).
+* `[forbid: condition | tag1, tag2]` to push tags into the negative prompt when condition is true.
+* `[prefer: condition | tag1, tag2]` to inject positive tags when condition is true.
+* Local variables: use `$@var=...` inside a branch and `$@var` inside the same branch only.
 
 ```text
 // Simple check: If 'red' AND 'blue' are present, output 'Purple'.
@@ -212,6 +246,10 @@ You can change the text of your prompt based on other words present in the promp
 
 // Nested conditions
 [if fantasy : [if magic AND NOT tech : wizard | knight | modern soldier]]
+
+// Comments and quoted tags in logic
+[if "ice mage" AND $style=="clean" // dev note
+ : arcane frost | neutral]
 ```
 
 ### Quick Test Prompt
@@ -361,18 +399,19 @@ Maintain consistent character appearances across multiple generations with outfi
 ### Character Folder Structure
 ```
 ComfyUI-UmiAI/
-└── characters/
-    ├── elena/
-    │   ├── profile.yaml      # Character definition
-    │   └── reference.png     # Reference image for IP-Adapter
-    └── kai/
-        ├── profile.yaml
-        └── reference.png
+  umi_utilities/
+    characters/
+      elena/
+        profile.yaml      # Character definition
+        reference.png     # Reference image for IP-Adapter
+      kai/
+        profile.yaml
+        reference.png
 ```
 
 ### Creating a Character Profile
 
-Create `characters/[name]/profile.yaml`:
+Create `umi_utilities/characters/[name]/profile.yaml`:
 
 ```yaml
 name: Elena
@@ -441,7 +480,7 @@ A portrait of @@elena:formal:happy@@ in a garden, __ArtStyle__
 
 ### API Endpoint
 
-Access character data via API for external tools:
+Access character data via API for external tools (requires `umi_utilities` installed):
 ```
 GET /umiapp/characters
 ```
@@ -470,30 +509,30 @@ Generate camera angle prompts for multi-angle LoRAs:
 
 ### Pose Library
 
-**UmiAI Pose Library** - 30+ built-in poses loaded from `presets/poses.yaml`:
+**UmiAI Pose Library** - 30+ built-in poses loaded from `umi_utilities/presets/poses.yaml`:
 - Categories: standing, sitting, action, expressive, lying, kneeling, leaning
 - Outputs: `pose_prompt`, `pose_tags`
 
 ### Expression Mixer
 
 **UmiAI Expression Mixer** - Blend emotions with weights:
-- 40+ emotions from `presets/emotions.yaml`
+- 40+ emotions from `umi_utilities/presets/emotions.yaml`
 - Mix up to 3 emotions with percentage weights
 - Example: happy:60% + excited:40%
 
 ### Scene Composer
 
 **UmiAI Scene Composer** - Combine backgrounds, lighting, atmosphere:
-- 50+ backgrounds from `presets/scenes.yaml`
+- 50+ backgrounds from `umi_utilities/presets/scenes.yaml`
 - 11 lighting styles
 - 10 atmosphere presets
 
 ### Adding Custom Presets
 
-Edit the YAML files in `presets/` folder:
+Edit the YAML files in `umi_utilities/presets/` folder:
 
 ```yaml
-# In presets/poses.yaml
+# In umi_utilities/presets/poses.yaml
 my_custom_pose:
   prompt: "your pose description"
   tags: ["tag1", "tag2"]
@@ -550,9 +589,9 @@ Download recommended models directly in ComfyUI:
 ### Available Categories:
 - **Character LoRAs** - Consistency LoRAs
 - **ControlNets** - Pose, depth, canny
-- **YOLO/SAM** - Detection and segmentation
-- **Captioners** - BLIP, WD14, Florence-2
 - **Upscalers** - 2x and 4x models
+
+If `umi_utilities` is installed, the Model Manager also shows utilities-only categories (QWEN helpers, segmentation, SAM, background removal, LLMs).
 
 ---
 
@@ -739,6 +778,17 @@ $hair theme,
 [if $hair=red : fire magic | ice magic]
 ```
 
+Local variables (branch-scoped):
+```text
+[if $style==clean : $@lens=sharp; clean light, $@lens focus | neutral]
+```
+
+Default/fallback values:
+```text
+${hair|brown}
+${style|"neutral base"}
+```
+
 ### 2. Compound Variables (Hidden Markers)
 Pack multiple "keys" into one variable for complex logic:
 
@@ -764,6 +814,16 @@ $theme elemental magic
 
 The `**hidden**` markers are automatically removed from the final output but remain available for logic checks.
 
+### 2.1 Aliases (aliases.yaml)
+Create an `aliases.yaml` in any wildcards folder:
+```yaml
+wildcards:
+  vibe: styles/vintage_35mm
+  skin: characters/skin_tones
+loras:
+  softfilm: filmgrain_soft_v2
+```
+
 ### 3. Nested Conditionals
 ```text
 $genre={fantasy **F**|scifi **S**|modern **M**}
@@ -784,6 +844,20 @@ $aspect={portrait **VERT**|landscape **HORZ**|square **SQ**}
 [if SQ: @@width=1024, height=1024@@]
 
 A $aspect composition of...
+```
+
+### 4.1 Debug Summary
+```text
+$debug={1}  // level 1 summary
+// Optional: disable the auto summary line
+$debug_summary=0
+```
+
+### 4.2 Trace Mode
+```text
+$trace={1}  // level 1 summary
+// Optional: disable the auto trace line
+$trace_summary=0
 ```
 
 ### 5. Combining All Features

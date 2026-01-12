@@ -332,9 +332,9 @@ app.registerExtension({
             menu.appendChild(button);
         }
 
-        // Add keyboard shortcut (Ctrl+Y)
+        // Add keyboard shortcut (Ctrl+Shift+Y)
         document.addEventListener("keydown", (e) => {
-            if (e.ctrlKey && e.key === "y") {
+            if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "y") {
                 e.preventDefault();
                 yamlManager.show();
             }
