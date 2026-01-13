@@ -288,6 +288,22 @@ def read_file_lines(file):
     """Read and parse lines from a wildcard text file"""
     f_lines = file.read().splitlines()
     lines = []
+    def strip_double_slash_comments(line):
+        i = 0
+        in_comment = False
+        out = []
+        while i < len(line):
+            if line[i] == '/' and i + 1 < len(line) and line[i + 1] == '/':
+                in_comment = not in_comment
+                i += 2
+                continue
+            if in_comment:
+                i += 1
+                continue
+            out.append(line[i])
+            i += 1
+        return "".join(out).strip()
+
     for line in f_lines:
         line = line.strip()
         if not line:
@@ -295,7 +311,7 @@ def read_file_lines(file):
         if line.startswith('#'):
             continue
         if '//' in line:
-            line = re.sub(r'(?<!:)//[^,\n]*', '', line).strip()
+            line = strip_double_slash_comments(line)
             if not line:
                 continue
         if '#' in line:
@@ -391,8 +407,21 @@ class LogicEvaluator:
         i = 0
         in_quote = False
         quote_char = ""
+        in_comment = False
         while i < len(expr):
             char = expr[i]
+            if in_comment:
+                if char == '\n':
+                    in_comment = False
+                    result.append(char)
+                    i += 1
+                    continue
+                if char == '/' and i + 1 < len(expr) and expr[i + 1] == '/':
+                    in_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
             if in_quote:
                 result.append(char)
                 if char == quote_char:
@@ -409,13 +438,9 @@ class LogicEvaluator:
                 continue
 
             if char == '/' and i + 1 < len(expr) and expr[i + 1] == '/':
-                prev_char = expr[i - 1] if i > 0 else ""
-                if prev_char != ':':
-                    # Skip until newline
-                    i += 2
-                    while i < len(expr) and expr[i] != '\n':
-                        i += 1
-                    continue
+                in_comment = True
+                i += 2
+                continue
 
             result.append(char)
             i += 1

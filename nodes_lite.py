@@ -249,6 +249,22 @@ class TagLoader(TagLoaderBase):
         with open(file_path, 'r', encoding='utf-8') as f:
             raw_lines = f.read().splitlines()
         lines = []
+        def strip_double_slash_comments(line):
+            i = 0
+            in_comment = False
+            out = []
+            while i < len(line):
+                if line[i] == '/' and i + 1 < len(line) and line[i + 1] == '/':
+                    in_comment = not in_comment
+                    i += 2
+                    continue
+                if in_comment:
+                    i += 1
+                    continue
+                out.append(line[i])
+                i += 1
+            return "".join(out).strip()
+
         for line in raw_lines:
             line = line.strip()
             if not line:
@@ -256,7 +272,7 @@ class TagLoader(TagLoaderBase):
             if line.startswith('#'):
                 continue
             if '//' in line:
-                line = re.sub(r'(?<!:)//[^,\n]*', '', line).strip()
+                line = strip_double_slash_comments(line)
                 if not line:
                     continue
             if '#' in line:
@@ -1106,14 +1122,30 @@ class UmiAIWildcardNodeLite:
         # CORE PROCESSING
         # ============================================================
 
-        # Strip comments: // comments until newline OR comma
+        # Strip comments: // toggles comment mode until newline or another //
         # Protect __# and <# patterns first
         protected_text = text.replace('__#', '___UMI_HASH_PROTECT___').replace('<#', '<___UMI_HASH_PROTECT___')
-        
-        # Process // comments: remove from // until newline or comma
-        import re
-        # Match // followed by anything that's NOT a comma or newline, stopping at comma or end
-        protected_text = re.sub(r'//[^,\n]*', '', protected_text)
+
+        def strip_double_slash_comments(text_block):
+            cleaned_lines = []
+            for line in text_block.splitlines():
+                i = 0
+                in_comment = False
+                out = []
+                while i < len(line):
+                    if line[i] == '/' and i + 1 < len(line) and line[i + 1] == '/':
+                        in_comment = not in_comment
+                        i += 2
+                        continue
+                    if in_comment:
+                        i += 1
+                        continue
+                    out.append(line[i])
+                    i += 1
+                cleaned_lines.append("".join(out))
+            return "\n".join(cleaned_lines)
+
+        protected_text = strip_double_slash_comments(protected_text)
         
         clean_lines = []
         for line in protected_text.splitlines():
