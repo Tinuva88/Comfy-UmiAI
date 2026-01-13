@@ -12,6 +12,7 @@ import csv
 import fnmatch
 import hashlib
 from datetime import datetime
+import time
 import folder_paths
 
 # ==============================================================================
@@ -26,6 +27,69 @@ GLOBAL_CACHE = {}
 GLOBAL_INDEX = {'built': False, 'files': set(), 'entries': {}, 'tags': set()}
 FILE_MTIME_CACHE = {}
 ALIAS_CACHE = {}
+
+
+def _lock_path_for(target_path):
+    return f"{target_path}.lock"
+
+
+def _acquire_lock(lock_path, timeout=5.0, poll=0.05):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            return fd
+        except FileExistsError:
+            if time.time() >= deadline:
+                raise TimeoutError(f"Timeout waiting for lock: {lock_path}")
+            time.sleep(poll)
+
+
+def _release_lock(lock_path, fd):
+    try:
+        os.close(fd)
+    finally:
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+
+
+class _FileLock:
+    def __init__(self, target_path, timeout=5.0, poll=0.05):
+        self.lock_path = _lock_path_for(target_path)
+        self.timeout = timeout
+        self.poll = poll
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = _acquire_lock(self.lock_path, self.timeout, self.poll)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.fd is not None:
+            _release_lock(self.lock_path, self.fd)
+        return False
+
+
+def _atomic_write_json(path, data, indent=2, ensure_ascii=False):
+    directory = os.path.dirname(path)
+    base = os.path.basename(path)
+    tmp_name = f".{base}.tmp.{os.getpid()}.{random.randint(0, 999999)}"
+    tmp_path = os.path.join(directory, tmp_name)
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=indent, ensure_ascii=ensure_ascii)
+    os.replace(tmp_path, path)
+
+
+def _read_json_file(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
 
 
 def _normalize_aliases(data):
@@ -246,30 +310,17 @@ def log_prompt_to_history(prompt, negative="", seed=None):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         history_file = os.path.join(current_dir, "prompt_history.json")
 
-        # Load existing history
-        history = []
-        if os.path.exists(history_file):
-            try:
-                with open(history_file, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-            except:
-                history = []
-
-        # Add new entry
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "prompt": prompt,
-            "negative": negative,
-            "seed": seed
-        }
-        history.append(entry)
-
-        # Keep only last 100 entries
-        history = history[-100:]
-
-        # Save updated history
-        with open(history_file, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
+        with _FileLock(history_file):
+            history = _read_json_file(history_file, [])
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "prompt": prompt,
+                "negative": negative,
+                "seed": seed
+            }
+            history.append(entry)
+            history = history[-100:]
+            _atomic_write_json(history_file, history)
     except Exception as e:
         print(f"[UmiAI] Warning: Could not log prompt to history: {e}")
 
@@ -1349,6 +1400,86 @@ class NegativePromptGenerator:
         for t in tags:
             self.add(t)
 
+    def _split_neg_list(self, text):
+        if text is None:
+            return []
+        parts = []
+        current = []
+        escape = False
+        for ch in text:
+            if escape:
+                current.append(ch)
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == ',':
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                continue
+            current.append(ch)
+        if escape:
+            current.append('\\')
+        part = "".join(current).strip()
+        if part:
+            parts.append(part)
+        return parts
+
+    def _extract_negatives(self, text):
+        if not text or "--neg:" not in text:
+            return text, []
+        negatives = []
+        out = []
+        i = 0
+        token = "--neg:"
+        while True:
+            idx = text.find(token, i)
+            if idx == -1:
+                out.append(text[i:])
+                break
+            out.append(text[i:idx])
+            j = idx + len(token)
+            while j < len(text) and text[j] in " \t":
+                j += 1
+            if j >= len(text):
+                i = j
+                break
+            if text[j] in ("'", '"'):
+                quote = text[j]
+                j += 1
+                buf = []
+                while j < len(text):
+                    ch = text[j]
+                    if ch == '\\' and j + 1 < len(text):
+                        buf.append('\\')
+                        buf.append(text[j + 1])
+                        j += 2
+                        continue
+                    if ch == quote:
+                        j += 1
+                        break
+                    buf.append(ch)
+                    j += 1
+                neg_text = "".join(buf)
+            else:
+                buf = []
+                while j < len(text) and text[j] != '\n':
+                    ch = text[j]
+                    if ch == '\\' and j + 1 < len(text):
+                        buf.append('\\')
+                        buf.append(text[j + 1])
+                        j += 2
+                        continue
+                    buf.append(ch)
+                    j += 1
+                neg_text = "".join(buf)
+            negatives.extend(self._split_neg_list(neg_text))
+            i = j
+        return "".join(out), negatives
+
     def strip_negative_tags(self, text):
         """Extract **negatives** from text and add them, return cleaned text"""
         # Handle **negative** syntax
@@ -1358,12 +1489,10 @@ class NegativePromptGenerator:
             self.add(tag)
             text = text.replace(match, "")
         
-        # Handle --neg: syntax
-        neg_pattern = r'--neg:\s*([^,\n]+)'
-        neg_matches = re.findall(neg_pattern, text)
-        for match in neg_matches:
-            self.add(match.strip())
-        text = re.sub(neg_pattern, '', text)
+        # Handle --neg: syntax (quoted or unquoted, supports escaping commas)
+        text, negatives = self._extract_negatives(text)
+        if negatives:
+            self.add_list(negatives)
         
         return text
 

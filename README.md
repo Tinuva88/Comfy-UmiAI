@@ -77,7 +77,7 @@ UmiAI transforms static prompts into dynamic, context-aware workflows. It introd
 
 ### 🎨 Advanced Controls
 * **📏 Resolution Control:** Set `@@width=1024, height=1536@@` inside your prompt to control image dimensions contextually.
-* **➖ Scoped Negatives:** Use `--neg: negative text` syntax to embed negative prompts directly in your workflow.
+* **➖ Scoped Negatives:** Use `--neg:` anywhere; quote to include commas (`--neg:"lowres, low quality"`) or escape commas (`lowres\\, low quality`).
 * **🔁 Recursive Processing:** Iterative prompt refinement with cycle detection (max 50 passes).
 * **🎯 Seeded Determinism:** Reproducible random selections via seed control for consistent results.
 * **🧭 RNG Streams:** Optional deterministic sub-streams per tag/scope (toggle `rng_streams`, use `$rng_scope` to group or `__@scope:tag__` per pick).
@@ -178,7 +178,7 @@ The UmiAI node acts as the "Central Brain". You must pass your **Model** and **C
 | **Vision AI** | `[VISION: instruction]` | `[VISION: describe the mood]` |
 | **LLM Naturalize** | `[LLM: tags]` | `[LLM: 1girl, solo, beach]` |
 | **Set Size** | `@@w=X, h=Y@@` | `@@width=1024, height=1536@@` |
-| **Negative Prompt** | `--neg: text` | `--neg: blurry, low quality` |
+| **Negative Prompt** | `--neg: text` | `portrait --neg:"blurry, low quality"` |
 | **Comments** | `//` or `#` | `// This is a comment` |
 | **Debug Toggle** | `$debug={0\|1\|2}` | `$debug={2}` |
 | **Trace Toggle** | `$trace={0\|1\|2}` | `$trace={2}` |

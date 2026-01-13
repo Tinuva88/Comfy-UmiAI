@@ -1605,32 +1605,8 @@ class LoRAHandler:
 
         return clean_text, model, clip, "\n\n".join(lora_info_output)
 
-class NegativePromptGenerator:
-    def __init__(self):
-        self.negative_list = []  # Changed from set to list to preserve order
-        self.seen_lower = set()  # Track lowercase versions for deduplication
-
-    def strip_negative_tags(self, text):
-        matches = re.findall(r'\*\*.*?\*\*', text)
-        for match in matches:
-            tag = match.replace("**", "").strip()
-            tag_lower = tag.lower()
-            if tag and tag_lower not in self.seen_lower:
-                self.seen_lower.add(tag_lower)
-                self.negative_list.append(tag)
-            text = text.replace(match, "")
-        return text
-
-    def add_list(self, tags):
-        for t in tags:
-            tag = t.strip()
-            tag_lower = tag.lower()
-            if tag and tag_lower not in self.seen_lower:
-                self.seen_lower.add(tag_lower)
-                self.negative_list.append(tag)
-
-    def get_negative_string(self):
-        return ", ".join(self.negative_list)
+class NegativePromptGenerator(shared_utils.NegativePromptGenerator):
+    pass
 
 # ==============================================================================
 # NODE DEFINITION
@@ -3940,8 +3916,7 @@ async def get_presets(request):
         return web.json_response({"presets": []})
 
     try:
-        with open(presets_file, 'r', encoding='utf-8') as f:
-            presets = json.load(f)
+        presets = shared_utils._read_json_file(presets_file, [])
         return web.json_response({"presets": presets})
     except Exception as e:
         print(f"[Umi Preset Manager] Error loading presets: {e}")
@@ -3961,26 +3936,16 @@ async def save_preset(request):
 
         presets_file = os.path.join(os.path.dirname(__file__), "presets.json")
 
-        # Load existing presets
-        presets = []
-        if os.path.exists(presets_file):
-            with open(presets_file, 'r', encoding='utf-8') as f:
-                presets = json.load(f)
-
-        # Check if preset with same name exists
-        presets = [p for p in presets if p.get("name") != name]
-
-        # Add new preset
-        presets.append({
-            "name": name,
-            "description": description,
-            "data": preset_data,
-            "timestamp": datetime.now().isoformat()
-        })
-
-        # Save presets
-        with open(presets_file, 'w', encoding='utf-8') as f:
-            json.dump(presets, f, indent=2, ensure_ascii=False)
+        with shared_utils._FileLock(presets_file):
+            presets = shared_utils._read_json_file(presets_file, [])
+            presets = [p for p in presets if p.get("name") != name]
+            presets.append({
+                "name": name,
+                "description": description,
+                "data": preset_data,
+                "timestamp": datetime.now().isoformat()
+            })
+            shared_utils._atomic_write_json(presets_file, presets)
 
         return web.json_response({"success": True})
 
@@ -4003,15 +3968,10 @@ async def delete_preset(request):
         if not os.path.exists(presets_file):
             return web.json_response({"error": "No presets found"}, status=404)
 
-        # Load and filter presets
-        with open(presets_file, 'r', encoding='utf-8') as f:
-            presets = json.load(f)
-
-        presets = [p for p in presets if p.get("name") != name]
-
-        # Save filtered presets
-        with open(presets_file, 'w', encoding='utf-8') as f:
-            json.dump(presets, f, indent=2, ensure_ascii=False)
+        with shared_utils._FileLock(presets_file):
+            presets = shared_utils._read_json_file(presets_file, [])
+            presets = [p for p in presets if p.get("name") != name]
+            shared_utils._atomic_write_json(presets_file, presets)
 
         return web.json_response({"success": True})
 
@@ -4029,8 +3989,7 @@ async def get_history(request):
         return web.json_response({"history": []})
 
     try:
-        with open(history_file, 'r', encoding='utf-8') as f:
-            history = json.load(f)
+        history = shared_utils._read_json_file(history_file, [])
 
         # Sort by timestamp descending (newest first)
         history.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
@@ -4047,7 +4006,8 @@ async def clear_history(request):
         history_file = os.path.join(os.path.dirname(__file__), "prompt_history.json")
 
         if os.path.exists(history_file):
-            os.remove(history_file)
+            with shared_utils._FileLock(history_file):
+                shared_utils._atomic_write_json(history_file, [])
 
         return web.json_response({"success": True})
     except Exception as e:

@@ -75,6 +75,7 @@ class TagLoader(TagLoaderBase):
         # Reset for fresh build
         self.files_index = set()
         self.umi_tags = set()
+        GLOBAL_INDEX_LITE['entries'] = {}
 
         for wildcard_path in self.wildcard_paths:
             if not os.path.exists(wildcard_path):
