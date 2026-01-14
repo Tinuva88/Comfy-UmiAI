@@ -10,6 +10,7 @@ import fnmatch
 import gc 
 import sys
 import subprocess
+from datetime import datetime
 from collections import Counter, OrderedDict
 import folder_paths
 import comfy.sd
@@ -1422,6 +1423,67 @@ class LoRAHandler:
             "translated", "commentary_request", "highres", "absurdres", "masterpiece",
             "best quality", "simple background", "white background", "transparent background"
         }
+        self._cache_dir = os.path.dirname(__file__)
+
+    def _load_json_file(self, path):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _get_override_tags(self, base_name):
+        overrides_path = os.path.join(self._cache_dir, "lora_overrides.json")
+        overrides = self._load_json_file(overrides_path) or {}
+        override = overrides.get(base_name, {})
+        tags = override.get("tags") if isinstance(override, dict) else None
+        if isinstance(tags, list):
+            return [str(t).strip() for t in tags if str(t).strip()]
+        return []
+
+    def _get_civitai_info_tags(self, lora_path):
+        civitai_info_path = os.path.splitext(lora_path)[0] + ".civitai.info"
+        civitai_info = self._load_json_file(civitai_info_path) or {}
+        activation_text = civitai_info.get("activation text", "")
+        if not activation_text:
+            return []
+        return [t.strip() for t in activation_text.split(",") if t.strip()]
+
+    def _get_civitai_cache_tags(self, base_name):
+        cache_path = os.path.join(self._cache_dir, "civitai_cache.json")
+        cache = self._load_json_file(cache_path) or {}
+        civitai_data = cache.get(base_name, {})
+        tags = civitai_data.get("trigger_words")
+        if isinstance(tags, list):
+            return [str(t).strip() for t in tags if str(t).strip()]
+        return []
+
+    def get_activation_tags(self, lora_name, lora_path, max_tags=10):
+        base_name = os.path.splitext(os.path.basename(lora_name))[0]
+        if lora_path:
+            base_name = os.path.splitext(os.path.basename(lora_path))[0]
+
+        override_tags = self._get_override_tags(base_name)
+        if override_tags:
+            return override_tags[:max_tags], "override"
+
+        if lora_path:
+            civitai_info_tags = self._get_civitai_info_tags(lora_path)
+            if civitai_info_tags:
+                return civitai_info_tags[:max_tags], "civitai_info"
+
+        civitai_cache_tags = self._get_civitai_cache_tags(base_name)
+        if civitai_cache_tags:
+            return civitai_cache_tags[:max_tags], "civitai_cache"
+
+        if lora_path:
+            safetensor_tags = self.get_lora_tags(lora_path, max_tags=max_tags) or []
+            if safetensor_tags:
+                return safetensor_tags, "safetensors"
+
+        return [], "none"
 
     def patch_zimage_lora(self, lora):
         new_lora = {}
@@ -1571,10 +1633,11 @@ class LoRAHandler:
                 lora_path = folder_paths.get_full_path("loras", f"{name}.safetensors")
 
             if lora_path:
-                tags = self.get_lora_tags(lora_path, max_tags=max_tags)
+                tags, tag_source = self.get_activation_tags(name, lora_path, max_tags=max_tags)
                 info_block = f"[LORA: {name} (Str: {strength})]\n"
                 if tags:
-                    info_block += f"Common Tags: {', '.join(tags)}"
+                    label = "Activation Tags" if tag_source != "safetensors" else "Common Tags"
+                    info_block += f"{label}: {', '.join(tags)}"
                 else:
                     info_block += "Common Tags: (No Metadata Found)"
                 lora_info_output.append(info_block)
@@ -3764,12 +3827,449 @@ async def save_lora_override(request):
         print(f"[Umi LoRA Browser] Error saving override: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+# Image Browser helpers
+IMAGE_METADATA_CACHE = {}
+IMAGE_METADATA_CACHE_PATH = os.path.join(os.path.dirname(__file__), "image_browser_cache.json")
+IMAGE_METADATA_CACHE_LOADED = False
+
+
+def _load_image_metadata_cache():
+    global IMAGE_METADATA_CACHE_LOADED
+    if IMAGE_METADATA_CACHE_LOADED:
+        return
+    if not os.path.exists(IMAGE_METADATA_CACHE_PATH):
+        IMAGE_METADATA_CACHE_LOADED = True
+        return
+    try:
+        data = shared_utils._read_json_file(IMAGE_METADATA_CACHE_PATH, {})
+        if isinstance(data, dict):
+            IMAGE_METADATA_CACHE.update(data)
+    except Exception:
+        pass
+    IMAGE_METADATA_CACHE_LOADED = True
+
+
+def _save_image_metadata_cache():
+    with shared_utils._FileLock(IMAGE_METADATA_CACHE_PATH):
+        shared_utils._atomic_write_json(IMAGE_METADATA_CACHE_PATH, IMAGE_METADATA_CACHE)
+IMAGE_BROWSER_DATA_PATH = os.path.join(os.path.dirname(__file__), "image_browser_data.json")
+
+
+def _load_image_browser_data():
+    if not os.path.exists(IMAGE_BROWSER_DATA_PATH):
+        return {"items": {}}
+    try:
+        return shared_utils._read_json_file(IMAGE_BROWSER_DATA_PATH, {"items": {}})
+    except Exception:
+        return {"items": {}}
+
+
+def _save_image_browser_data(data):
+    with shared_utils._FileLock(IMAGE_BROWSER_DATA_PATH):
+        shared_utils._atomic_write_json(IMAGE_BROWSER_DATA_PATH, data)
+
+
+def _get_image_browser_item(rel_path):
+    data = _load_image_browser_data()
+    item = data.get("items", {}).get(rel_path)
+    if not item:
+        return {"tags": [], "favorite": False}
+    tags = item.get("tags") or []
+    favorite = bool(item.get("favorite", False))
+    return {"tags": tags, "favorite": favorite}
+
+
+def _update_image_browser_item(rel_path, tags=None, favorite=None):
+    data = _load_image_browser_data()
+    items = data.setdefault("items", {})
+    item = items.get(rel_path, {"tags": [], "favorite": False})
+    if tags is not None:
+        item["tags"] = tags
+    if favorite is not None:
+        item["favorite"] = bool(favorite)
+    items[rel_path] = item
+    _save_image_browser_data(data)
+    return {"tags": item.get("tags", []), "favorite": bool(item.get("favorite", False))}
+
+
+def _parse_a1111_parameters(params_text):
+    result = {}
+    if not params_text:
+        return result
+    lines = [line.strip() for line in params_text.split("\n") if line.strip()]
+    if not lines:
+        return result
+    params_line = lines[-1]
+    for part in params_line.split(","):
+        if ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        key = key.strip().lower().replace(" ", "_")
+        result[key] = value.strip()
+    size = result.get("size")
+    if size and "x" in size.lower():
+        w, h = size.lower().split("x", 1)
+        if w.strip().isdigit():
+            result["width"] = int(w.strip())
+        if h.strip().isdigit():
+            result["height"] = int(h.strip())
+    return result
+
+
+def _parse_lora_tags(prompt):
+    if not prompt:
+        return []
+    matches = re.findall(r'<lora:([^:>]+)(?::[0-9.]+)?>', prompt)
+    return [m.strip() for m in matches if m.strip()]
+
+
+def _parse_int(val):
+    try:
+        return int(float(val))
+    except Exception:
+        return None
+
+
+def _parse_float(val):
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def _extract_comfy_prompt_fields(workflow):
+    if not workflow:
+        return {}
+    data = workflow
+    if isinstance(workflow, str):
+        try:
+            data = json.loads(workflow)
+        except Exception:
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    if "nodes" in data:
+        return {}
+
+    ksampler = None
+    for node in data.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if class_type in ("KSampler", "KSamplerAdvanced"):
+            ksampler = node
+            break
+
+    def _resolve_node_ref(ref):
+        if isinstance(ref, (list, tuple)) and ref:
+            return str(ref[0])
+        return None
+
+    result = {
+        "model": None,
+        "sampler": None,
+        "scheduler": None,
+        "steps": None,
+        "cfg": None,
+        "seed": None,
+        "loras": [],
+    }
+
+    if ksampler:
+        inputs = ksampler.get("inputs", {})
+        result["sampler"] = inputs.get("sampler_name") or inputs.get("sampler")
+        result["scheduler"] = inputs.get("scheduler") or inputs.get("scheduler_name")
+        result["steps"] = _parse_int(inputs.get("steps"))
+        result["cfg"] = _parse_float(inputs.get("cfg") or inputs.get("cfg_scale"))
+        result["seed"] = _parse_int(inputs.get("seed") or inputs.get("noise_seed"))
+
+        model_ref = _resolve_node_ref(inputs.get("model"))
+        if model_ref and model_ref in data:
+            model_node = data.get(model_ref, {})
+            if model_node.get("class_type") in ("CheckpointLoaderSimple", "CheckpointLoader"):
+                result["model"] = model_node.get("inputs", {}).get("ckpt_name")
+
+    if not result["model"]:
+        for node in data.values():
+            if not isinstance(node, dict):
+                continue
+            if node.get("class_type") in ("CheckpointLoaderSimple", "CheckpointLoader"):
+                result["model"] = node.get("inputs", {}).get("ckpt_name")
+                if result["model"]:
+                    break
+
+    loras = []
+    for node in data.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        inputs = node.get("inputs", {}) or {}
+
+        if "lora" in str(class_type).lower():
+            for key, value in inputs.items():
+                if "lora_name" in key and isinstance(value, str) and value:
+                    loras.append(value)
+
+        if class_type in ("UmiAIWildcardNode", "UmiAIWildcardNodeLite"):
+            text = inputs.get("text")
+            if isinstance(text, str) and text:
+                loras.extend(_parse_lora_tags(text))
+    result["loras"] = loras
+
+    return result
+
+
+def _derive_image_fields(metadata):
+    derived = {
+        "models": [],
+        "loras": [],
+        "sampler": None,
+        "scheduler": None,
+        "steps": None,
+        "cfg": None,
+        "seed": None,
+    }
+    params_text = metadata.get("a1111_params") or metadata.get("parameters") or ""
+    params = _parse_a1111_parameters(params_text)
+    model = params.get("model")
+    if model:
+        derived["models"] = [model]
+    derived["sampler"] = params.get("sampler")
+    derived["scheduler"] = params.get("scheduler") or params.get("schedule_type")
+    derived["steps"] = _parse_int(params.get("steps"))
+    derived["cfg"] = _parse_float(params.get("cfg_scale") or params.get("cfg"))
+    derived["seed"] = _parse_int(params.get("seed"))
+    prompt = metadata.get("umi_prompt") or metadata.get("prompt") or ""
+    prompt_loras = _parse_lora_tags(prompt)
+    derived["loras"] = prompt_loras
+    if metadata.get("width"):
+        derived["width"] = metadata.get("width")
+    if metadata.get("height"):
+        derived["height"] = metadata.get("height")
+    if params.get("width") and not derived.get("width"):
+        derived["width"] = params.get("width")
+    if params.get("height") and not derived.get("height"):
+        derived["height"] = params.get("height")
+
+    comfy_fields = _extract_comfy_prompt_fields(metadata.get("workflow"))
+    if comfy_fields:
+        if not derived["models"] and comfy_fields.get("model"):
+            derived["models"] = [comfy_fields.get("model")]
+        if not derived["sampler"] and comfy_fields.get("sampler"):
+            derived["sampler"] = comfy_fields.get("sampler")
+        if not derived["scheduler"] and comfy_fields.get("scheduler"):
+            derived["scheduler"] = comfy_fields.get("scheduler")
+        if derived["steps"] is None and comfy_fields.get("steps") is not None:
+            derived["steps"] = comfy_fields.get("steps")
+        if derived["cfg"] is None and comfy_fields.get("cfg") is not None:
+            derived["cfg"] = comfy_fields.get("cfg")
+        if derived["seed"] is None and comfy_fields.get("seed") is not None:
+            derived["seed"] = comfy_fields.get("seed")
+        if comfy_fields.get("loras"):
+            merged_loras = list(dict.fromkeys(prompt_loras + comfy_fields.get("loras")))
+            derived["loras"] = merged_loras
+    return derived
+
+
+def extract_metadata(image_path):
+    """Extract metadata from PNG/JPG"""
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(image_path) as img:
+            metadata = {
+                "width": img.width,
+                "height": img.height,
+                "format": img.format,
+                "prompt": None,
+                "negative": None,
+                "workflow": None,
+                "parameters": {}
+            }
+
+            if img.format == "PNG":
+                if "prompt" in img.info:
+                    try:
+                        metadata["workflow"] = json.loads(img.info["prompt"])
+                    except Exception:
+                        pass
+
+                if "parameters" in img.info:
+                    params_text = img.info["parameters"]
+                    metadata["a1111_params"] = params_text
+
+                    lines = params_text.split("\n")
+                    if len(lines) > 0:
+                        metadata["prompt"] = lines[0]
+
+                    for line in lines:
+                        if line.startswith("Negative prompt:"):
+                            metadata["negative"] = line.replace("Negative prompt:", "").strip()
+                            break
+
+                if "umi_prompt" in img.info:
+                    metadata["umi_prompt"] = img.info["umi_prompt"]
+                if "umi_negative" in img.info:
+                    metadata["umi_negative"] = img.info["umi_negative"]
+                if "umi_input_prompt" in img.info:
+                    metadata["umi_input_prompt"] = img.info["umi_input_prompt"]
+                if "umi_input_negative" in img.info:
+                    metadata["umi_input_negative"] = img.info["umi_input_negative"]
+
+                if metadata["prompt"] is None and "umi_prompt" in img.info:
+                    metadata["prompt"] = img.info["umi_prompt"]
+                if metadata["negative"] is None and "umi_negative" in img.info:
+                    metadata["negative"] = img.info["umi_negative"]
+
+            if hasattr(img, "_getexif") and img._getexif():
+                exif = img._getexif()
+                if 0x9286 in exif:
+                    metadata["prompt"] = exif[0x9286]
+
+            return metadata
+
+    except Exception as e:
+        print(f"[Umi Image Browser] Error extracting metadata from {image_path}: {e}")
+        return None
+
+
+def _get_cached_image_metadata(full_path, rel_path, mtime, size, allow_extract=True):
+    _load_image_metadata_cache()
+    cached = IMAGE_METADATA_CACHE.get(rel_path)
+    if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+        return cached.get("metadata", {}), cached.get("derived", {})
+    if not allow_extract:
+        return {}, {}
+    metadata = extract_metadata(full_path) or {}
+    derived = _derive_image_fields(metadata)
+    IMAGE_METADATA_CACHE[rel_path] = {
+        "mtime": mtime,
+        "size": size,
+        "metadata": metadata,
+        "derived": derived
+    }
+    return metadata, derived
+
+
+def _parse_date_param(value, end_of_day=False):
+    if not value:
+        return None
+    try:
+        if value.isdigit():
+            return float(value)
+        dt = datetime.strptime(value, "%Y-%m-%d")
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _parse_list_param(params, key):
+    raw = params.get(key, "")
+    if not raw:
+        return []
+    return [v.strip() for v in raw.split(",") if v.strip()]
+
+
+def _list_matches(targets, selections):
+    if not selections:
+        return True
+    if not targets:
+        return False
+    targets_lower = {t.lower() for t in targets if t}
+    for sel in selections:
+        if sel.lower() in targets_lower:
+            return True
+    return False
+
+
+def _tags_match(tags, selections):
+    if not selections:
+        return True
+    if not tags:
+        return False
+    tags_lower = {t.lower() for t in tags}
+    for sel in selections:
+        if sel.lower() not in tags_lower:
+            return False
+    return True
+
+
+def _matches_filters(entry, filters):
+    metadata = entry.get("metadata", {})
+    derived = entry.get("derived", {})
+    annotations = entry.get("annotations", {})
+
+    if filters.get("favorites_only") and not annotations.get("favorite"):
+        return False
+
+    date_from = filters.get("date_from")
+    date_to = filters.get("date_to")
+    if date_from or date_to:
+        mtime = entry.get("mtime", 0)
+        if date_from and mtime < date_from:
+            return False
+        if date_to and mtime > date_to:
+            return False
+
+    search = filters.get("search")
+    if search:
+        prompt = metadata.get("prompt") or ""
+        negative = metadata.get("negative") or ""
+        a1111 = metadata.get("a1111_params") or ""
+        model_text = " ".join(derived.get("models", []) or [])
+        lora_text = " ".join(derived.get("loras", []) or [])
+        tags_text = " ".join(annotations.get("tags", []) or [])
+        haystack = " ".join([entry.get("filename", ""), prompt, negative, a1111, model_text, lora_text, tags_text]).lower()
+        if search not in haystack:
+            return False
+
+    if not _list_matches(derived.get("models", []), filters.get("models", [])):
+        return False
+    if not _list_matches(derived.get("loras", []), filters.get("loras", [])):
+        return False
+
+    samplers = filters.get("samplers", [])
+    if samplers:
+        sampler = (derived.get("sampler") or "").lower()
+        if not sampler or sampler not in {s.lower() for s in samplers}:
+            return False
+
+    if not _tags_match(annotations.get("tags", []), filters.get("tags", [])):
+        return False
+
+    steps_min = filters.get("steps_min")
+    steps_max = filters.get("steps_max")
+    if steps_min is not None or steps_max is not None:
+        steps_val = derived.get("steps")
+        if steps_val is None:
+            return False
+        if steps_min is not None and steps_val < steps_min:
+            return False
+        if steps_max is not None and steps_val > steps_max:
+            return False
+
+    cfg_min = filters.get("cfg_min")
+    cfg_max = filters.get("cfg_max")
+    if cfg_min is not None or cfg_max is not None:
+        cfg_val = derived.get("cfg")
+        if cfg_val is None:
+            return False
+        if cfg_min is not None and cfg_val < cfg_min:
+            return False
+        if cfg_max is not None and cfg_val > cfg_max:
+            return False
+
+    return True
+
+
 @server.PromptServer.instance.routes.get("/umiapp/images/scan")
 async def scan_images(request):
     """Phase 6: Scan output directory for images with metadata"""
     import asyncio
     from PIL import Image as PILImage
     from PIL.PngImagePlugin import PngInfo
+    from collections import Counter
 
     # Get output directory
     output_dir = folder_paths.get_output_directory()
@@ -3781,130 +4281,164 @@ async def scan_images(request):
     limit = int(params.get("limit", 100))
     offset = int(params.get("offset", 0))
     sort_by = params.get("sort", "newest")  # newest, oldest, name
+    recursive = params.get("recursive", "1") not in ("0", "false", "no")
+    quick = params.get("quick", "0") in ("1", "true", "yes")
+
+    filters = {
+        "search": params.get("search", "").strip().lower(),
+        "favorites_only": params.get("favorites") in ("1", "true", "yes"),
+        "date_from": _parse_date_param(params.get("date_from")),
+        "date_to": _parse_date_param(params.get("date_to"), end_of_day=True),
+        "models": _parse_list_param(params, "models"),
+        "loras": _parse_list_param(params, "loras"),
+        "samplers": _parse_list_param(params, "samplers"),
+        "tags": _parse_list_param(params, "tags"),
+        "steps_min": _parse_int(params.get("steps_min")),
+        "steps_max": _parse_int(params.get("steps_max")),
+        "cfg_min": _parse_float(params.get("cfg_min")),
+        "cfg_max": _parse_float(params.get("cfg_max")),
+    }
 
     images_data = []
-
-    def extract_metadata(image_path):
-        """Extract metadata from PNG/JPG"""
-        try:
-            with PILImage.open(image_path) as img:
-                metadata = {
-                    "width": img.width,
-                    "height": img.height,
-                    "format": img.format,
-                    "prompt": None,
-                    "negative": None,
-                    "workflow": None,
-                    "parameters": {}
-                }
-
-                # PNG metadata
-                if img.format == "PNG":
-                    # ComfyUI workflow (in 'prompt' key)
-                    if "prompt" in img.info:
-                        try:
-                            metadata["workflow"] = json.loads(img.info["prompt"])
-                        except:
-                            pass
-
-                    # A1111 format (in 'parameters' key)
-                    if "parameters" in img.info:
-                        params_text = img.info["parameters"]
-                        metadata["a1111_params"] = params_text
-
-                        # Parse A1111 format
-                        lines = params_text.split("\n")
-                        if len(lines) > 0:
-                            metadata["prompt"] = lines[0]
-
-                        # Look for "Negative prompt:"
-                        for i, line in enumerate(lines):
-                            if line.startswith("Negative prompt:"):
-                                metadata["negative"] = line.replace("Negative prompt:", "").strip()
-                                break
-
-                    # Check for custom Umi keys
-                    if "umi_prompt" in img.info:
-                        metadata["umi_prompt"] = img.info["umi_prompt"]
-                    if "umi_negative" in img.info:
-                        metadata["umi_negative"] = img.info["umi_negative"]
-                    if "umi_input_prompt" in img.info:
-                        metadata["umi_input_prompt"] = img.info["umi_input_prompt"]
-                    if "umi_input_negative" in img.info:
-                        metadata["umi_input_negative"] = img.info["umi_input_negative"]
-
-                    # Set fallback for 'prompt' and 'negative' if not already set
-                    if metadata["prompt"] is None and "umi_prompt" in img.info:
-                        metadata["prompt"] = img.info["umi_prompt"]
-                    if metadata["negative"] is None and "umi_negative" in img.info:
-                        metadata["negative"] = img.info["umi_negative"]
-
-                # EXIF data (for JPG)
-                if hasattr(img, '_getexif') and img._getexif():
-                    exif = img._getexif()
-                    # User Comment tag (0x9286)
-                    if 0x9286 in exif:
-                        metadata["prompt"] = exif[0x9286]
-
-                return metadata
-
-        except Exception as e:
-            print(f"[Umi Image Browser] Error extracting metadata from {image_path}: {e}")
-            return None
 
     # Scan directory
     try:
         image_extensions = {".png", ".jpg", ".jpeg", ".webp"}
         all_images = []
 
-        for root, dirs, files in os.walk(output_dir):
-            for file in files:
+        if recursive:
+            for root, dirs, files in os.walk(output_dir):
+                for file in files:
+                    if os.path.splitext(file.lower())[1] in image_extensions:
+                        full_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(full_path, output_dir)
+                        mtime = os.path.getmtime(full_path)
+                        size = os.path.getsize(full_path)
+                        metadata, derived = _get_cached_image_metadata(full_path, rel_path, mtime, size, allow_extract=not quick)
+                        annotations = _get_image_browser_item(rel_path)
+                        all_images.append({
+                            "path": full_path,
+                            "filename": file,
+                            "relative_path": rel_path,
+                            "mtime": mtime,
+                            "size": size,
+                            "metadata": metadata,
+                            "derived": derived,
+                            "annotations": annotations
+                        })
+        else:
+            for file in os.listdir(output_dir):
                 if os.path.splitext(file.lower())[1] in image_extensions:
-                    full_path = os.path.join(root, file)
+                    full_path = os.path.join(output_dir, file)
+                    rel_path = os.path.relpath(full_path, output_dir)
+                    mtime = os.path.getmtime(full_path)
+                    size = os.path.getsize(full_path)
+                    metadata, derived = _get_cached_image_metadata(full_path, rel_path, mtime, size, allow_extract=not quick)
+                    annotations = _get_image_browser_item(rel_path)
                     all_images.append({
                         "path": full_path,
                         "filename": file,
-                        "relative_path": os.path.relpath(full_path, output_dir),
-                        "mtime": os.path.getmtime(full_path),
-                        "size": os.path.getsize(full_path)
+                        "relative_path": rel_path,
+                        "mtime": mtime,
+                        "size": size,
+                        "metadata": metadata,
+                        "derived": derived,
+                        "annotations": annotations
                     })
+
+        # Filter
+        if quick:
+            search = filters.get("search")
+            if search:
+                filtered_images = [img for img in all_images if search in img.get("filename", "").lower()]
+            else:
+                filtered_images = list(all_images)
+        else:
+            filtered_images = [img for img in all_images if _matches_filters(img, filters)]
+        if not recursive:
+            filtered_images = [
+                img for img in filtered_images
+                if "/" not in img.get("relative_path", "").replace("\\", "/")
+            ]
 
         # Sort images
         if sort_by == "newest":
-            all_images.sort(key=lambda x: x["mtime"], reverse=True)
+            filtered_images.sort(key=lambda x: x["mtime"], reverse=True)
         elif sort_by == "oldest":
-            all_images.sort(key=lambda x: x["mtime"])
+            filtered_images.sort(key=lambda x: x["mtime"])
         elif sort_by == "name":
-            all_images.sort(key=lambda x: x["filename"])
+            filtered_images.sort(key=lambda x: x["filename"])
+
+        # Facets
+        model_counts = Counter()
+        lora_counts = Counter()
+        sampler_counts = Counter()
+        tag_counts = Counter()
+
+        if not quick:
+            for img in filtered_images:
+                for model in img.get("derived", {}).get("models", []) or []:
+                    model_counts[model] += 1
+                for lora in img.get("derived", {}).get("loras", []) or []:
+                    lora_counts[lora] += 1
+                sampler = img.get("derived", {}).get("sampler")
+                if sampler:
+                    sampler_counts[sampler] += 1
+                for tag in img.get("annotations", {}).get("tags", []) or []:
+                    tag_counts[tag] += 1
+
+        facets = {
+            "models": [{"name": k, "count": v} for k, v in model_counts.most_common()],
+            "loras": [{"name": k, "count": v} for k, v in lora_counts.most_common()],
+            "samplers": [{"name": k, "count": v} for k, v in sampler_counts.most_common()],
+            "tags": [{"name": k, "count": v} for k, v in tag_counts.most_common()],
+        }
 
         # Paginate
-        paginated = all_images[offset:offset+limit]
+        paginated = filtered_images[offset:offset+limit]
 
-        # Extract metadata for paginated results
+        # Create web-accessible URL and strip path
         for img_info in paginated:
-            metadata = extract_metadata(img_info["path"])
-            if metadata:
-                img_info["metadata"] = metadata
-            else:
-                img_info["metadata"] = {}
-
-            # Create web-accessible URL
             rel_path = img_info["relative_path"].replace("\\", "/")
             img_info["url"] = f"/view?filename={rel_path}&type=output"
-
-            # Remove full path for security
             del img_info["path"]
+
+        if not quick:
+            _save_image_metadata_cache()
 
         return web.json_response({
             "images": paginated,
-            "total": len(all_images),
+            "total": len(filtered_images),
             "offset": offset,
-            "limit": limit
+            "limit": limit,
+            "facets": facets
         })
 
     except Exception as e:
         print(f"[Umi Image Browser] Scan error: {e}")
         return web.json_response({"error": str(e)}, status=500)
+
+
+@server.PromptServer.instance.routes.post("/umiapp/images/annotations/update")
+async def update_image_annotations(request):
+    """Update tags/favorite for an image in the browser"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    rel_path = data.get("relative_path")
+    if not rel_path:
+        return web.json_response({"error": "relative_path is required"}, status=400)
+
+    tags = data.get("tags")
+    favorite = data.get("favorite")
+
+    if tags is not None and not isinstance(tags, list):
+        return web.json_response({"error": "tags must be a list"}, status=400)
+
+    item = _update_image_browser_item(rel_path, tags=tags, favorite=favorite)
+    return web.json_response({"success": True, "item": item})
 
 # Phase 8: Preset Manager Endpoints
 @server.PromptServer.instance.routes.get("/umiapp/presets")

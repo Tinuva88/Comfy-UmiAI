@@ -1,37 +1,37 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// Phase 6: Image Browser - Booru-style image gallery with metadata and prompt copying
-
 class ImageBrowser {
     constructor() {
         this.element = null;
         this.images = [];
+        this.imageMap = new Map();
         this.currentPage = 0;
-        this.pageSize = 50;
+        this.pageSize = 30;
         this.totalImages = 0;
         this.sortBy = "newest";
-        this.searchTerm = "";
-        this.dateFilter = "all";
-        this.dateFrom = "";
-        this.dateTo = "";
         this.selectedImage = null;
-    }
-
-    async fetchImages() {
-        try {
-            const offset = this.currentPage * this.pageSize;
-            const response = await fetch(`/umiapp/images/scan?limit=${this.pageSize}&offset=${offset}&sort=${this.sortBy}`);
-            const data = await response.json();
-
-            this.images = data.images || [];
-            this.totalImages = data.total || 0;
-
-            return this.images;
-        } catch (error) {
-            console.error("[Umi Image Browser] Failed to fetch images:", error);
-            return [];
-        }
+        this.selectedIds = new Set();
+        this.facets = { models: [], loras: [], samplers: [], tags: [] };
+        this.refreshTimer = null;
+        this.filters = {
+            search: "",
+            favoritesOnly: false,
+            dateFrom: "",
+            dateTo: "",
+            stepsMin: "",
+            stepsMax: "",
+            cfgMin: "",
+            cfgMax: "",
+            recursive: true,
+            models: new Set(),
+            loras: new Set(),
+            samplers: new Set(),
+            tags: new Set()
+        };
+        this.tagSearch = "";
+        this.contextMenu = null;
+        this.compareOverlay = null;
     }
 
     createPanel() {
@@ -43,586 +43,765 @@ class ImageBrowser {
             left: 0;
             right: 0;
             bottom: 0;
-            background: rgba(15, 15, 18, 0.98);
+            width: 100vw;
+            height: 100vh;
+            background: #0f1115;
             z-index: 10000;
             display: none;
-            flex-direction: column;
+            color: #d7dae0;
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
         `;
 
-        panel.innerHTML = `
-            <div style="
-                padding: 18px 24px;
-                background: linear-gradient(135deg, rgba(97, 175, 239, 0.12) 0%, rgba(198, 120, 221, 0.08) 50%, rgba(86, 182, 194, 0.08) 100%);
-                border-bottom: 1px solid rgba(97, 175, 239, 0.25);
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                backdrop-filter: blur(8px);
-            ">
-                <h2 style="margin: 0; color: #61afef; font-size: 22px; font-weight: 600; text-shadow: 0 2px 4px rgba(0,0,0,0.4);">🖼️ Image Browser</h2>
-                <div style="display: flex; gap: 12px; align-items: center;">
-                    <select class="umi-sort-select" style="
-                        padding: 8px 12px;
-                        background: rgba(44, 44, 44, 0.8);
-                        border: 1px solid rgba(85, 85, 85, 0.6);
-                        border-radius: 6px;
-                        color: #abb2bf;
-                        cursor: pointer;
-                        transition: all 0.2s ease;
-                    ">
-                        <option value="newest">Newest First</option>
-                        <option value="oldest">Oldest First</option>
-                        <option value="name">By Name</option>
-                    </select>
-                    <select class="umi-date-filter" style="
-                        padding: 8px 12px;
-                        background: rgba(44, 44, 44, 0.8);
-                        border: 1px solid rgba(85, 85, 85, 0.6);
-                        border-radius: 6px;
-                        color: #abb2bf;
-                        cursor: pointer;
-                    ">
-                        <option value="all">All Time</option>
-                        <option value="today">Today</option>
-                        <option value="week">This Week</option>
-                        <option value="month">This Month</option>
-                        <option value="custom">Custom Range</option>
-                    </select>
-                    <div class="umi-date-range" style="display: none; gap: 5px; align-items: center;">
-                        <span style="color: #abb2bf; font-size: 12px;">From:</span>
-                        <input type="date" class="umi-date-from" style="padding: 6px; background: #2c2c2c; border: 1px solid #555; border-radius: 4px; color: #abb2bf; font-size: 12px;" />
-                        <span style="color: #abb2bf; font-size: 12px;">To:</span>
-                        <input type="date" class="umi-date-to" style="padding: 6px; background: #2c2c2c; border: 1px solid #555; border-radius: 4px; color: #abb2bf; font-size: 12px;" />
-                    </div>
-                    <input
-                        type="text"
-                        class="umi-image-search"
-                        placeholder="🔍 Search prompts..."
-                        style="
-                            padding: 8px 14px;
-                            background: rgba(44, 44, 44, 0.8);
-                            border: 1px solid rgba(85, 85, 85, 0.6);
-                            border-radius: 6px;
-                            color: #abb2bf;
-                            width: 220px;
-                            transition: all 0.2s ease;
-                        "
-                    />
-                    <button class="umi-close-btn" style="
-                        background: linear-gradient(135deg, #e06c75 0%, #be5046 100%);
-                        color: white;
-                        border: none;
-                        padding: 8px 18px;
-                        border-radius: 6px;
-                        cursor: pointer;
-                        font-size: 14px;
-                        font-weight: 600;
-                        transition: all 0.2s ease;
-                        box-shadow: 0 2px 8px rgba(224, 108, 117, 0.3);
-                    " onmouseover="this.style.transform='translateY(-1px)'; this.style.boxShadow='0 4px 12px rgba(224, 108, 117, 0.4)'" onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(224, 108, 117, 0.3)'">✕ Close</button>
-                </div>
-            </div>
+        panel.innerHTML = this.getStyles() + this.getLayout();
 
-            <div style="display: flex; flex: 1; overflow: hidden;">
-                <!-- Image Grid -->
-                <div class="umi-image-grid-container" style="
+        this.element = panel;
+        document.body.appendChild(panel);
+        this.contextMenu = panel.querySelector('[data-role="context-menu"]');
+        this.compareOverlay = panel.querySelector('[data-role="compare"]');
+        const body = panel.querySelector('.umi-ib-body');
+        if (body) {
+            body.style.display = 'grid';
+            body.style.width = '100%';
+            body.style.height = '100%';
+            body.style.gridTemplateColumns = '260px minmax(0, 1fr) 360px';
+        }
+        const main = panel.querySelector('.umi-ib-main');
+        if (main) {
+            main.style.flex = '1';
+            main.style.minWidth = '0';
+        }
+        const grid = panel.querySelector('.umi-ib-grid');
+        if (grid) {
+            grid.style.flex = '1';
+            grid.style.minHeight = '0';
+        }
+        this.setDetailsVisible(false);
+        this.bindEvents();
+    }
+
+    getStyles() {
+        return `
+            <style>
+                .umi-ib-root {
+                    display: flex;
+                    flex-direction: column;
+                    height: 100%;
+                    width: 100%;
                     flex: 1;
+                }
+                .umi-ib-header {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    padding: 12px 18px;
+                    border-bottom: 1px solid #20242c;
+                    background: linear-gradient(135deg, #1d2230 0%, #151a24 100%);
+                }
+                .umi-ib-title {
+                    font-size: 18px;
+                    font-weight: 600;
+                    color: #8fc6ff;
+                }
+                .umi-ib-header-actions {
+                    display: flex;
+                    gap: 8px;
+                    align-items: center;
+                }
+                .umi-ib-btn {
+                    background: #2a303b;
+                    color: #d7dae0;
+                    border: 1px solid #3b4250;
+                    padding: 6px 10px;
+                    border-radius: 6px;
+                    cursor: pointer;
+                    font-size: 12px;
+                }
+                .umi-ib-btn:hover {
+                    border-color: #5b6b85;
+                }
+                .umi-ib-select {
+                    background: #1c212b;
+                    color: #d7dae0;
+                    border: 1px solid #3b4250;
+                    padding: 6px 8px;
+                    border-radius: 6px;
+                    font-size: 12px;
+                }
+                .umi-ib-body {
+                    display: grid;
+                    grid-template-columns: 260px minmax(0, 1fr) 360px;
+                    height: 100%;
+                    width: 100%;
+                    flex: 1;
+                    min-height: 0;
+                }
+                .umi-ib-sidebar {
+                    border-right: 1px solid #20242c;
+                    padding: 14px;
                     overflow-y: auto;
+                    background: #12161f;
+                    min-width: 0;
+                }
+                .umi-ib-main {
+                    position: relative;
+                    overflow: hidden;
+                    display: flex;
+                    flex-direction: column;
+                    min-width: 0;
+                }
+                .umi-ib-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                    gap: 12px;
+                    padding: 14px;
+                    overflow-y: auto;
+                    height: 100%;
+                    min-height: 0;
+                }
+                .umi-ib-details {
+                    border-left: 1px solid #20242c;
+                    padding: 14px;
+                    overflow-y: auto;
+                    background: #12161f;
+                    min-width: 0;
+                }
+                .umi-ib-section {
+                    margin-bottom: 16px;
+                }
+                .umi-ib-section-title {
+                    font-size: 12px;
+                    letter-spacing: 0.08em;
+                    text-transform: uppercase;
+                    color: #8b93a6;
+                    margin-bottom: 8px;
+                }
+                .umi-ib-input {
+                    width: 100%;
+                    padding: 6px 8px;
+                    background: #1c212b;
+                    border: 1px solid #313847;
+                    border-radius: 6px;
+                    color: #d7dae0;
+                    font-size: 12px;
+                }
+                .umi-ib-row {
+                    display: flex;
+                    gap: 8px;
+                }
+                .umi-ib-checkbox {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    font-size: 12px;
+                    color: #c1c7d4;
+                }
+                .umi-ib-facet-list {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 6px;
+                    max-height: 180px;
+                    overflow-y: auto;
+                    padding-right: 4px;
+                }
+                .umi-ib-facet-item {
+                    display: flex;
+                    justify-content: space-between;
+                    gap: 8px;
+                    font-size: 12px;
+                }
+                .umi-ib-facet-item label {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    cursor: pointer;
+                }
+                .umi-ib-facet-count {
+                    color: #8b93a6;
+                }
+                .umi-ib-card {
+                    background: #1a1f2b;
+                    border: 1px solid #2a303b;
+                    border-radius: 8px;
+                    overflow: hidden;
+                    cursor: pointer;
+                    transition: transform 0.1s ease, border-color 0.1s ease;
+                    position: relative;
+                }
+                .umi-ib-card:hover {
+                    border-color: #4c6b9a;
+                    transform: translateY(-2px);
+                }
+                .umi-ib-card.selected {
+                    border-color: #8fc6ff;
+                    box-shadow: 0 0 0 1px #8fc6ff inset;
+                }
+                .umi-ib-thumb {
+                    width: 100%;
+                    height: 180px;
+                    background-size: cover;
+                    background-position: center;
+                    position: relative;
+                }
+                .umi-ib-card-meta {
+                    padding: 8px;
+                }
+                .umi-ib-card-name {
+                    font-size: 11px;
+                    color: #c7cbd6;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                }
+                .umi-ib-card-sub {
+                    font-size: 10px;
+                    color: #7b8499;
+                    margin-top: 4px;
+                }
+                .umi-ib-badge {
+                    position: absolute;
+                    top: 6px;
+                    right: 6px;
+                    background: #2f7d4b;
+                    color: #fff;
+                    padding: 2px 6px;
+                    font-size: 9px;
+                    border-radius: 4px;
+                }
+                .umi-ib-fav {
+                    position: absolute;
+                    top: 6px;
+                    left: 6px;
+                    background: rgba(0,0,0,0.6);
+                    color: #f5d76e;
+                    border: none;
+                    font-size: 12px;
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                }
+                .umi-ib-tags {
+                    display: flex;
+                    gap: 4px;
+                    flex-wrap: wrap;
+                    margin-top: 6px;
+                }
+                .umi-ib-tag {
+                    background: #2a303b;
+                    color: #c1c7d4;
+                    font-size: 9px;
+                    padding: 2px 6px;
+                    border-radius: 4px;
+                }
+                .umi-ib-tag[data-tag] {
+                    cursor: pointer;
+                }
+                .umi-ib-fav--off {
+                    opacity: 0.35;
+                    color: #c7cbd6;
+                }
+                .umi-ib-pagination {
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    gap: 8px;
+                    padding: 10px;
+                    border-top: 1px solid #20242c;
+                    background: #10141d;
+                }
+                .umi-ib-details-empty {
+                    color: #7b8499;
+                    text-align: center;
                     padding: 20px;
-                ">
-                    <div class="umi-image-grid" style="
-                        display: grid;
-                        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-                        gap: 15px;
-                    "></div>
-
-                    <!-- Pagination -->
-                    <div class="umi-pagination" style="
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        gap: 10px;
-                        margin-top: 20px;
-                        padding: 20px;
-                    "></div>
-                </div>
-
-                <!-- Image Details Sidebar -->
-                <div class="umi-image-details" style="
-                    width: 400px;
-                    background: #1e1e1e;
-                    border-left: 1px solid #444;
+                    font-size: 12px;
+                }
+                .umi-ib-detail-image {
+                    width: 100%;
+                    border-radius: 6px;
+                    margin-bottom: 10px;
+                }
+                .umi-ib-detail-title {
+                    font-size: 14px;
+                    color: #8fc6ff;
+                    margin-bottom: 6px;
+                }
+                .umi-ib-detail-meta {
+                    font-size: 11px;
+                    color: #9aa3b2;
+                    margin-bottom: 10px;
+                }
+                .umi-ib-detail-section {
+                    margin-bottom: 12px;
+                }
+                .umi-ib-detail-label {
+                    font-size: 11px;
+                    color: #8b93a6;
+                    margin-bottom: 4px;
+                }
+                .umi-ib-detail-box {
+                    background: #1c212b;
+                    border: 1px solid #2a303b;
+                    border-radius: 6px;
+                    padding: 8px;
+                    font-size: 12px;
+                    color: #d7dae0;
+                    max-height: 160px;
                     overflow-y: auto;
+                    white-space: pre-wrap;
+                }
+                .umi-ib-detail-actions {
+                    display: flex;
+                    gap: 8px;
+                    margin-top: 6px;
+                }
+                .umi-ib-context-menu {
+                    position: fixed;
+                    display: none;
+                    background: #1c212b;
+                    border: 1px solid #2a303b;
+                    border-radius: 6px;
+                    padding: 6px 0;
+                    z-index: 10002;
+                    min-width: 180px;
+                }
+                .umi-ib-context-menu button {
+                    width: 100%;
+                    background: none;
+                    border: none;
+                    color: #d7dae0;
+                    padding: 6px 12px;
+                    text-align: left;
+                    font-size: 12px;
+                    cursor: pointer;
+                }
+                .umi-ib-context-menu button:hover {
+                    background: #2a303b;
+                }
+                .umi-ib-compare {
+                    position: fixed;
+                    top: 60px;
+                    left: 60px;
+                    right: 60px;
+                    bottom: 60px;
+                    background: #0f1115;
+                    border: 1px solid #2a303b;
+                    border-radius: 10px;
+                    z-index: 10001;
                     display: none;
                     flex-direction: column;
-                ">
-                    <div style="padding: 15px; border-bottom: 1px solid #444;">
-                        <h3 style="margin: 0 0 10px 0; color: #61afef; font-size: 16px;">Image Details</h3>
-                        <button class="umi-close-details" style="
-                            width: 100%;
-                            padding: 6px;
-                            background: #e06c75;
-                            color: white;
-                            border: none;
-                            border-radius: 4px;
-                            cursor: pointer;
-                            font-size: 12px;
-                        ">✕ Close Details</button>
-                    </div>
+                }
+                .umi-ib-compare-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 10px 14px;
+                    border-bottom: 1px solid #20242c;
+                }
+                .umi-ib-compare-body {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 12px;
+                    padding: 12px;
+                    overflow: auto;
+                }
+                .umi-ib-compare-card {
+                    background: #151a24;
+                    border: 1px solid #2a303b;
+                    border-radius: 8px;
+                    padding: 10px;
+                }
+                .umi-ib-compare-card img {
+                    width: 100%;
+                    border-radius: 6px;
+                    margin-bottom: 8px;
+                }
+                .umi-ib-chip {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                    font-size: 11px;
+                    background: #1c212b;
+                    border: 1px solid #2a303b;
+                    padding: 4px 8px;
+                    border-radius: 6px;
+                }
+            </style>
+        `;
+    }
 
-                    <div class="umi-details-content" style="padding: 15px; flex: 1;"></div>
+    getLayout() {
+        return `
+            <div class="umi-ib-root">
+                <div class="umi-ib-header">
+                    <div class="umi-ib-title">Image Browser</div>
+                    <div class="umi-ib-header-actions">
+                        <button class="umi-ib-btn" data-action="refresh">Refresh</button>
+                        <select class="umi-ib-select" data-role="sort">
+                            <option value="newest">Newest</option>
+                            <option value="oldest">Oldest</option>
+                            <option value="name">Name</option>
+                        </select>
+                        <select class="umi-ib-select" data-role="page-size">
+                            <option value="15">15</option>
+                            <option value="30" selected>30</option>
+                            <option value="60">60</option>
+                        </select>
+                        <button class="umi-ib-btn" data-action="compare" disabled>Compare</button>
+                        <button class="umi-ib-btn" data-action="close">Close</button>
+                    </div>
                 </div>
+                <div class="umi-ib-body">
+                    <aside class="umi-ib-sidebar">
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">Search</div>
+                            <input class="umi-ib-input" data-role="search" placeholder="Search prompts, models, tags" />
+                        </div>
+                        <div class="umi-ib-section">
+                            <label class="umi-ib-checkbox">
+                                <input type="checkbox" data-role="favorites-only" /> Favorites only
+                            </label>
+                        </div>
+                        <div class="umi-ib-section">
+                            <label class="umi-ib-checkbox">
+                                <input type="checkbox" data-role="recursive-scan" checked /> Include subfolders
+                            </label>
+                        </div>
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">Date Range</div>
+                            <div class="umi-ib-row">
+                                <input class="umi-ib-input" type="date" data-role="date-from" />
+                                <input class="umi-ib-input" type="date" data-role="date-to" />
+                            </div>
+                        </div>
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">Steps</div>
+                            <div class="umi-ib-row">
+                                <input class="umi-ib-input" type="number" min="0" data-role="steps-min" placeholder="Min" />
+                                <input class="umi-ib-input" type="number" min="0" data-role="steps-max" placeholder="Max" />
+                            </div>
+                        </div>
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">CFG</div>
+                            <div class="umi-ib-row">
+                                <input class="umi-ib-input" type="number" step="0.1" min="0" data-role="cfg-min" placeholder="Min" />
+                                <input class="umi-ib-input" type="number" step="0.1" min="0" data-role="cfg-max" placeholder="Max" />
+                            </div>
+                        </div>
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">Models</div>
+                            <div class="umi-ib-facet-list" data-facet="models"></div>
+                        </div>
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">LoRAs</div>
+                            <div class="umi-ib-facet-list" data-facet="loras"></div>
+                        </div>
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">Samplers</div>
+                            <div class="umi-ib-facet-list" data-facet="samplers"></div>
+                        </div>
+                        <div class="umi-ib-section">
+                            <div class="umi-ib-section-title">Tags</div>
+                            <input class="umi-ib-input" data-role="tag-search" placeholder="Filter tags" />
+                            <div class="umi-ib-facet-list" data-facet="tags"></div>
+                        </div>
+                        <button class="umi-ib-btn" data-action="clear-filters">Clear filters</button>
+                    </aside>
+                    <main class="umi-ib-main">
+                        <div class="umi-ib-grid" data-role="grid"></div>
+                        <div class="umi-ib-pagination" data-role="pagination"></div>
+                    </main>
+                    <aside class="umi-ib-details" data-role="details">
+                        <div class="umi-ib-details-empty">Select an image to view details.</div>
+                    </aside>
+                </div>
+                <div class="umi-ib-context-menu" data-role="context-menu"></div>
+                <div class="umi-ib-compare" data-role="compare"></div>
             </div>
         `;
+    }
 
-        // Event listeners
-        const closeBtn = panel.querySelector(".umi-close-btn");
-        closeBtn.addEventListener("click", () => this.hide());
+    bindEvents() {
+        const closeBtn = this.element.querySelector('[data-action="close"]');
+        closeBtn.addEventListener('click', () => this.hide());
 
-        const sortSelect = panel.querySelector(".umi-sort-select");
-        sortSelect.addEventListener("change", (e) => {
+        const refreshBtn = this.element.querySelector('[data-action="refresh"]');
+        refreshBtn.addEventListener('click', () => this.loadImages());
+
+        const sortSelect = this.element.querySelector('[data-role="sort"]');
+        sortSelect.addEventListener('change', (e) => {
             this.sortBy = e.target.value;
             this.currentPage = 0;
             this.loadImages();
         });
 
-        const dateFilter = panel.querySelector(".umi-date-filter");
-        const dateRangeDiv = panel.querySelector(".umi-date-range");
-        const dateFromInput = panel.querySelector(".umi-date-from");
-        const dateToInput = panel.querySelector(".umi-date-to");
-
-        dateFilter.addEventListener("change", (e) => {
-            this.dateFilter = e.target.value;
-
-            // Show/hide custom date range inputs
-            if (e.target.value === "custom") {
-                dateRangeDiv.style.display = "flex";
-            } else {
-                dateRangeDiv.style.display = "none";
-                this.filterImages();
-            }
+        const pageSizeSelect = this.element.querySelector('[data-role="page-size"]');
+        pageSizeSelect.addEventListener('change', (e) => {
+            this.pageSize = parseInt(e.target.value, 10);
+            this.currentPage = 0;
+            this.loadImages();
         });
 
-        dateFromInput.addEventListener("change", (e) => {
-            this.dateFrom = e.target.value;
-            if (this.dateFilter === "custom") {
-                this.filterImages();
-            }
+        const searchInput = this.element.querySelector('[data-role="search"]');
+        searchInput.addEventListener('input', (e) => {
+            this.filters.search = e.target.value.toLowerCase();
+            this.scheduleRefresh();
         });
 
-        dateToInput.addEventListener("change", (e) => {
-            this.dateTo = e.target.value;
-            if (this.dateFilter === "custom") {
-                this.filterImages();
-            }
+        const favoritesOnly = this.element.querySelector('[data-role="favorites-only"]');
+        favoritesOnly.addEventListener('change', (e) => {
+            this.filters.favoritesOnly = e.target.checked;
+            this.currentPage = 0;
+            this.loadImages();
         });
 
-        const searchInput = panel.querySelector(".umi-image-search");
-        searchInput.addEventListener("input", (e) => {
-            this.searchTerm = e.target.value.toLowerCase();
-            this.filterImages();
+        const recursiveScan = this.element.querySelector('[data-role="recursive-scan"]');
+        recursiveScan.addEventListener('change', (e) => {
+            this.filters.recursive = e.target.checked;
+            this.currentPage = 0;
+            this.loadImages();
         });
 
-        const closeDetails = panel.querySelector(".umi-close-details");
-        closeDetails.addEventListener("click", () => {
-            panel.querySelector(".umi-image-details").style.display = "none";
+        const dateFrom = this.element.querySelector('[data-role="date-from"]');
+        const dateTo = this.element.querySelector('[data-role="date-to"]');
+        dateFrom.addEventListener('change', (e) => {
+            this.filters.dateFrom = e.target.value;
+            this.scheduleRefresh();
+        });
+        dateTo.addEventListener('change', (e) => {
+            this.filters.dateTo = e.target.value;
+            this.scheduleRefresh();
         });
 
-        // ESC key to close
-        document.addEventListener("keydown", (e) => {
-            if (e.key === "Escape" && panel.style.display === "flex") {
-                if (this.selectedImage) {
-                    panel.querySelector(".umi-image-details").style.display = "none";
-                    this.selectedImage = null;
+        const stepsMin = this.element.querySelector('[data-role="steps-min"]');
+        const stepsMax = this.element.querySelector('[data-role="steps-max"]');
+        stepsMin.addEventListener('input', (e) => {
+            this.filters.stepsMin = e.target.value;
+            this.scheduleRefresh();
+        });
+        stepsMax.addEventListener('input', (e) => {
+            this.filters.stepsMax = e.target.value;
+            this.scheduleRefresh();
+        });
+
+        const cfgMin = this.element.querySelector('[data-role="cfg-min"]');
+        const cfgMax = this.element.querySelector('[data-role="cfg-max"]');
+        cfgMin.addEventListener('input', (e) => {
+            this.filters.cfgMin = e.target.value;
+            this.scheduleRefresh();
+        });
+        cfgMax.addEventListener('input', (e) => {
+            this.filters.cfgMax = e.target.value;
+            this.scheduleRefresh();
+        });
+
+        const tagSearch = this.element.querySelector('[data-role="tag-search"]');
+        tagSearch.addEventListener('input', (e) => {
+            this.tagSearch = e.target.value.toLowerCase();
+            this.renderFacets();
+        });
+
+        const clearFilters = this.element.querySelector('[data-action="clear-filters"]');
+        clearFilters.addEventListener('click', () => {
+            this.resetFilters();
+        });
+
+        const compareBtn = this.element.querySelector('[data-action="compare"]');
+        compareBtn.addEventListener('click', () => this.showCompare());
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && this.element.style.display === 'flex') {
+                if (this.compareOverlay && this.compareOverlay.style.display === 'flex') {
+                    this.compareOverlay.style.display = 'none';
                 } else {
                     this.hide();
                 }
             }
         });
 
-        this.element = panel;
-        document.body.appendChild(panel);
-    }
-
-    async loadImages() {
-        const grid = this.element.querySelector(".umi-image-grid");
-        grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; color: #888; padding: 40px;">Loading images...</div>';
-
-        await this.fetchImages();
-        this.renderImages();
-        this.renderPagination();
-    }
-
-    filterImages() {
-        this.renderImages();
-    }
-
-    renderImages() {
-        const grid = this.element.querySelector(".umi-image-grid");
-
-        let filtered = this.images;
-
-        // Apply date filter
-        if (this.dateFilter !== "all") {
-            if (this.dateFilter === "custom") {
-                // Custom date range
-                if (this.dateFrom || this.dateTo) {
-                    const fromTime = this.dateFrom ? new Date(this.dateFrom).getTime() / 1000 : 0;
-                    const toTime = this.dateTo ? new Date(this.dateTo + "T23:59:59").getTime() / 1000 : Date.now() / 1000;
-
-                    filtered = filtered.filter(img => {
-                        if (this.dateFrom && this.dateTo) {
-                            return img.mtime >= fromTime && img.mtime <= toTime;
-                        } else if (this.dateFrom) {
-                            return img.mtime >= fromTime;
-                        } else if (this.dateTo) {
-                            return img.mtime <= toTime;
-                        }
-                        return true;
-                    });
-                }
-            } else {
-                // Preset date filters
-                const now = Date.now() / 1000; // Convert to Unix timestamp
-                let cutoff = 0;
-
-                if (this.dateFilter === "today") {
-                    const today = new Date();
-                    today.setHours(0, 0, 0, 0);
-                    cutoff = today.getTime() / 1000;
-                } else if (this.dateFilter === "week") {
-                    cutoff = now - (7 * 24 * 60 * 60);
-                } else if (this.dateFilter === "month") {
-                    cutoff = now - (30 * 24 * 60 * 60);
-                }
-
-                filtered = filtered.filter(img => img.mtime >= cutoff);
+        document.addEventListener('click', () => {
+            if (this.contextMenu && this.contextMenu.style.display === 'block') {
+                this.contextMenu.style.display = 'none';
             }
-        }
+        });
+    }
 
-        // Apply search filter
-        if (this.searchTerm) {
-            filtered = filtered.filter(img => {
-                const prompt = img.metadata?.prompt || "";
-                const negative = img.metadata?.negative || "";
-                const a1111 = img.metadata?.a1111_params || "";
-                return prompt.toLowerCase().includes(this.searchTerm) ||
-                    negative.toLowerCase().includes(this.searchTerm) ||
-                    a1111.toLowerCase().includes(this.searchTerm) ||
-                    img.filename.toLowerCase().includes(this.searchTerm);
-            });
-        }
+    resetFilters() {
+        this.filters = {
+            search: "",
+            favoritesOnly: false,
+            dateFrom: "",
+            dateTo: "",
+            stepsMin: "",
+            stepsMax: "",
+            cfgMin: "",
+            cfgMax: "",
+            recursive: true,
+            models: new Set(),
+            loras: new Set(),
+            samplers: new Set(),
+            tags: new Set()
+        };
+        this.tagSearch = "";
+        this.currentPage = 0;
+        this.element.querySelector('[data-role="search"]').value = "";
+        this.element.querySelector('[data-role="favorites-only"]').checked = false;
+        this.element.querySelector('[data-role="recursive-scan"]').checked = true;
+        this.element.querySelector('[data-role="date-from"]').value = "";
+        this.element.querySelector('[data-role="date-to"]').value = "";
+        this.element.querySelector('[data-role="steps-min"]').value = "";
+        this.element.querySelector('[data-role="steps-max"]').value = "";
+        this.element.querySelector('[data-role="cfg-min"]').value = "";
+        this.element.querySelector('[data-role="cfg-max"]').value = "";
+        this.element.querySelector('[data-role="tag-search"]').value = "";
+        this.loadImages();
+    }
 
-        if (filtered.length === 0) {
-            grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; color: #888; padding: 40px;">No images found</div>';
+    scheduleRefresh() {
+        if (this.refreshTimer) {
+            clearTimeout(this.refreshTimer);
+        }
+        this.refreshTimer = setTimeout(() => {
+            this.currentPage = 0;
+            this.loadImages();
+        }, 350);
+    }
+
+    buildQuery() {
+        const params = new URLSearchParams();
+        params.set('limit', String(this.pageSize));
+        params.set('offset', String(this.currentPage * this.pageSize));
+        params.set('sort', this.sortBy);
+        if (this.filters.search) params.set('search', this.filters.search);
+        if (this.filters.favoritesOnly) params.set('favorites', '1');
+        if (!this.filters.recursive) params.set('recursive', '0');
+        if (this.filters.dateFrom) params.set('date_from', this.filters.dateFrom);
+        if (this.filters.dateTo) params.set('date_to', this.filters.dateTo);
+        if (this.filters.stepsMin) params.set('steps_min', this.filters.stepsMin);
+        if (this.filters.stepsMax) params.set('steps_max', this.filters.stepsMax);
+        if (this.filters.cfgMin) params.set('cfg_min', this.filters.cfgMin);
+        if (this.filters.cfgMax) params.set('cfg_max', this.filters.cfgMax);
+        if (this.filters.models.size > 0) {
+            params.set('models', Array.from(this.filters.models).join(','));
+        }
+        if (this.filters.loras.size > 0) {
+            params.set('loras', Array.from(this.filters.loras).join(','));
+        }
+        if (this.filters.samplers.size > 0) {
+            params.set('samplers', Array.from(this.filters.samplers).join(','));
+        }
+        if (this.filters.tags.size > 0) {
+            params.set('tags', Array.from(this.filters.tags).join(','));
+        }
+        return params.toString();
+    }
+
+    async fetchImages(quick = false) {
+        try {
+            const quickFlag = quick ? '&quick=1' : '';
+            const response = await fetch(`/umiapp/images/scan?${this.buildQuery()}${quickFlag}`);
+            const data = await response.json();
+            this.images = data.images || [];
+            this.totalImages = data.total || 0;
+            this.facets = data.facets || { models: [], loras: [], samplers: [], tags: [] };
+            return this.images;
+        } catch (error) {
+            console.error('[Umi Image Browser] Failed to fetch images:', error);
+            return [];
+        }
+    }
+
+    async loadImages(quick = false) {
+        const grid = this.element.querySelector('[data-role="grid"]');
+        grid.innerHTML = '<div class="umi-ib-details-empty">Loading images...</div>';
+        await this.fetchImages(quick);
+        this.renderGrid();
+        this.renderPagination();
+        this.renderFacets();
+        this.updateCompareButton();
+    }
+
+    renderGrid() {
+        const grid = this.element.querySelector('[data-role="grid"]');
+        this.imageMap.clear();
+
+        if (!this.images.length) {
+            grid.innerHTML = '<div class="umi-ib-details-empty">No images found</div>';
             return;
         }
 
-        grid.innerHTML = filtered.map((img, index) => this.createImageCard(img, index)).join("");
+        grid.innerHTML = this.images.map(img => this.createCardHTML(img)).join('');
 
-        // Add click handlers
-        grid.querySelectorAll(".umi-image-card").forEach((card, index) => {
-            card.addEventListener("click", () => {
-                this.showImageDetails(filtered[index]);
+        grid.querySelectorAll('.umi-ib-card').forEach(card => {
+            const relPath = card.dataset.id;
+            const img = this.imageMap.get(relPath);
+
+            card.addEventListener('click', (e) => this.handleCardClick(img, e));
+            card.addEventListener('contextmenu', (e) => {
+                e.preventDefault();
+                this.showContextMenu(img, e.clientX, e.clientY);
             });
+
+            const favBtn = card.querySelector('.umi-ib-fav');
+            if (favBtn) {
+                favBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const isFavorite = !(img.annotations && img.annotations.favorite);
+                    this.updateAnnotations(img.relative_path, { favorite: isFavorite });
+                });
+            }
         });
     }
 
-    createImageCard(img) {
-        const hasPrompt = img.metadata?.prompt ? '✓' : '';
-        const resolution = `${img.metadata?.width || '?'}×${img.metadata?.height || '?'}`;
+    createCardHTML(img) {
+        this.imageMap.set(img.relative_path, img);
+        const hasPrompt = img.metadata && (img.metadata.prompt || img.metadata.umi_prompt);
+        const resolution = `${img.metadata?.width || '?'}x${img.metadata?.height || '?'}`;
+        const tags = (img.annotations?.tags || []).slice(0, 3);
+        const extraTagCount = (img.annotations?.tags || []).length - tags.length;
+        const tagHtml = tags.map(tag => {
+            return `<span class="umi-ib-tag">#${this.escapeHtml(tag)}</span>`;
+        }).join('') + (extraTagCount > 0 ? `<span class="umi-ib-tag">+${extraTagCount}</span>` : '');
+        const favClass = img.annotations?.favorite ? 'umi-ib-fav' : 'umi-ib-fav umi-ib-fav--off';
 
         return `
-            <div class="umi-image-card" style="
-                background: #2c2c2c;
-                border: 1px solid #444;
-                border-radius: 6px;
-                overflow: hidden;
-                cursor: pointer;
-                transition: all 0.2s;
-            " onmouseover="this.style.borderColor='#61afef'; this.style.transform='scale(1.02)'" onmouseout="this.style.borderColor='#444'; this.style.transform='scale(1)'">
-                <div style="
-                    width: 100%;
-                    height: 200px;
-                    background: url('${img.url}') center/cover;
-                    position: relative;
-                ">
-                    ${hasPrompt ? '<div style="position: absolute; top: 5px; right: 5px; background: #98c379; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600;">Has Prompt</div>' : ''}
+            <div class="umi-ib-card ${this.selectedIds.has(img.relative_path) ? 'selected' : ''}" data-id="${img.relative_path}">
+                <div class="umi-ib-thumb" style="background-image:url('${img.url}')">
+                    <button class="${favClass}">Fav</button>
+                    ${hasPrompt ? '<div class="umi-ib-badge">Prompt</div>' : ''}
                 </div>
-                <div style="padding: 8px;">
-                    <div style="font-size: 11px; color: #abb2bf; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${img.filename}">
-                        ${img.filename}
-                    </div>
-                    <div style="font-size: 10px; color: #666;">
-                        ${resolution} • ${(img.size / 1024).toFixed(1)} KB
-                    </div>
+                <div class="umi-ib-card-meta">
+                    <div class="umi-ib-card-name" title="${this.escapeHtml(img.filename)}">${this.escapeHtml(img.filename)}</div>
+                    <div class="umi-ib-card-sub">${resolution} | ${(img.size / 1024).toFixed(1)} KB</div>
+                    <div class="umi-ib-tags">${tagHtml}</div>
                 </div>
             </div>
         `;
     }
 
-    showImageDetails(img) {
-        this.selectedImage = img;
-        const sidebar = this.element.querySelector(".umi-image-details");
-        const content = this.element.querySelector(".umi-details-content");
+    handleCardClick(img, event) {
+        if (!img) return;
+        const relPath = img.relative_path;
 
-        sidebar.style.display = "flex";
-
-        const metadata = img.metadata || {};
-        console.log("[Umi Image Browser] Full image metadata:", img);
-        console.log("[Umi Image Browser] Metadata object:", metadata);
-
-        // Extract prompts: input (before wildcards) and output (after processing)
-        const inputPrompt = metadata.umi_input_prompt || "";
-        const inputNegative = metadata.umi_input_negative || "";
-        let outputPrompt = metadata.umi_prompt || metadata.prompt || "";
-        let outputNegative = metadata.umi_negative || metadata.negative || "";
-
-        // If still no output prompt, try A1111 params
-        if (!outputPrompt && metadata.a1111_params) {
-            const lines = metadata.a1111_params.split("\n");
-            if (lines.length > 0) {
-                outputPrompt = lines[0];
+        if (event.ctrlKey || event.metaKey) {
+            if (this.selectedIds.has(relPath)) {
+                this.selectedIds.delete(relPath);
+            } else {
+                this.selectedIds.add(relPath);
             }
-        }
-
-        // HTML escape function to properly display <lora:...> tags
-        const escapeHtml = (text) => {
-            if (!text) return "";
-            return text
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;")
-                .replace(/'/g, "&#039;");
-        };
-
-        // Build sections HTML
-        let sectionsHTML = '';
-
-        // Input Prompt Section (before wildcard processing)
-        if (inputPrompt) {
-            sectionsHTML += `
-                <div style="margin-bottom: 15px;">
-                    <div style="font-weight: 600; color: #98c379; margin-bottom: 5px; font-size: 13px;">📝 Input Prompt (with wildcards)</div>
-                    <div class="umi-input-prompt-box" style="
-                        background: #2c2c2c;
-                        padding: 10px;
-                        border-radius: 4px;
-                        font-size: 12px;
-                        color: #abb2bf;
-                        max-height: 150px;
-                        overflow-y: auto;
-                        word-wrap: break-word;
-                        margin-bottom: 8px;
-                    ">${escapeHtml(inputPrompt)}</div>
-                    <button class="umi-copy-input-prompt" style="
-                        width: 100%;
-                        padding: 8px;
-                        background: #98c379;
-                        color: white;
-                        border: none;
-                        border-radius: 4px;
-                        cursor: pointer;
-                        font-size: 12px;
-                        font-weight: 600;
-                    ">📋 Copy Input to Umi Node</button>
-                </div>
-            `;
-
-            if (inputNegative) {
-                sectionsHTML += `
-                    <div style="margin-bottom: 15px;">
-                        <div style="font-weight: 600; color: #e5c07b; margin-bottom: 5px; font-size: 13px;">📝 Input Negative</div>
-                        <div class="umi-input-negative-box" style="
-                            background: #2c2c2c;
-                            padding: 10px;
-                            border-radius: 4px;
-                            font-size: 12px;
-                            color: #abb2bf;
-                            max-height: 150px;
-                            overflow-y: auto;
-                            word-wrap: break-word;
-                        ">${escapeHtml(inputNegative)}</div>
-                    </div>
-                `;
-            }
-        }
-
-        // Output Prompt Section (after processing)
-        if (outputPrompt) {
-            sectionsHTML += `
-                <div style="margin-bottom: 15px;">
-                    <div style="font-weight: 600; color: #61afef; margin-bottom: 5px; font-size: 13px;">✨ Output Prompt (processed)</div>
-                    <div class="umi-output-prompt-box" style="
-                        background: #2c2c2c;
-                        padding: 10px;
-                        border-radius: 4px;
-                        font-size: 12px;
-                        color: #abb2bf;
-                        max-height: 150px;
-                        overflow-y: auto;
-                        word-wrap: break-word;
-                        margin-bottom: 8px;
-                    ">${escapeHtml(outputPrompt)}</div>
-                    <button class="umi-copy-output-prompt" style="
-                        width: 100%;
-                        padding: 8px;
-                        background: #61afef;
-                        color: white;
-                        border: none;
-                        border-radius: 4px;
-                        cursor: pointer;
-                        font-size: 12px;
-                        font-weight: 600;
-                    ">📋 Copy Output to Umi Node</button>
-                </div>
-            `;
-
-            if (outputNegative) {
-                sectionsHTML += `
-                    <div style="margin-bottom: 15px;">
-                        <div style="font-weight: 600; color: #e06c75; margin-bottom: 5px; font-size: 13px;">✨ Output Negative</div>
-                        <div class="umi-output-negative-box" style="
-                            background: #2c2c2c;
-                            padding: 10px;
-                            border-radius: 4px;
-                            font-size: 12px;
-                            color: #abb2bf;
-                            max-height: 150px;
-                            overflow-y: auto;
-                            word-wrap: break-word;
-                        ">${escapeHtml(outputNegative)}</div>
-                    </div>
-                `;
-            }
-        }
-
-        if (!sectionsHTML) {
-            sectionsHTML = '<div style="color: #888; text-align: center; padding: 20px;">No prompt metadata found</div>';
-        }
-
-        content.innerHTML = `
-            <div style="margin-bottom: 15px;">
-                <img src="${img.url}" style="width: 100%; border-radius: 4px; margin-bottom: 10px;" />
-                <div style="font-size: 12px; color: #888; margin-bottom: 10px;">
-                    ${img.filename}<br>
-                    ${metadata.width}×${metadata.height} • ${metadata.format || 'Unknown'}<br>
-                    ${new Date(img.mtime * 1000).toLocaleString()}
-                </div>
-            </div>
-
-            ${sectionsHTML}
-
-            <div style="display: flex; gap: 8px;">
-                <button class="umi-open-image" style="
-                    flex: 1;
-                    padding: 8px;
-                    background: #56b6c2;
-                    color: white;
-                    border: none;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    font-size: 12px;
-                    font-weight: 600;
-                ">🔗 Open Image</button>
-            </div>
-        `;
-
-        // Add button handlers
-        const copyInputBtn = content.querySelector(".umi-copy-input-prompt");
-        if (copyInputBtn) {
-            copyInputBtn.addEventListener("click", () => {
-                this.copyToUmiNode(inputPrompt, inputNegative);
-            });
-        }
-
-        const copyOutputBtn = content.querySelector(".umi-copy-output-prompt");
-        if (copyOutputBtn) {
-            copyOutputBtn.addEventListener("click", () => {
-                this.copyToUmiNode(outputPrompt, outputNegative);
-            });
-        }
-
-        content.querySelector(".umi-open-image").addEventListener("click", () => {
-            window.open(img.url, "_blank");
-        });
-    }
-
-    copyToUmiNode(prompt, negative) {
-        const activeNode = this.findActiveUmiNode();
-
-        if (activeNode) {
-            // Set positive prompt - widget name is "text" for both Full and Lite nodes
-            const promptWidget = activeNode.widgets.find(w => w.name === "text");
-            if (promptWidget && prompt) {
-                promptWidget.value = prompt;
-                if (promptWidget.callback) {
-                    promptWidget.callback(prompt);
-                }
-                // Trigger input event for syntax highlighting
-                if (promptWidget.inputEl) {
-                    promptWidget.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                }
-            }
-
-            // Set negative prompt if provided
-            if (negative) {
-                const negWidget = activeNode.widgets.find(w => w.name === "input_negative");
-                if (negWidget) {
-                    negWidget.value = negative;
-                    if (negWidget.callback) {
-                        negWidget.callback(negative);
-                    }
-                    // Trigger input event for syntax highlighting
-                    if (negWidget.inputEl) {
-                        negWidget.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                }
-            }
-
-            // Force graph redraw to ensure visibility
-            app.graph.setDirtyCanvas(true, true);
-
-            this.showNotification(`✓ Copied to ${activeNode.type}`);
+        } else if (event.shiftKey) {
+            this.selectedIds.add(relPath);
         } else {
-            // Fallback: copy to clipboard
-            let text = prompt;
-            if (negative) {
-                text += `\n\nNegative: ${negative}`;
-            }
-            navigator.clipboard.writeText(text);
-            this.showNotification("📋 Copied to clipboard (no active Umi node)");
-        }
-    }
-
-    findActiveUmiNode() {
-        const canvas = app.canvas;
-        if (!canvas) return null;
-
-        // Find selected Umi node
-        const selectedNodes = canvas.selected_nodes;
-        if (selectedNodes) {
-            for (const nodeId in selectedNodes) {
-                const node = app.graph.getNodeById(parseInt(nodeId));
-                if (node && (node.type === "UmiAIWildcardNode" || node.type === "UmiAIWildcardNodeLite")) {
-                    return node;
-                }
-            }
+            this.selectedIds.clear();
+            this.selectedIds.add(relPath);
         }
 
-        // Fallback: find any Umi node
-        for (const node of app.graph._nodes) {
-            if (node.type === "UmiAIWildcardNode" || node.type === "UmiAIWildcardNodeLite") {
-                return node;
-            }
-        }
-
-        return null;
+        this.selectedImage = img;
+        this.renderGrid();
+        this.renderDetails();
+        this.updateCompareButton();
     }
 
     renderPagination() {
-        const pagination = this.element.querySelector(".umi-pagination");
+        const pagination = this.element.querySelector('[data-role="pagination"]');
         const totalPages = Math.ceil(this.totalImages / this.pageSize);
 
         if (totalPages <= 1) {
@@ -630,72 +809,423 @@ class ImageBrowser {
             return;
         }
 
-        const buttons = [];
+        pagination.innerHTML = `
+            <button class="umi-ib-btn" data-page="${this.currentPage - 1}" ${this.currentPage === 0 ? 'disabled' : ''}>Prev</button>
+            <span class="umi-ib-chip">Page ${this.currentPage + 1} of ${totalPages} (${this.totalImages})</span>
+            <button class="umi-ib-btn" data-page="${this.currentPage + 1}" ${this.currentPage >= totalPages - 1 ? 'disabled' : ''}>Next</button>
+        `;
 
-        // Previous button
-        buttons.push(`
-            <button class="umi-page-btn" data-page="${this.currentPage - 1}" ${this.currentPage === 0 ? 'disabled' : ''} style="
-                padding: 6px 12px;
-                background: #2c2c2c;
-                color: #abb2bf;
-                border: 1px solid #555;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 12px;
-            ">← Prev</button>
-        `);
-
-        // Page info
-        buttons.push(`
-            <span style="color: #888; font-size: 13px;">
-                Page ${this.currentPage + 1} of ${totalPages} (${this.totalImages} images)
-            </span>
-        `);
-
-        // Next button
-        buttons.push(`
-            <button class="umi-page-btn" data-page="${this.currentPage + 1}" ${this.currentPage >= totalPages - 1 ? 'disabled' : ''} style="
-                padding: 6px 12px;
-                background: #2c2c2c;
-                color: #abb2bf;
-                border: 1px solid #555;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 12px;
-            ">Next →</button>
-        `);
-
-        pagination.innerHTML = buttons.join('');
-
-        // Add click handlers
-        pagination.querySelectorAll(".umi-page-btn:not([disabled])").forEach(btn => {
-            btn.addEventListener("click", () => {
-                this.currentPage = parseInt(btn.dataset.page);
+        pagination.querySelectorAll('button[data-page]:not([disabled])').forEach(btn => {
+            btn.addEventListener('click', () => {
+                this.currentPage = parseInt(btn.dataset.page, 10);
                 this.loadImages();
             });
         });
     }
 
+    renderFacets() {
+        ['models', 'loras', 'samplers', 'tags'].forEach((facet) => {
+            const container = this.element.querySelector(`[data-facet="${facet}"]`);
+            if (!container) return;
+
+            let list = this.facets[facet] || [];
+            if (facet === 'tags' && this.tagSearch) {
+                list = list.filter(item => item.name.toLowerCase().includes(this.tagSearch));
+            }
+
+            if (!list.length) {
+                container.innerHTML = '<div class="umi-ib-details-empty">None</div>';
+                return;
+            }
+
+            container.innerHTML = list.slice(0, 50).map(item => {
+                const selected = this.filters[facet].has(item.name);
+                return `
+                    <div class="umi-ib-facet-item">
+                        <label>
+                            <input type="checkbox" data-facet-item="${facet}" data-value="${this.escapeHtml(item.name)}" ${selected ? 'checked' : ''} />
+                            <span>${this.escapeHtml(item.name)}</span>
+                        </label>
+                        <span class="umi-ib-facet-count">${item.count}</span>
+                    </div>
+                `;
+            }).join('');
+
+            container.querySelectorAll('input[type="checkbox"]').forEach(input => {
+                input.addEventListener('change', (e) => {
+                    const value = e.target.dataset.value;
+                    if (!value) return;
+                    if (e.target.checked) {
+                        this.filters[facet].add(value);
+                    } else {
+                        this.filters[facet].delete(value);
+                    }
+                    this.currentPage = 0;
+                    this.loadImages();
+                });
+            });
+        });
+    }
+
+    setDetailsVisible(isVisible) {
+        const details = this.element.querySelector('[data-role="details"]');
+        const body = this.element.querySelector('.umi-ib-body');
+        if (!details || !body) return;
+        if (isVisible) {
+            details.style.display = 'block';
+            body.style.gridTemplateColumns = '260px minmax(0, 1fr) 360px';
+        } else {
+            details.style.display = 'none';
+            body.style.gridTemplateColumns = '260px minmax(0, 1fr)';
+        }
+    }
+
+    renderDetails() {
+        const details = this.element.querySelector('[data-role="details"]');
+        if (!this.selectedImage) {
+            this.setDetailsVisible(false);
+            details.innerHTML = '<div class="umi-ib-details-empty">Select an image to view details.</div>';
+            return;
+        }
+
+        this.setDetailsVisible(true);
+        const img = this.selectedImage;
+        const metadata = img.metadata || {};
+        const derived = img.derived || {};
+        const annotations = img.annotations || {};
+
+        const inputPrompt = metadata.umi_input_prompt || "";
+        const inputNegative = metadata.umi_input_negative || "";
+        const outputPrompt = metadata.umi_prompt || metadata.prompt || "";
+        const outputNegative = metadata.umi_negative || metadata.negative || "";
+
+        const tagChips = (annotations.tags || []).map(tag => `
+            <span class="umi-ib-tag" data-tag="${this.escapeHtmlAttr(tag)}">${this.escapeHtml(tag)}</span>
+        `).join('');
+
+        details.innerHTML = `
+            <div class="umi-ib-detail-section">
+                <img class="umi-ib-detail-image" src="${img.url}" />
+                <div class="umi-ib-detail-title">${this.escapeHtml(img.filename)}</div>
+                <div class="umi-ib-detail-meta">
+                    ${metadata.width || '?'}x${metadata.height || '?'} | ${(img.size / 1024).toFixed(1)} KB<br />
+                    ${new Date(img.mtime * 1000).toLocaleString()}
+                </div>
+                <div class="umi-ib-detail-actions">
+                    <button class="umi-ib-btn" data-action="toggle-favorite">${annotations.favorite ? 'Unfavorite' : 'Favorite'}</button>
+                    <button class="umi-ib-btn" data-action="open-image">Open</button>
+                </div>
+            </div>
+
+            <div class="umi-ib-detail-section">
+                <div class="umi-ib-detail-label">Tags</div>
+                <div>${tagChips || '<span class="umi-ib-details-empty">No tags</span>'}</div>
+                <div class="umi-ib-detail-actions">
+                    <input class="umi-ib-input" data-role="tag-input" placeholder="Add tag" />
+                    <button class="umi-ib-btn" data-action="add-tag">Add</button>
+                </div>
+            </div>
+
+            <div class="umi-ib-detail-section">
+                <div class="umi-ib-detail-label">Metadata</div>
+                <div class="umi-ib-detail-box">Model: ${this.escapeHtml((derived.models || [])[0] || 'Unknown')}
+Sampler: ${this.escapeHtml(derived.sampler || 'Unknown')}
+Steps: ${derived.steps ?? 'Unknown'}
+CFG: ${derived.cfg ?? 'Unknown'}
+Seed: ${derived.seed ?? 'Unknown'}
+LoRAs: ${(derived.loras || []).length ? this.escapeHtml((derived.loras || []).join(', ')) : 'None'}</div>
+            </div>
+
+            ${this.renderPromptSection('Input Prompt', inputPrompt, inputNegative)}
+            ${this.renderPromptSection('Output Prompt', outputPrompt, outputNegative)}
+        `;
+
+        const openBtn = details.querySelector('[data-action="open-image"]');
+        if (openBtn) {
+            openBtn.addEventListener('click', () => window.open(img.url, '_blank'));
+        }
+
+        const favBtn = details.querySelector('[data-action="toggle-favorite"]');
+        if (favBtn) {
+            favBtn.addEventListener('click', () => {
+                this.updateAnnotations(img.relative_path, { favorite: !annotations.favorite });
+            });
+        }
+
+        const addTagBtn = details.querySelector('[data-action="add-tag"]');
+        if (addTagBtn) {
+            addTagBtn.addEventListener('click', () => this.addTagFromDetails());
+        }
+
+        details.querySelectorAll('[data-tag]').forEach(tagEl => {
+            tagEl.addEventListener('click', () => {
+                const tagValue = tagEl.dataset.tag;
+                if (!tagValue) return;
+                const nextTags = (annotations.tags || []).filter(tag => tag !== tagValue);
+                this.updateAnnotations(img.relative_path, { tags: nextTags });
+            });
+        });
+
+        details.querySelectorAll('[data-role="copy-to-node"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const prompt = btn.dataset.prompt || '';
+                const negative = btn.dataset.negative || '';
+                this.copyToUmiNode(prompt, negative);
+            });
+        });
+
+        details.querySelectorAll('[data-role="copy-to-clipboard"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const text = btn.dataset.text || '';
+                navigator.clipboard.writeText(text || '');
+                this.showNotification('Copied to clipboard');
+            });
+        });
+    }
+
+    renderPromptSection(title, prompt, negative) {
+        if (!prompt && !negative) {
+            return '';
+        }
+
+        const promptSafe = this.escapeHtml(prompt || '');
+        const negativeSafe = this.escapeHtml(negative || '');
+        return `
+            <div class="umi-ib-detail-section">
+                <div class="umi-ib-detail-label">${title}</div>
+                ${prompt ? `<div class="umi-ib-detail-box">${promptSafe}</div>` : ''}
+                <div class="umi-ib-detail-actions">
+                    <button class="umi-ib-btn" data-role="copy-to-node" data-prompt="${this.escapeHtmlAttr(prompt || '')}" data-negative="${this.escapeHtmlAttr(negative || '')}">Copy to Umi</button>
+                    <button class="umi-ib-btn" data-role="copy-to-clipboard" data-text="${this.escapeHtmlAttr(prompt || '')}">Copy prompt</button>
+                </div>
+                ${negative ? `<div class="umi-ib-detail-label" style="margin-top:8px;">Negative</div><div class="umi-ib-detail-box">${negativeSafe}</div>` : ''}
+            </div>
+        `;
+    }
+
+    addTagFromDetails() {
+        const details = this.element.querySelector('[data-role="details"]');
+        const input = details.querySelector('[data-role="tag-input"]');
+        if (!input || !this.selectedImage) return;
+        const value = input.value.trim();
+        if (!value) return;
+        const currentTags = new Set(this.selectedImage.annotations?.tags || []);
+        currentTags.add(value);
+        input.value = '';
+        this.updateAnnotations(this.selectedImage.relative_path, { tags: Array.from(currentTags) });
+    }
+
+    updateCompareButton() {
+        const compareBtn = this.element.querySelector('[data-action="compare"]');
+        if (!compareBtn) return;
+        const size = this.selectedIds.size;
+        compareBtn.disabled = size < 2;
+        compareBtn.textContent = size >= 2 ? `Compare (${size})` : 'Compare';
+    }
+
+    showCompare() {
+        if (!this.compareOverlay) return;
+        const selected = Array.from(this.selectedIds).slice(0, 2).map(id => this.imageMap.get(id)).filter(Boolean);
+        if (selected.length < 2) {
+            this.showNotification('Select two images to compare');
+            return;
+        }
+
+        this.compareOverlay.innerHTML = `
+            <div class="umi-ib-compare-header">
+                <div class="umi-ib-title">Compare</div>
+                <button class="umi-ib-btn" data-action="close-compare">Close</button>
+            </div>
+            <div class="umi-ib-compare-body">
+                ${selected.map(img => `
+                    <div class="umi-ib-compare-card">
+                        <img src="${img.url}" />
+                        <div class="umi-ib-detail-title">${this.escapeHtml(img.filename)}</div>
+                        <div class="umi-ib-detail-meta">${img.metadata?.width || '?'}x${img.metadata?.height || '?'} | ${(img.size / 1024).toFixed(1)} KB</div>
+                        <div class="umi-ib-detail-box">${this.escapeHtml((img.metadata?.umi_prompt || img.metadata?.prompt || '').slice(0, 800))}</div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+        this.compareOverlay.style.display = 'flex';
+
+        const closeBtn = this.compareOverlay.querySelector('[data-action="close-compare"]');
+        closeBtn.addEventListener('click', () => {
+            this.compareOverlay.style.display = 'none';
+        });
+    }
+
+    showContextMenu(img, x, y) {
+        if (!this.contextMenu || !img) return;
+        const prompt = img.metadata?.umi_prompt || img.metadata?.prompt || '';
+        const negative = img.metadata?.umi_negative || img.metadata?.negative || '';
+        const seed = img.derived?.seed ?? '';
+        const model = (img.derived?.models || [])[0] || '';
+
+        this.contextMenu.innerHTML = `
+            <button data-action="copy-prompt">Copy prompt</button>
+            <button data-action="copy-negative">Copy negative</button>
+            <button data-action="copy-seed">Copy seed</button>
+            <button data-action="copy-model">Copy model</button>
+            <button data-action="open-image">Open image</button>
+        `;
+
+        this.contextMenu.style.left = `${x}px`;
+        this.contextMenu.style.top = `${y}px`;
+        this.contextMenu.style.display = 'block';
+
+        this.contextMenu.querySelector('[data-action="copy-prompt"]').addEventListener('click', () => {
+            navigator.clipboard.writeText(prompt || '');
+            this.contextMenu.style.display = 'none';
+            this.showNotification('Prompt copied');
+        });
+        this.contextMenu.querySelector('[data-action="copy-negative"]').addEventListener('click', () => {
+            navigator.clipboard.writeText(negative || '');
+            this.contextMenu.style.display = 'none';
+            this.showNotification('Negative copied');
+        });
+        this.contextMenu.querySelector('[data-action="copy-seed"]').addEventListener('click', () => {
+            navigator.clipboard.writeText(String(seed || ''));
+            this.contextMenu.style.display = 'none';
+            this.showNotification('Seed copied');
+        });
+        this.contextMenu.querySelector('[data-action="copy-model"]').addEventListener('click', () => {
+            navigator.clipboard.writeText(String(model || ''));
+            this.contextMenu.style.display = 'none';
+            this.showNotification('Model copied');
+        });
+        this.contextMenu.querySelector('[data-action="open-image"]').addEventListener('click', () => {
+            window.open(img.url, '_blank');
+            this.contextMenu.style.display = 'none';
+        });
+    }
+
+    async updateAnnotations(relPath, updates) {
+        try {
+            const response = await fetch('/umiapp/images/annotations/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ relative_path: relPath, ...updates })
+            });
+            const data = await response.json();
+            if (data.item) {
+                const target = this.images.find(img => img.relative_path === relPath);
+                if (target) {
+                    target.annotations = data.item;
+                }
+                if (this.selectedImage && this.selectedImage.relative_path === relPath) {
+                    this.selectedImage.annotations = data.item;
+                }
+                this.renderGrid();
+                this.renderDetails();
+                this.renderFacets();
+            }
+        } catch (error) {
+            console.error('[Umi Image Browser] Failed to update annotations:', error);
+        }
+    }
+
+    copyToUmiNode(prompt, negative) {
+        const activeNode = this.findActiveUmiNode();
+
+        if (activeNode) {
+            const promptWidget = activeNode.widgets.find(w => w.name === 'text');
+            if (promptWidget && prompt) {
+                promptWidget.value = prompt;
+                if (promptWidget.callback) {
+                    promptWidget.callback(prompt);
+                }
+                if (promptWidget.inputEl) {
+                    promptWidget.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }
+
+            if (negative) {
+                const negWidget = activeNode.widgets.find(w => w.name === 'input_negative');
+                if (negWidget) {
+                    negWidget.value = negative;
+                    if (negWidget.callback) {
+                        negWidget.callback(negative);
+                    }
+                    if (negWidget.inputEl) {
+                        negWidget.inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }
+            }
+
+            app.graph.setDirtyCanvas(true, true);
+            this.showNotification(`Copied to ${activeNode.type}`);
+        } else {
+            let text = prompt || '';
+            if (negative) {
+                text += `\n\nNegative: ${negative}`;
+            }
+            navigator.clipboard.writeText(text);
+            this.showNotification('Copied to clipboard (no active Umi node)');
+        }
+    }
+
+    findActiveUmiNode() {
+        const canvas = app.canvas;
+        if (!canvas) return null;
+
+        const selectedNodes = canvas.selected_nodes;
+        if (selectedNodes) {
+            for (const nodeId in selectedNodes) {
+                const node = app.graph.getNodeById(parseInt(nodeId, 10));
+                if (node && (node.type === 'UmiAIWildcardNode' || node.type === 'UmiAIWildcardNodeLite')) {
+                    return node;
+                }
+            }
+        }
+
+        for (const node of app.graph._nodes) {
+            if (node.type === 'UmiAIWildcardNode' || node.type === 'UmiAIWildcardNodeLite') {
+                return node;
+            }
+        }
+
+        return null;
+    }
+
     showNotification(message) {
-        const notification = document.createElement("div");
+        const notification = document.createElement('div');
         notification.style.cssText = `
             position: fixed;
             top: 20px;
             right: 20px;
-            background: #98c379;
+            background: #2f7d4b;
             color: white;
-            padding: 12px 20px;
-            border-radius: 4px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-            z-index: 10001;
-            font-size: 14px;
+            padding: 10px 16px;
+            border-radius: 6px;
+            z-index: 10003;
+            font-size: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
         `;
         notification.textContent = message;
         document.body.appendChild(notification);
+        setTimeout(() => notification.remove(), 2000);
+    }
 
-        setTimeout(() => {
-            notification.remove();
-        }, 2000);
+    escapeHtml(text) {
+        if (!text) return '';
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    escapeHtmlAttr(text) {
+        if (!text) return '';
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;')
+            .replace(/\n/g, '&#10;');
     }
 
     async show() {
@@ -703,40 +1233,40 @@ class ImageBrowser {
             this.createPanel();
         }
 
-        this.element.style.display = "flex";
+        this.element.style.display = 'block';
         this.currentPage = 0;
-        await this.loadImages();
+        await this.loadImages(true);
+        setTimeout(() => {
+            this.loadImages(false);
+        }, 400);
     }
 
     hide() {
         if (this.element) {
-            this.element.style.display = "none";
+            this.element.style.display = 'none';
             this.selectedImage = null;
+            this.selectedIds.clear();
         }
     }
 }
 
-// Global instance
 const imageBrowser = new ImageBrowser();
 
-// Register extension
 app.registerExtension({
-    name: "Umi.ImageBrowser",
+    name: 'Umi.ImageBrowser',
 
     async setup() {
-        // Add menu button
-        const menu = document.querySelector(".comfy-menu");
+        const menu = document.querySelector('.comfy-menu');
         if (menu) {
-            const button = document.createElement("button");
-            button.textContent = "🖼️ Image Browser";
-            button.style.cssText = "margin-left: 4px;";
+            const button = document.createElement('button');
+            button.textContent = 'Image Browser';
+            button.style.cssText = 'margin-left: 4px;';
             button.onclick = () => imageBrowser.show();
             menu.appendChild(button);
         }
 
-        // Add keyboard shortcut (Ctrl+I)
-        document.addEventListener("keydown", (e) => {
-            if (e.ctrlKey && e.key === "i") {
+        document.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'i') {
                 e.preventDefault();
                 imageBrowser.show();
             }

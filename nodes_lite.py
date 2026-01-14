@@ -821,6 +821,62 @@ def append_trace_summary(prompt, variables):
 class LoRAHandler(LoRAHandlerBase):
     def __init__(self):
         super().__init__()
+        self._cache_dir = os.path.dirname(__file__)
+
+    def _load_json_file(self, path):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _get_override_tags(self, base_name):
+        overrides_path = os.path.join(self._cache_dir, "lora_overrides.json")
+        overrides = self._load_json_file(overrides_path) or {}
+        override = overrides.get(base_name, {})
+        tags = override.get("tags") if isinstance(override, dict) else None
+        if isinstance(tags, list):
+            return [str(t).strip() for t in tags if str(t).strip()]
+        return []
+
+    def _get_civitai_info_tags(self, lora_path):
+        civitai_info_path = os.path.splitext(lora_path)[0] + ".civitai.info"
+        civitai_info = self._load_json_file(civitai_info_path) or {}
+        activation_text = civitai_info.get("activation text", "")
+        if not activation_text:
+            return []
+        return [t.strip() for t in activation_text.split(",") if t.strip()]
+
+    def _get_civitai_cache_tags(self, base_name):
+        cache_path = os.path.join(self._cache_dir, "civitai_cache.json")
+        cache = self._load_json_file(cache_path) or {}
+        civitai_data = cache.get(base_name, {})
+        tags = civitai_data.get("trigger_words")
+        if isinstance(tags, list):
+            return [str(t).strip() for t in tags if str(t).strip()]
+        return []
+
+    def get_activation_tags(self, lora_name, lora_path, max_tags=20):
+        base_name = os.path.splitext(os.path.basename(lora_name))[0]
+        if lora_path:
+            base_name = os.path.splitext(os.path.basename(lora_path))[0]
+
+        override_tags = self._get_override_tags(base_name)
+        if override_tags:
+            return override_tags[:max_tags], "override"
+
+        if lora_path:
+            civitai_info_tags = self._get_civitai_info_tags(lora_path)
+            if civitai_info_tags:
+                return civitai_info_tags[:max_tags], "civitai_info"
+
+        civitai_cache_tags = self._get_civitai_cache_tags(base_name)
+        if civitai_cache_tags:
+            return civitai_cache_tags[:max_tags], "civitai_cache"
+
+        return [], "none"
     
     def extract_and_load(self, text, model, clip, lora_behavior, cache_limit):
         lora_pattern = r'<lora:([^:>]+):([0-9.]+)>'
@@ -957,6 +1013,10 @@ class LoRAHandler(LoRAHandlerBase):
 
         if lora_path is None or not lora_path.endswith('.safetensors'):
             return ""
+
+        activation_tags, tag_source = self.get_activation_tags(lora_name, lora_path, max_tags=20)
+        if activation_tags:
+            return ", ".join(activation_tags)
 
         try:
             with safe_open(lora_path, framework="pt", device="cpu") as f:

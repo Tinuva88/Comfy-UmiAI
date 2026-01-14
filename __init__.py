@@ -20,6 +20,14 @@ except Exception:
     except Exception:
         _umi_utilities = None
 
+try:
+    from . import bgrm as _bgrm
+except Exception:
+    try:
+        import bgrm as _bgrm
+    except Exception:
+        _bgrm = None
+
 # 1. Setup the API Route
 def _resolve_umi_asset_path(*parts):
     base_dir = os.path.dirname(__file__)
@@ -958,11 +966,15 @@ NODE_CLASS_MAPPINGS = {}
 NODE_CLASS_MAPPINGS.update(CORE_NODE_CLASS_MAPPINGS)
 if _umi_utilities is not None:
     NODE_CLASS_MAPPINGS.update(_umi_utilities.NODE_CLASS_MAPPINGS)
+if _bgrm is not None:
+    NODE_CLASS_MAPPINGS.update(_bgrm.NODE_CLASS_MAPPINGS)
 
 NODE_DISPLAY_NAME_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS.update(CORE_NODE_DISPLAY_NAME_MAPPINGS)
 if _umi_utilities is not None:
     NODE_DISPLAY_NAME_MAPPINGS.update(_umi_utilities.NODE_DISPLAY_NAME_MAPPINGS)
+if _bgrm is not None:
+    NODE_DISPLAY_NAME_MAPPINGS.update(_bgrm.NODE_DISPLAY_NAME_MAPPINGS)
 
 # 3. Expose the web directory
 WEB_DIRECTORY = "./js"
