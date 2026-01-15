@@ -14,6 +14,7 @@ class LoraBrowserPanel {
         this.sourceFilter = "all";
         this.tagsOnly = false;
         this.editDialog = null;
+        this.hasLoaded = false;
     }
 
     async fetchLoras() {
@@ -49,16 +50,16 @@ class LoraBrowserPanel {
         panel.innerHTML = `
             <style>
                 .umi-lb-root { display: flex; flex-direction: column; height: 100%; width: 100%; }
-                .umi-lb-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-bottom: 1px solid #20242c; background: linear-gradient(135deg, #1d2230 0%, #151a24 100%); }
+                .umi-lb-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-bottom: 1px solid #20242c; background: linear-gradient(135deg, #1d2230 0%, #151a24 100%); flex-wrap: wrap; gap: 8px; }
                 .umi-lb-title { font-size: 18px; font-weight: 600; color: #8fc6ff; }
-                .umi-lb-actions { display: flex; gap: 8px; align-items: center; }
+                .umi-lb-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; row-gap: 6px; }
                 .umi-lb-btn { background: #2a303b; color: #d7dae0; border: 1px solid #3b4250; padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
                 .umi-lb-btn:hover { border-color: #5b6b85; }
                 .umi-lb-select { background: #1c212b; color: #d7dae0; border: 1px solid #3b4250; padding: 6px 8px; border-radius: 6px; font-size: 12px; }
                 .umi-lb-body { display: grid; grid-template-columns: 260px minmax(0, 1fr) 360px; height: 100%; width: 100%; flex: 1; min-height: 0; }
                 .umi-lb-sidebar { border-right: 1px solid #20242c; padding: 14px; overflow-y: auto; background: #12161f; min-width: 0; }
                 .umi-lb-main { position: relative; overflow: hidden; display: flex; flex-direction: column; min-width: 0; flex: 1; }
-                .umi-lb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; padding: 14px; overflow-y: auto; height: 100%; min-height: 0; }
+                .umi-lb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 220px)); grid-auto-rows: max-content; align-content: start; align-items: start; justify-content: start; gap: 12px; padding: 14px; overflow-y: auto; height: 100%; min-height: 0; }
                 .umi-lb-pagination { display: flex; justify-content: center; align-items: center; gap: 8px; padding: 10px; border-top: 1px solid #20242c; background: #10141d; }
                 .umi-lb-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; background: #1c212b; border: 1px solid #2a303b; padding: 4px 8px; border-radius: 6px; }
                 .umi-lb-details { border-left: 1px solid #20242c; padding: 14px; overflow-y: auto; background: #12161f; min-width: 0; }
@@ -66,14 +67,16 @@ class LoraBrowserPanel {
                 .umi-lb-section-title { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #8b93a6; margin-bottom: 8px; }
                 .umi-lb-input { width: 100%; padding: 6px 8px; background: #1c212b; border: 1px solid #313847; border-radius: 6px; color: #d7dae0; font-size: 12px; }
                 .umi-lb-checkbox { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #c1c7d4; }
-                .umi-lb-card { background: #1a1f2b; border: 1px solid #2a303b; border-radius: 8px; overflow: hidden; cursor: pointer; transition: transform 0.1s ease, border-color 0.1s ease; position: relative; }
+                .umi-lb-card { background: #1a1f2b; border: 1px solid #2a303b; border-radius: 8px; overflow: hidden; cursor: pointer; transition: transform 0.1s ease, border-color 0.1s ease; position: relative; display: flex; flex-direction: column; }
                 .umi-lb-card:hover { border-color: #4c6b9a; transform: translateY(-2px); }
                 .umi-lb-card.selected { border-color: #8fc6ff; box-shadow: 0 0 0 1px #8fc6ff inset; }
-                .umi-lb-thumb { width: 100%; height: 140px; background-size: cover; background-position: center; position: relative; }
-                .umi-lb-card-meta { padding: 8px; }
+                .umi-lb-thumb { width: 100%; height: 140px; background: #0f1115; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
+                .umi-lb-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; z-index: 1; }
+                .umi-lb-thumb-title { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 8px; font-size: 11px; color: #e3e7ef; background: linear-gradient(180deg, rgba(15, 17, 21, 0) 0%, rgba(15, 17, 21, 0.85) 60%, rgba(15, 17, 21, 0.95) 100%); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6); z-index: 2; pointer-events: none; }
+                .umi-lb-card-meta { padding: 8px; background: #161b25; position: relative; z-index: 2; }
                 .umi-lb-card-name { font-size: 11px; color: #c7cbd6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
                 .umi-lb-card-sub { font-size: 10px; color: #7b8499; margin-top: 4px; }
-                .umi-lb-badge { position: absolute; top: 6px; right: 6px; background: #2f7d4b; color: #fff; padding: 2px 6px; font-size: 9px; border-radius: 4px; }
+                .umi-lb-badge { position: absolute; top: 6px; right: 6px; background: #2f7d4b; color: #fff; padding: 2px 6px; font-size: 9px; border-radius: 4px; z-index: 2; }
                 .umi-lb-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
                 .umi-lb-tag { background: #2a303b; color: #c1c7d4; font-size: 9px; padding: 2px 6px; border-radius: 4px; }
                 .umi-lb-details-empty { color: #7b8499; text-align: center; padding: 20px; font-size: 12px; }
@@ -128,6 +131,7 @@ class LoraBrowserPanel {
                         <div class="umi-lb-section">
                             <div class="umi-lb-section-title">Actions</div>
                             <button class="umi-lb-btn" data-action="refresh">Refresh</button>
+                            <button class="umi-lb-btn" data-action="fetch-all">Fetch CivitAI</button>
                         </div>
                         <div class="umi-lb-section">
                             <div class="umi-lb-section-title">Fetch status</div>
@@ -195,8 +199,9 @@ class LoraBrowserPanel {
             this.renderLoras();
         });
 
-        const fetchAll = this.element.querySelector('[data-action="fetch-all"]');
-        fetchAll.addEventListener('click', () => this.fetchAllCivitai());
+        this.element.querySelectorAll('[data-action="fetch-all"]').forEach((btn) => {
+            btn.addEventListener('click', () => this.fetchAllCivitai());
+        });
     }
 
     getActivationTags(lora) {
@@ -241,10 +246,15 @@ class LoraBrowserPanel {
         });
     }
 
-    async loadLoras() {
+    async loadLoras(force = false) {
         const grid = this.element.querySelector('[data-role="grid"]');
+        if (this.loras.length > 0 && this.hasLoaded && !force) {
+            this.renderLoras();
+            return;
+        }
         grid.innerHTML = '<div class="umi-lb-details-empty">Loading LoRAs...</div>';
         await this.fetchLoras();
+        this.hasLoaded = true;
         this.renderLoras();
     }
 
@@ -303,8 +313,10 @@ class LoraBrowserPanel {
 
         return `
             <div class="umi-lb-card ${selectedClass}">
-                <div class="umi-lb-thumb" style="background-image:url('${previewUrl || ""}')">
+                <div class="umi-lb-thumb">
+                    ${previewUrl ? `<img src="${previewUrl}" alt="${this.escapeHtmlAttr(lora.name)}" loading="lazy" />` : ''}
                     ${badge}
+                    <div class="umi-lb-thumb-title" title="${this.escapeHtml(lora.name)}">${this.escapeHtml(lora.name)}</div>
                 </div>
                 <div class="umi-lb-card-meta">
                     <div class="umi-lb-card-name" title="${this.escapeHtml(lora.name)}">${this.escapeHtml(lora.name)}</div>
@@ -598,7 +610,7 @@ class LoraBrowserPanel {
         }
 
         this.element.style.display = "block";
-        await this.loadLoras();
+        await this.loadLoras(false);
     }
 
     hide() {

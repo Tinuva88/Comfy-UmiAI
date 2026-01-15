@@ -151,7 +151,9 @@ class ImageBrowser {
                 }
                 .umi-ib-grid {
                     display: grid;
-                    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                    grid-template-columns: repeat(auto-fill, minmax(200px, 200px));
+                    justify-content: start;
+                    align-content: start;
                     gap: 12px;
                     padding: 14px;
                     overflow-y: auto;
