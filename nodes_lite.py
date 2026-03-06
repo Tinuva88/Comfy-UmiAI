@@ -991,7 +991,7 @@ class LoRAHandler(LoRAHandlerBase):
             return [], "none"
     
     def extract_and_load(self, text, model, clip, lora_behavior, cache_limit):
-        lora_pattern = r'<lora:([^:>]+):([0-9.]+)>'
+        lora_pattern = r'<lora:([^:>]+):([-+]?[0-9.]+)>'
         lora_matches = re.findall(lora_pattern, text)
 
         lora_info_parts = []
@@ -1003,9 +1003,6 @@ class LoRAHandler(LoRAHandlerBase):
             # Input validation: clamp strength to valid range
             try:
                 strength = float(strength_str)
-                if strength < 0.0 or strength > 5.0:
-                    print(f"[UmiAI Lite] WARNING: LoRA strength {strength} for '{lora_name}' is out of range. Clamping to [0.0, 5.0].")
-                    strength = max(0.0, min(5.0, strength))
             except ValueError:
                 print(f"[UmiAI Lite] ERROR: Invalid LoRA strength '{strength_str}' for '{lora_name}'. Using 1.0 as default.")
                 strength = 1.0
