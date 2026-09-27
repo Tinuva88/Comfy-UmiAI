@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { ensureUmiTheme } from "./umi_theme.js";
 
 class LoraBrowserPanel {
   constructor() {
@@ -14,27 +15,58 @@ class LoraBrowserPanel {
     this.pageSize = 30;
     this.cardSize = "medium";
     this.sourceFilter = "all";
+    this.metadataFilter = "all";
+    this.sortBy = "name";
     this.pathFilter = "";
     this.tagsOnly = false;
     this.baseModels = [];
+    this.folders = [];
+    this.selectedFolders = new Set();
     this.selectedBaseModels = new Set();
+    this.selectedIds = new Set();
     this.hasLoaded = false;
     this.expandedFolders = new Set(["Lora"]);
     this.resizeObserver = null;
     this.showAllTags = false;
     this.manualFolderSelection = false;
     this.fetchStats = { current: 0, total: 0, currentName: "" };
+    this.wildcards = [];
+    this.wildcardTarget = "";
+    this.lastError = null;
+    this.previousFocus = null;
+    this.fetchGeneration = 0;
   }
 
-  async fetchLoras() {
+  async fetchLoras(force = false) {
+    const generation = ++this.fetchGeneration;
     try {
-      const response = await fetch("/umiapp/loras");
-      const data = await response.json();
+      const response = await fetch(force ? "/umiapp/loras?force=1" : "/umiapp/loras");
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (parseError) {
+        data = null;
+      }
+      if (generation !== this.fetchGeneration) return null;
+      if (!response.ok || !data || data.success === false) {
+        this.lastError = (data && data.error) || `Request failed (HTTP ${response.status})`;
+        this.loras = [];
+        this.baseModels = [];
+        this.folders = [];
+        return this.loras;
+      }
+      this.lastError = null;
       this.loras = data.loras || [];
       this.baseModels = data.base_models || [];
+      this.folders = [...new Set(this.loras.map(l => l.folder || "(root)"))].sort((a, b) => a.localeCompare(b));
       return this.loras;
     } catch (error) {
+      if (generation !== this.fetchGeneration) return null;
       console.error("[Umi LoRA Browser] Failed to fetch LoRAs:", error);
+      this.lastError = (error && error.message) || String(error);
+      this.loras = [];
+      this.baseModels = [];
+      this.folders = [];
       return [];
     }
   }
@@ -50,42 +82,43 @@ class LoraBrowserPanel {
             bottom: 0;
             width: 100vw;
             height: 100vh;
-            background: #0f1115;
+            background: var(--umi-sunken);
             z-index: 10000;
             display: none;
-            color: #d7dae0;
+            color: var(--umi-ink);
             font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
         `;
 
+    ensureUmiTheme();
     panel.innerHTML = `
             <style>
                 .umi-lb-root { display: flex; flex-direction: column; height: 100%; width: 100%; position: relative; }
                 
                 /* Header */
-                .umi-lb-header { display: flex; align-items: center; padding: 12px 18px; border-bottom: 1px solid #20242c; background: linear-gradient(135deg, #1d2230 0%, #151a24 100%); gap: 16px; height: 60px; box-sizing: border-box; }
-                .umi-lb-title { font-size: 18px; font-weight: 600; color: #8fc6ff; white-space: nowrap; }
+                .umi-lb-header { display: flex; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--umi-rule); background: var(--umi-surface); gap: 16px; min-height: 60px; flex-shrink: 0; box-sizing: border-box; }
+                .umi-lb-title { font-size: 18px; font-weight: 600; color: var(--umi-accent); white-space: nowrap; }
                 .umi-lb-search-container { flex: 1; display: flex; justify-content: center; max-width: 600px; margin: 0 auto; position: relative; }
-                .umi-lb-search-input { width: 100%; padding: 8px 12px; background: #12161f; border: 1px solid #3b4250; border-radius: 6px; color: #fff; font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.2) inset; }
-                .umi-lb-search-input:focus { border-color: #8fc6ff; outline: none; }
-                .umi-lb-search-help { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 10px; color: #5b6b85; cursor: help; }
+                .umi-lb-search-input { width: 100%; padding: 8px 12px; background: var(--umi-sunken); border: 1px solid var(--umi-rule-strong); border-radius: 6px; color: var(--umi-ink-strong); font-size: 14px; box-shadow: 0 2px 4px rgba(0,0,0,0.2) inset; }
+                .umi-lb-search-input:focus { border-color: var(--umi-accent); outline: none; }
+                .umi-lb-search-help { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 10px; color: var(--umi-ink-3); cursor: help; }
                 .umi-lb-actions { display: flex; gap: 12px; align-items: center; white-space: nowrap; }
-                .umi-lb-btn { background: #2a303b; color: #d7dae0; border: 1px solid #3b4250; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; height: 32px; position: relative; display: inline-flex; align-items: center; justify-content: center; }
-                .umi-lb-btn:hover { border-color: #5b6b85; background: #323a46; }
+                .umi-lb-btn { background: var(--umi-surface-alt); color: var(--umi-ink); border: 1px solid var(--umi-rule-strong); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; height: 32px; position: relative; display: inline-flex; align-items: center; justify-content: center; }
+                .umi-lb-btn:hover { border-color: var(--umi-rule-hover); background: var(--umi-surface-hover); }
                 
                 /* Danger Button */
-                .umi-lb-btn-danger { color: #ff6b6b; border-color: #502a2a; }
-                .umi-lb-btn-danger:hover { background: #3b2020; border-color: #ff6b6b; }
+                .umi-lb-btn-danger { color: var(--umi-danger); border-color: var(--umi-danger-soft); }
+                .umi-lb-btn-danger:hover { background: var(--umi-danger-wash); border-color: var(--umi-danger); }
 
                 /* Gold Button Style */
-                .umi-lb-btn-gold { background: #b58900; color: #10141d; border: 1px solid #dcb538; font-weight: 600; width: 100%; margin-top: 8px; }
-                .umi-lb-btn-gold:hover { background: #dcb538; color: #000; border-color: #ffe680; }
+                .umi-lb-btn-gold { background: var(--umi-warn-fill); color: var(--umi-ink-inverse); border: 1px solid var(--umi-warn-fill-hover); font-weight: 600; width: 100%; margin-top: 8px; }
+                .umi-lb-btn-gold:hover { background: var(--umi-warn-fill-hover); color: var(--umi-ink-inverse); border-color: var(--umi-warn); }
 
-                .umi-lb-select { background: #1c212b; color: #d7dae0; border: 1px solid #3b4250; padding: 0 8px; border-radius: 6px; font-size: 12px; height: 32px; }
+                .umi-lb-select { background: var(--umi-surface); color: var(--umi-ink); border: 1px solid var(--umi-rule-strong); padding: 0 8px; border-radius: 6px; font-size: 12px; height: 32px; }
 
                 /* Layout */
-                .umi-lb-body { display: grid; grid-template-columns: 280px minmax(0, 1fr) 360px; height: calc(100% - 60px); width: 100%; }
-                .umi-lb-sidebar { border-right: 1px solid #20242c; padding: 14px; overflow-y: auto; background: #12161f; display: flex; flex-direction: column; gap: 16px; }
-                .umi-lb-main { position: relative; overflow: hidden; display: flex; flex-direction: column; min-width: 0; background: #0f1115; }
+                .umi-lb-body { display: grid; grid-template-columns: 280px minmax(0, 1fr) 360px; flex: 1; min-height: 0; width: 100%; position: relative; }
+                .umi-lb-sidebar { border-right: 1px solid var(--umi-rule); padding: 14px; overflow-y: auto; background: var(--umi-sunken); display: flex; flex-direction: column; gap: 16px; }
+                .umi-lb-main { position: relative; overflow: hidden; display: flex; flex-direction: column; min-width: 0; background: var(--umi-sunken); }
                 .umi-lb-grid { display: grid; align-content: start; justify-content: start; gap: 12px; padding: 14px; overflow-y: auto; flex: 1; }
                 
                 /* Grid Sizes */
@@ -94,51 +127,59 @@ class LoraBrowserPanel {
                 .grid-large { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
 
                 /* Pagination */
-                .umi-lb-pagination { display: flex; justify-content: center; align-items: center; gap: 8px; padding: 8px; border-top: 1px solid #20242c; background: #10141d; height: 50px; box-sizing: border-box; }
-                .umi-lb-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; background: #1c212b; border: 1px solid #2a303b; padding: 4px 8px; border-radius: 6px; }
-                .umi-lb-page-input { background: transparent; border: 1px solid #3b4250; color: #8fc6ff; width: 35px; text-align: center; font-size: 11px; border-radius: 4px; margin: 0 4px; }
+                .umi-lb-pagination { display: flex; justify-content: center; align-items: center; gap: 8px; padding: 8px; border-top: 1px solid var(--umi-rule); background: var(--umi-sunken); height: 50px; box-sizing: border-box; }
+                .umi-lb-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; background: var(--umi-surface); border: 1px solid var(--umi-rule); padding: 4px 8px; border-radius: 6px; }
+                .umi-lb-page-input { background: transparent; border: 1px solid var(--umi-rule-strong); color: var(--umi-accent); width: 35px; text-align: center; font-size: 11px; border-radius: 4px; margin: 0 4px; }
+                .umi-lb-selection-bar { display: none; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--umi-rule); background: var(--umi-ground); }
+                .umi-lb-selection-bar.active { display: flex; }
+                .umi-lb-selection-spacer { flex: 1; }
 
                 /* Tree */
                 .umi-lb-tree { font-size: 12px; line-height: 1.6; user-select: none; }
-                .umi-lb-tree-item { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 4px; cursor: pointer; color: #c1c7d4; transition: background 0.1s; }
+                .umi-lb-tree-item { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 4px; cursor: pointer; color: var(--umi-ink); transition: background 0.1s; }
                 .umi-lb-tree-item:hover { background: rgba(255, 255, 255, 0.05); }
-                .umi-lb-tree-item.active-folder { color: #d7dae0; font-weight: 600; }
-                .umi-lb-tree-file { font-size: 11px; color: #8b93a6; padding: 3px 6px 3px 24px; cursor: pointer; border-radius: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-                .umi-lb-tree-file:hover { color: #fff; background: rgba(255, 255, 255, 0.05); }
-                .umi-lb-tree-file.selected { background: rgba(33, 150, 243, 0.2); color: #64b5f6; border: 1px solid rgba(33, 150, 243, 0.3); }
-                .umi-lb-tree-toggle { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; transition: transform 0.2s; font-size: 10px; color: #6c757d; }
+                .umi-lb-tree-item.active-folder { color: var(--umi-ink); font-weight: 600; }
+                .umi-lb-tree-file { font-size: 11px; color: var(--umi-ink-2); padding: 3px 6px 3px 24px; cursor: pointer; border-radius: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                .umi-lb-tree-file:hover { color: var(--umi-ink-strong); background: rgba(255, 255, 255, 0.05); }
+                .umi-lb-tree-file.selected { background: rgba(33, 150, 243, 0.2); color: var(--umi-accent); border: 1px solid rgba(33, 150, 243, 0.3); }
+                .umi-lb-tree-toggle { width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; transition: transform 0.2s; font-size: 10px; color: var(--umi-ink-3); }
                 .umi-lb-tree-toggle.collapsed { transform: rotate(-90deg); }
-                .umi-lb-tree-children { margin-left: 7px; border-left: 1px solid #2a303b; }
+                .umi-lb-tree-children { margin-left: 7px; border-left: 1px solid var(--umi-rule); }
 
                 /* Details */
-                .umi-lb-details { border-left: 1px solid #20242c; padding: 14px; overflow-y: auto; overflow-x: visible; background: #12161f; min-width: 0; position: relative; }
-                .umi-lb-detail-image-container { position: relative; width: 100%; height: 400px; background: #000; border-radius: 6px; overflow: hidden; margin-bottom: 10px; border: 1px solid #2a303b; }
+                .umi-lb-details { border-left: 1px solid var(--umi-rule); padding: 14px; overflow-y: auto; overflow-x: visible; background: var(--umi-sunken); min-width: 0; position: relative; }
+                .umi-lb-detail-image-container { position: relative; width: 100%; height: 400px; background: var(--umi-sunken); border-radius: 6px; overflow: hidden; margin-bottom: 10px; border: 1px solid var(--umi-rule); }
                 .umi-lb-detail-image { width: 100%; height: 100%; object-fit: contain; }
                 
                 /* Editable Fields */
                 .umi-lb-editable { padding: 4px; border: 1px dashed transparent; border-radius: 4px; transition: all 0.2s; }
-                .umi-lb-editable:hover { border-color: #3b4250; background: #1c212b; cursor: text; }
-                .umi-lb-editable:focus { border-color: #8fc6ff; background: #161b25; outline: none; border-style: solid; }
+                .umi-lb-editable:hover { border-color: var(--umi-rule-strong); background: var(--umi-surface); cursor: text; }
+                .umi-lb-editable:focus { border-color: var(--umi-accent); background: var(--umi-ground); outline: none; border-style: solid; }
+                .umi-lb-editable[data-placeholder]:empty::before { content: attr(data-placeholder); color: var(--umi-ink-3); pointer-events: none; }
 
-                .umi-lb-detail-title { font-size: 14px; color: #8fc6ff; margin-bottom: 4px; font-weight: 600; line-height: 1.4; word-break: break-all; }
-                .umi-lb-detail-meta { font-size: 11px; color: #9aa3b2; margin-bottom: 12px; line-height: 1.5; }
-                .umi-lb-detail-label { font-size: 11px; color: #8b93a6; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
-                .umi-lb-detail-box { background: #1c212b; border: 1px solid #2a303b; border-radius: 6px; padding: 8px; font-size: 12px; color: #d7dae0; max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
+                .umi-lb-detail-title { font-size: 14px; color: var(--umi-accent); margin-bottom: 4px; font-weight: 600; line-height: 1.4; word-break: break-all; }
+                .umi-lb-detail-meta { font-size: 11px; color: var(--umi-ink); margin-bottom: 12px; line-height: 1.5; }
+                .umi-lb-detail-label { font-size: 11px; color: var(--umi-ink-2); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+                .umi-lb-detail-box { background: var(--umi-surface); border: 1px solid var(--umi-rule); border-radius: 6px; padding: 8px; font-size: 12px; color: var(--umi-ink); max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
                 .umi-lb-detail-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+                .umi-lb-detail-back { display: none; }
                 
                 /* Dropdown Menu */
-                .umi-lb-dropdown { position: absolute; top: 100%; right: 0; left: auto; background: #2a303b; border: 1px solid #3b4250; border-radius: 6px; padding: 4px 0; z-index: 10050; display: none; min-width: 140px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+                .umi-lb-dropdown { position: absolute; top: 100%; right: 0; left: auto; background: var(--umi-surface-alt); border: 1px solid var(--umi-rule-strong); border-radius: 6px; padding: 4px 0; z-index: 10050; display: none; min-width: 140px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
                 .umi-lb-dropdown.show { display: block; }
-                .umi-lb-dropdown-item { padding: 8px 12px; font-size: 12px; color: #d7dae0; cursor: pointer; white-space: nowrap; }
-                .umi-lb-dropdown-item:hover { background: #3b4250; color: #fff; }
+                .umi-lb-dropdown-item { padding: 8px 12px; font-size: 12px; color: var(--umi-ink); cursor: pointer; white-space: nowrap; }
+                .umi-lb-dropdown-item:hover { background: var(--umi-surface-hover); color: var(--umi-ink-strong); }
 
                 /* Card Styles */
-                .umi-lb-card { background: #1a1f2b; border: 1px solid #2a303b; border-radius: 8px; overflow: hidden; cursor: pointer; transition: transform 0.1s ease, border-color 0.1s ease; position: relative; display: flex; flex-direction: column; height: 100%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
-                .umi-lb-card:hover { border-color: #4c6b9a; transform: translateY(-2px); }
-                .umi-lb-card.selected { border-color: #8fc6ff; box-shadow: 0 0 0 1px #8fc6ff inset; }
-                .umi-lb-thumb { width: 100%; height: 100%; background: #000; position: relative; overflow: hidden; }
+                .umi-lb-card { background: var(--umi-ground); border: 1px solid var(--umi-rule); border-radius: 8px; overflow: hidden; cursor: pointer; transition: transform 0.1s ease, border-color 0.1s ease; position: relative; display: flex; flex-direction: column; height: 100%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+                .umi-lb-card:hover { border-color: var(--umi-accent-soft); transform: translateY(-2px); }
+                .umi-lb-card.selected { border-color: var(--umi-accent); box-shadow: 0 0 0 1px var(--umi-accent) inset; }
+                .umi-lb-thumb { width: 100%; height: 100%; background: var(--umi-sunken); position: relative; overflow: hidden; }
                 .umi-lb-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
                 
+                .umi-lb-overlay { color: var(--umi-ink-on-media); }
+                .umi-lb-overlay .umi-lb-card-name { color: inherit; }
+                .umi-lb-overlay .umi-lb-tag { color: var(--umi-ink-on-media); background: rgba(0,0,0,.65); }
                 /* Heights based on class */
                 .grid-small .umi-lb-thumb { min-height: 140px; }
                 .grid-medium .umi-lb-thumb { min-height: 200px; }
@@ -146,47 +187,48 @@ class LoraBrowserPanel {
 
                 /* Overlay & Tags */
                 .umi-lb-overlay { position: absolute; left: 0; right: 0; bottom: 0; padding: 8px 8px 6px; background: linear-gradient(0deg, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.8) 60%, rgba(0,0,0,0) 100%); z-index: 5; pointer-events: none; }
-                .umi-lb-card-name { font-size: 11px; font-weight: 600; color: #fff; margin-bottom: 2px; white-space: normal; word-break: break-word; text-shadow: 0 1px 2px black; line-height: 1.2; }
+                .umi-lb-card-name { font-size: 11px; font-weight: 600; color: var(--umi-ink-strong); margin-bottom: 2px; white-space: normal; word-break: break-word; text-shadow: 0 1px 2px black; line-height: 1.2; }
                 .grid-small .umi-lb-overlay { display: none; }
-                .umi-lb-badge { position: absolute; top: 6px; right: 6px; background: rgba(47, 125, 75, 0.9); color: #fff; padding: 2px 6px; font-size: 9px; border-radius: 4px; z-index: 6; box-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+                .umi-lb-badge { position: absolute; top: 6px; right: 6px; background: rgba(47, 125, 75, 0.9); color: var(--umi-ink-strong); padding: 2px 6px; font-size: 9px; border-radius: 4px; z-index: 6; box-shadow: 0 1px 2px rgba(0,0,0,0.5); }
                 
                 .umi-lb-tags { display: flex; gap: 4px; margin-top: 4px; overflow: hidden; flex-wrap: nowrap; height: 15px; mask-image: linear-gradient(to right, black 85%, transparent 100%); -webkit-mask-image: linear-gradient(to right, black 85%, transparent 100%); transition: height 0.2s ease; }
                 .umi-lb-show-tags .umi-lb-tags { flex-wrap: wrap; height: auto; mask-image: none; -webkit-mask-image: none; overflow: visible; }
-                .umi-lb-tag { background: rgba(255, 255, 255, 0.15); color: #e0e0e0; font-size: 9px; padding: 0 4px; border-radius: 3px; backdrop-filter: blur(2px); white-space: nowrap; flex-shrink: 0; line-height: 14px; margin-bottom: 2px; }
+                .umi-lb-tag { background: rgba(255, 255, 255, 0.15); color: var(--umi-ink); font-size: 9px; padding: 0 4px; border-radius: 3px; backdrop-filter: blur(2px); white-space: nowrap; flex-shrink: 0; line-height: 14px; margin-bottom: 2px; }
 
                 /* Inputs */
                 .umi-lb-section { margin-bottom: 12px; }
-                .umi-lb-section-title { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #8b93a6; margin-bottom: 6px; border-bottom: 1px solid #2a303b; padding-bottom: 4px; font-weight: 600; }
-                .umi-lb-input { width: 100%; padding: 6px 8px; background: #1c212b; border: 1px solid #313847; border-radius: 6px; color: #d7dae0; font-size: 12px; }
-                .umi-lb-checkbox { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #c1c7d4; cursor: pointer; user-select: none; }
+                .umi-lb-section-title { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--umi-ink-2); margin-bottom: 6px; border-bottom: 1px solid var(--umi-rule); padding-bottom: 4px; font-weight: 600; }
+                .umi-lb-input { width: 100%; padding: 6px 8px; background: var(--umi-surface); border: 1px solid var(--umi-rule-strong); border-radius: 6px; color: var(--umi-ink); font-size: 12px; }
+                .umi-lb-checkbox { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--umi-ink); cursor: pointer; user-select: none; }
+                .umi-lb-filter-grid { display: flex; flex-wrap: wrap; gap: 6px; }
                 .umi-lb-slider-row { display: flex; align-items: center; gap: 8px; }
                 .umi-range { flex: 1; cursor: pointer; }
-                .umi-range-val { font-family: monospace; color: #8fc6ff; min-width: 32px; text-align: right; }
+                .umi-range-val { font-family: monospace; color: var(--umi-accent); min-width: 32px; text-align: right; }
 
                 /* Modal Styles */
                 .umi-lb-modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.85); z-index: 20000; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(2px); opacity: 0; transition: opacity 0.2s; pointer-events: none; }
                 .umi-lb-modal-overlay.open { opacity: 1; pointer-events: auto; }
-                .umi-lb-modal { background: #1c212b; border: 1px solid #3b4250; border-radius: 8px; width: 90%; max-width: 600px; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 10px 40px rgba(0,0,0,0.6); transform: scale(0.95); transition: transform 0.2s; overflow: hidden; }
+                .umi-lb-modal { background: var(--umi-surface); border: 1px solid var(--umi-rule-strong); border-radius: 8px; width: 90%; max-width: 600px; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 10px 40px rgba(0,0,0,0.6); transform: scale(0.95); transition: transform 0.2s; overflow: hidden; }
                 .umi-lb-modal-overlay.open .umi-lb-modal { transform: scale(1); }
-                .umi-lb-modal-header { padding: 14px 18px; border-bottom: 1px solid #2a303b; display: flex; justify-content: space-between; align-items: center; font-weight: 600; color: #8fc6ff; background: #151a24; border-radius: 8px 8px 0 0; }
-                .umi-lb-modal-close { cursor: pointer; font-size: 18px; color: #8b93a6; }
-                .umi-lb-modal-close:hover { color: #fff; }
-                .umi-lb-modal-body { padding: 20px; overflow-y: auto; background: #0f1115; }
+                .umi-lb-modal-header { padding: 14px 18px; border-bottom: 1px solid var(--umi-rule); display: flex; justify-content: space-between; align-items: center; font-weight: 600; color: var(--umi-accent); background: var(--umi-ground); border-radius: 8px 8px 0 0; }
+                .umi-lb-modal-close { cursor: pointer; font-size: 18px; color: var(--umi-ink-2); }
+                .umi-lb-modal-close:hover { color: var(--umi-ink-strong); }
+                .umi-lb-modal-body { padding: 20px; overflow-y: auto; background: var(--umi-sunken); }
                 
                 /* Fetch Options Modal Grid */
                 .umi-lb-fetch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; }
                 .umi-lb-fetch-option { 
-                    background: #2a303b; padding: 14px; border-radius: 6px; border: 2px solid #3b4250; cursor: pointer; transition: all 0.2s; 
+                    background: var(--umi-surface-alt); padding: 14px; border-radius: 6px; border: 2px solid var(--umi-rule-strong); cursor: pointer; transition: all 0.2s; 
                     display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; min-height: 80px;
                 }
-                .umi-lb-fetch-option:hover { border-color: #5b6b85; background: #323a46; }
-                .umi-lb-fetch-option.selected { border-color: #8fc6ff; background: #1d2230; }
-                .umi-lb-fetch-title { font-weight: 600; font-size: 13px; color: #d7dae0; margin-bottom: 4px; }
-                .umi-lb-fetch-desc { font-size: 11px; color: #9aa3b2; line-height: 1.4; }
+                .umi-lb-fetch-option:hover { border-color: var(--umi-rule-hover); background: var(--umi-surface-hover); }
+                .umi-lb-fetch-option.selected { border-color: var(--umi-accent); background: var(--umi-surface); }
+                .umi-lb-fetch-title { font-weight: 600; font-size: 13px; color: var(--umi-ink); margin-bottom: 4px; }
+                .umi-lb-fetch-desc { font-size: 11px; color: var(--umi-ink); line-height: 1.4; }
 
                 /* Status Bar in Header */
                 .umi-lb-status { 
-                    font-size: 11px; color: #8fc6ff; font-family: monospace; 
+                    font-size: 11px; color: var(--umi-accent); font-family: monospace; 
                     display: flex; flex-direction: column; align-items: flex-end; justify-content: center;
                     min-width: 120px; text-align: right;
                     margin-left: 12px;
@@ -195,13 +237,30 @@ class LoraBrowserPanel {
 
                 /* Modal Grids (Images) */
                 .umi-lb-img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px; }
-                .umi-lb-img-choice { width: 100%; aspect-ratio: 2/3; object-fit: contain; background: #000; border-radius: 4px; border: 2px solid #2a303b; cursor: pointer; transition: all 0.1s; }
-                .umi-lb-img-choice:hover { border-color: #8fc6ff; box-shadow: 0 0 10px rgba(143, 198, 255, 0.2); }
+                .umi-lb-img-choice { width: 100%; aspect-ratio: 2/3; object-fit: contain; background: var(--umi-sunken); border-radius: 4px; border: 2px solid var(--umi-rule); cursor: pointer; transition: all 0.1s; }
+                .umi-lb-img-choice:hover { border-color: var(--umi-accent); box-shadow: 0 0 10px rgba(143, 198, 255, 0.2); }
                 
                 .umi-lb-tag-grid { display: flex; flex-wrap: wrap; gap: 8px; }
-                .umi-lb-int-tag { background: #2a303b; padding: 6px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; border: 1px solid #3b4250; color: #d7dae0; transition: all 0.1s; }
-                .umi-lb-int-tag:hover { background: #323a46; border-color: #8fc6ff; color: #fff; }
-                .umi-lb-int-tag.copied { background: #2f7d4b; border-color: #4CAF50; color: #fff; }
+                .umi-lb-int-tag { background: var(--umi-surface-alt); padding: 6px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; border: 1px solid var(--umi-rule-strong); color: var(--umi-ink); transition: all 0.1s; }
+                .umi-lb-int-tag:hover { background: var(--umi-surface-hover); border-color: var(--umi-accent); color: var(--umi-ink-strong); }
+                .umi-lb-int-tag.copied { background: var(--umi-ok-soft); border-color: var(--umi-ok); color: var(--umi-ink-strong); }
+
+                .umi-lb-filter-toggle { display: none; }
+                @media (max-width: 1000px) {
+                    .umi-lb-header { height: auto; min-height: 60px; flex-wrap: wrap; }
+                    .umi-lb-search-container { order: 3; flex-basis: 100%; max-width: none; }
+                    .umi-lb-body { grid-template-columns: 220px minmax(0, 1fr); height: auto; }
+                    .umi-lb-details { position: absolute; inset: 0 0 0 auto; width: min(360px, 90vw); z-index: 20; box-shadow: -4px 0 18px rgba(0,0,0,.4); }
+                    .umi-lb-details:not(.has-selection) { display: none; }
+                    .umi-lb-detail-back { display: inline-flex; margin-bottom: 8px; }
+                }
+                @media (max-width: 680px) {
+                    .umi-lb-sidebar { position: absolute; inset: 0 auto 0 0; width: min(280px, 88vw); z-index: 25; display: none; box-shadow: 4px 0 14px rgba(0,0,0,.2); }
+                    .umi-lb-sidebar.filters-open { display: flex; }
+                    .umi-lb-filter-toggle { display: inline-flex; }
+                    .umi-lb-body { grid-template-columns: minmax(0, 1fr); }
+                    .umi-lb-actions { flex-wrap: wrap; white-space: normal; }
+                }
 
             </style>
             <div class="umi-lb-root">
@@ -224,22 +283,31 @@ regex:^SDXL.* - Regex search
                         <span class="umi-lb-status-line">Ready</span>
                     </div>
 
-                    <div style="width: 1px; height: 24px; background: #3b4250; margin: 0 4px;"></div>
+                    <div style="width: 1px; height: 24px; background: var(--umi-surface-hover); margin: 0 4px;"></div>
 
                     <div class="umi-lb-actions">
+                        <button class="umi-lb-btn umi-lb-filter-toggle" data-action="toggle-filters" aria-expanded="false">Filters</button>
                         <label class="umi-lb-checkbox" title="Toggle full activation text on thumbnails">
                             <input type="checkbox" data-role="expand-tags" /> Expand Tags
                         </label>
-                        <div style="width: 1px; height: 24px; background: #3b4250; margin: 0 4px;"></div>
-                        <label class="umi-lb-checkbox" title="Global Default Strength">Global Str</label>
+                        <div style="width: 1px; height: 24px; background: var(--umi-surface-hover); margin: 0 4px;"></div>
+                        <label class="umi-lb-checkbox" title="Global Default Strength">Default strength</label>
                         <div class="umi-lb-slider-row" style="width: 120px;">
                              <input type="range" class="umi-range" data-role="global-strength" min="0" max="3" step="0.1" value="1.0" />
                              <span class="umi-range-val" data-role="global-strength-val">1.0</span>
                         </div>
-                        <select class="umi-lb-select" data-role="card-size">
+                        <select class="umi-lb-select" data-role="card-size" aria-label="Thumbnail size" title="Thumbnail size">
                             <option value="small">Small</option>
                             <option value="medium" selected>Medium</option>
                             <option value="large">Large</option>
+                        </select>
+                        <select class="umi-lb-select" data-role="sort" aria-label="Sort LoRAs">
+                            <option value="name">Name</option>
+                            <option value="newest">Newest</option>
+                            <option value="oldest">Oldest</option>
+                            <option value="size">File size</option>
+                            <option value="base_model">Base model</option>
+                            <option value="folder">Folder</option>
                         </select>
                         <button class="umi-lb-btn" data-action="fetch-all">Fetch CivitAI</button>
                         <button class="umi-lb-btn" data-action="close">Close</button>
@@ -251,8 +319,24 @@ regex:^SDXL.* - Regex search
                             <button class="umi-lb-btn" style="width:100%" data-action="refresh">Refresh LoRAs</button>
                         </div>
                         <div class="umi-lb-section">
+                            <div class="umi-lb-section-title">Metadata</div>
+                            <select class="umi-lb-select" data-role="metadata-filter" style="width:100%;">
+                                <option value="all">All LoRAs</option>
+                                <option value="missing_preview">Missing preview</option>
+                                <option value="has_preview">Has preview</option>
+                                <option value="missing_civitai">Missing CivitAI</option>
+                                <option value="has_civitai">Has CivitAI</option>
+                                <option value="missing_triggers">Missing triggers</option>
+                                <option value="has_triggers">Has triggers</option>
+                            </select>
+                        </div>
+                        <div class="umi-lb-section">
                             <div class="umi-lb-section-title">Base Model</div>
                             <div class="umi-lb-tag-grid" data-role="base-model-filters"></div>
+                        </div>
+                        <div class="umi-lb-section">
+                            <div class="umi-lb-section-title">Folders</div>
+                            <div class="umi-lb-filter-grid" data-role="folder-filters"></div>
                         </div>
                         <div class="umi-lb-section" style="flex:1; overflow-y:auto; min-height:0;">
                             <div class="umi-lb-section-title">Folder Browser</div>
@@ -260,11 +344,12 @@ regex:^SDXL.* - Regex search
                         </div>
                     </aside>
                     <main class="umi-lb-main">
+                        <div class="umi-lb-selection-bar" data-role="selection-bar"></div>
                         <div class="umi-lb-grid grid-medium" data-role="grid"></div>
                         <div class="umi-lb-pagination" data-role="pagination"></div>
                     </main>
                     <aside class="umi-lb-details" data-role="details">
-                        <div class="umi-lb-details-empty" style="color:#7b8499;text-align:center;padding:20px;font-size:12px;">Select a LoRA</div>
+                        <div class="umi-lb-details-empty" style="color:var(--umi-ink-2);text-align:center;padding:20px;font-size:12px;">Select a LoRA</div>
                     </aside>
                 </div>
                 <!-- Modal Container -->
@@ -283,6 +368,10 @@ regex:^SDXL.* - Regex search
         `;
 
     this.element = panel;
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", "LoRA Browser");
+    panel.tabIndex = -1;
     document.body.appendChild(panel);
     
     this.resizeObserver = new ResizeObserver(() => {
@@ -306,8 +395,27 @@ regex:^SDXL.* - Regex search
   updateStatus(message, subMessage = "") {
       const statusEl = this.element.querySelector('[data-role="status-bar"]');
       if(statusEl) {
-          statusEl.innerHTML = `<span class="umi-lb-status-line">${message}</span>${subMessage ? `<span class="umi-lb-status-line" style="color:#9aa3b2">${subMessage}</span>` : ""}`;
+          statusEl.replaceChildren();
+          const primary = document.createElement("span");
+          primary.className = "umi-lb-status-line";
+          primary.textContent = String(message || "");
+          statusEl.appendChild(primary);
+          if (subMessage) {
+              const secondary = document.createElement("span");
+              secondary.className = "umi-lb-status-line";
+              secondary.style.color = "var(--umi-ink)";
+              secondary.textContent = String(subMessage);
+              statusEl.appendChild(secondary);
+          }
       }
+  }
+
+  closeDropdowns() {
+      if (!this.element) return;
+      this.element.querySelectorAll('.umi-lb-dropdown.show').forEach(dropdown => {
+          dropdown.classList.remove('show');
+          dropdown.style.position = '';
+      });
   }
 
   // --- Search Logic ---
@@ -378,6 +486,12 @@ regex:^SDXL.* - Regex search
         const relativeFilter = this.pathFilter.replace(/^Lora\//, "").toLowerCase();
         if (!name.startsWith(relativeFilter)) return false;
       }
+
+      if (this.selectedFolders.size > 0) {
+        const folder = (lora.folder || "(root)").toLowerCase();
+        const match = [...this.selectedFolders].some((f) => f.toLowerCase() === folder);
+        if (!match) return false;
+      }
       
       // Base Model Filter
       if (this.selectedBaseModels.size > 0) {
@@ -385,6 +499,8 @@ regex:^SDXL.* - Regex search
         const match = [...this.selectedBaseModels].some((m) => m.toLowerCase() === baseModel);
         if (!match) return false;
       }
+
+      if (!this.matchesMetadataFilter(lora, activations)) return false;
 
       // Advanced Search Filter
       if (query) {
@@ -413,11 +529,57 @@ regex:^SDXL.* - Regex search
     });
   }
 
+  async fetchWildcards() {
+    try {
+      const response = await fetch("/umiapp/wildcards/text/list");
+      const data = await response.json();
+      this.wildcards = data.files || [];
+      return this.wildcards;
+    } catch (error) {
+      console.error("[Umi LoRA Browser] Failed to fetch wildcards:", error);
+      this.wildcards = [];
+      return [];
+    }
+  }
+
+  matchesMetadataFilter(lora, activation = null) {
+    const mode = this.metadataFilter || "all";
+    if (mode === "all") return true;
+    const activations = activation || this.getActivationTags(lora);
+    const hasPreview = Boolean(this.getPreviewUrl(lora));
+    const hasCivitai = Boolean(lora.civitai && (lora.civitai.id || lora.civitai.url || lora.civitai.name));
+    const hasTriggers = activations.tags && activations.tags.length > 0;
+    if (mode === "missing_preview") return !hasPreview;
+    if (mode === "has_preview") return hasPreview;
+    if (mode === "missing_civitai") return !hasCivitai;
+    if (mode === "has_civitai") return hasCivitai;
+    if (mode === "missing_triggers") return !hasTriggers;
+    if (mode === "has_triggers") return hasTriggers;
+    return true;
+  }
+
+  sortLoras(list) {
+    const sorted = [...list];
+    const clean = (lora) => this.getCleanFileName(lora.filename || lora.name).toLowerCase();
+    if (this.sortBy === "newest") sorted.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+    else if (this.sortBy === "oldest") sorted.sort((a, b) => (a.mtime || 0) - (b.mtime || 0));
+    else if (this.sortBy === "size") sorted.sort((a, b) => (b.size || 0) - (a.size || 0));
+    else if (this.sortBy === "base_model") sorted.sort((a, b) => String(a.base_model || a.civitai?.base_model || "").localeCompare(String(b.base_model || b.civitai?.base_model || "")) || clean(a).localeCompare(clean(b)));
+    else if (this.sortBy === "folder") sorted.sort((a, b) => String(a.folder || "").localeCompare(String(b.folder || "")) || clean(a).localeCompare(clean(b)));
+    else sorted.sort((a, b) => clean(a).localeCompare(clean(b)));
+    return sorted;
+  }
+
   // --- End Search Logic ---
 
   showFetchOptionsModal() {
       const html = `
-        <div style="margin-bottom:10px;font-size:12px;color:#d7dae0;">Choose what data to fetch from CivitAI:</div>
+        <div style="margin-bottom:10px;font-size:12px;color:var(--umi-ink);">Choose what data to fetch from CivitAI:</div>
+        <div style="margin-bottom:12px;">
+            <div class="umi-lb-detail-label">CivitAI API Token (optional)</div>
+            <input class="umi-lb-input" data-role="civitai-api-token" type="password" placeholder="Paste API token for account-gated models" value="${this.escapeHtmlAttr(localStorage.getItem("umi_civitai_api_token") || "")}" />
+            <div style="font-size:11px;color:var(--umi-ink-2);margin-top:5px;">Stored locally in this browser. Leave empty to use the server environment token or anonymous access.</div>
+        </div>
         <div class="umi-lb-fetch-grid">
             <div class="umi-lb-fetch-option" data-mode="update_missing">
                 <div class="umi-lb-fetch-title">Update Missing</div>
@@ -439,8 +601,8 @@ regex:^SDXL.* - Regex search
                 <div class="umi-lb-fetch-title">Replace JSON & Info</div>
                 <div class="umi-lb-fetch-desc">Refresh both .json and .civitai.info files.</div>
             </div>
-            <div class="umi-lb-fetch-option" style="border-color: #ff6b6b;" data-mode="replace_all">
-                <div class="umi-lb-fetch-title" style="color: #ff6b6b;">Replace All</div>
+            <div class="umi-lb-fetch-option" style="border-color: var(--umi-danger);" data-mode="replace_all">
+                <div class="umi-lb-fetch-title" style="color: var(--umi-danger);">Replace All</div>
                 <div class="umi-lb-fetch-desc">Previews, Info, and JSON. Warning: Very slow.</div>
             </div>
         </div>
@@ -469,37 +631,52 @@ regex:^SDXL.* - Regex search
       startBtn.style.width = "100%";
       startBtn.onclick = () => {
           if(selectedMode) {
+              const tokenInput = body.querySelector('[data-role="civitai-api-token"]');
+              const token = tokenInput ? tokenInput.value.trim() : "";
+              if (token) localStorage.setItem("umi_civitai_api_token", token);
+              else localStorage.removeItem("umi_civitai_api_token");
               document.getElementById('umi-lb-modal').classList.remove('open');
-              this.startBatchFetch(selectedMode);
+              this.startBatchFetch(selectedMode, token);
           }
       };
       body.appendChild(startBtn);
   }
 
-  async startBatchFetch(mode) {
+  async startBatchFetch(mode, apiToken = "") {
       this.updateStatus("Initializing...", "Batch fetch started");
       
       try {
-          this.showNotification("Starting batch fetch...", false);
-          const res = await fetch("/umiapp/loras/civitai/batch", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ mode: mode })
-          });
-          
-          const data = await res.json();
-          if(data.success) {
-              this.updateStatus("Fetch Complete", `Processed ${data.count} items`);
-              this.showNotification(`Processed ${data.count} items`);
-              
-              // Reload data
-              await this.loadLoras(true);
-              this.renderFolderTree();
-              this.renderLoras();
-          } else {
-              this.updateStatus("Error", "Batch fetch failed");
-              this.showNotification("Batch fetch failed", true);
+          const items = this.loras.length ? [...this.loras] : await this.fetchLoras(true);
+          if (items === null) return;
+          let processed = 0;
+          let failed = 0;
+          let cached = 0;
+          let warnings = 0;
+          this.showNotification(`Starting ${items.length} LoRA fetches...`, false);
+
+          for (let i = 0; i < items.length; i++) {
+              const lora = items[i];
+              const label = lora.filename || lora.name || `LoRA ${i + 1}`;
+              this.updateStatus(`Fetching ${i + 1}/${items.length}`, label);
+              const result = await this.fetchSingleCivitai(lora, false, mode, apiToken);
+              if (result && result.success) {
+                  processed += 1;
+                  if (result.cached) cached += 1;
+                  if (result.warning) warnings += 1;
+              } else {
+                  failed += 1;
+              }
+              await new Promise(resolve => setTimeout(resolve, 0));
           }
+
+          await this.loadLoras(true);
+          this.renderFolderTree();
+          this.renderLoras();
+          const suffix = failed ? `, ${failed} failed` : "";
+          const warningSuffix = warnings ? `, ${warnings} warning${warnings === 1 ? "" : "s"}` : "";
+          const cachedSuffix = cached ? ` (${cached} already cached)` : "";
+          this.updateStatus("Fetch Complete", `Processed ${processed}/${items.length}${suffix}${warningSuffix}${cachedSuffix}`);
+          this.showNotification(`Processed ${processed}/${items.length}${suffix}${warningSuffix}`, Boolean(failed || warnings));
       } catch (e) {
           console.error(e);
           this.updateStatus("Error", e.message);
@@ -520,7 +697,7 @@ regex:^SDXL.* - Regex search
 
   showInternalTagsModal(tagPairs) {
       if (!tagPairs || !tagPairs.length) {
-          this.createModal("Internal Tags", `<div style="text-align:center; color:#9aa3b2; padding:20px;">No internal tags found in metadata.</div>`);
+          this.createModal("Internal Tags", `<div style="text-align:center; color:var(--umi-ink); padding:20px;">No internal tags found in metadata.</div>`);
           return;
       }
 
@@ -538,7 +715,7 @@ regex:^SDXL.* - Regex search
       const highBound = percentile(counts, 0.9);
       const rangeCount = Math.max(1, highBound - lowBound);
       const getTagColor = (tag, count) => {
-          if (topTags.has(tag)) return "#4fc3f7"; // blue for top 5%
+          if (topTags.has(tag)) return "var(--umi-accent)"; // blue for top 5%
           const clamped = Math.min(highBound, Math.max(lowBound, count));
           const ratio = (clamped - lowBound) / rangeCount; // 0..1
           if (ratio <= 0.5) {
@@ -555,7 +732,7 @@ regex:^SDXL.* - Regex search
           return `rgb(${r}, ${g}, ${b})`; // yellow -> green
       };
       const html = `
-        <div style="margin-bottom:12px; font-size:12px; color:#8b93a6;">Filter tags by training count and click to copy.</div>
+        <div style="margin-bottom:12px; font-size:12px; color:var(--umi-ink-2);">Filter tags by training count and click to copy.</div>
         <div class="umi-lb-slider-row" style="margin-bottom:10px;">
             <input type="range" class="umi-range" data-role="tag-threshold" min="1" max="${maxCount}" step="1" value="1" />
             <span class="umi-range-val" data-role="tag-threshold-val">1</span>
@@ -578,8 +755,8 @@ regex:^SDXL.* - Regex search
               </div>
           `).join('');
           grid.querySelectorAll('.umi-lb-int-tag').forEach(btn => {
-              btn.addEventListener('click', () => {
-                  navigator.clipboard.writeText(btn.dataset.tag);
+              btn.addEventListener('click', async () => {
+                  if (!await this.copyText(btn.dataset.tag, "Tag copied")) return;
                   btn.classList.add('copied');
                   btn.textContent = "Copied!";
                   setTimeout(() => {
@@ -599,7 +776,86 @@ regex:^SDXL.* - Regex search
       renderTags(1);
   }
 
+  getPreviewPrompts(lora) {
+      const prompts = lora?.preview_prompts || lora?.civitai?.preview_prompts || [];
+      return Array.isArray(prompts) ? prompts.filter(item => item && typeof item === "object") : [];
+  }
+
+  showPreviewPromptsModal(lora) {
+      const prompts = this.getPreviewPrompts(lora);
+      if (!prompts.length) {
+          this.createModal("Preview Prompts", `<div style="text-align:center; color:var(--umi-ink); padding:20px;">No preview prompt metadata found. Try fetching or refreshing CivitAI info for this LoRA.</div>`);
+          return;
+      }
+
+      const settingLine = (item) => {
+          const parts = [];
+          if (item.model) parts.push(`Model: ${item.model}`);
+          if (item.sampler) parts.push(`Sampler: ${item.sampler}`);
+          if (item.scheduler) parts.push(`Scheduler: ${item.scheduler}`);
+          if (item.steps) parts.push(`Steps: ${item.steps}`);
+          if (item.cfg_scale) parts.push(`CFG: ${item.cfg_scale}`);
+          if (item.seed) parts.push(`Seed: ${item.seed}`);
+          if (item.size) parts.push(`Size: ${item.size}`);
+          return parts.join(" | ");
+      };
+
+      const resourcesLine = (resources) => {
+          if (!Array.isArray(resources) || !resources.length) return "";
+          return resources
+              .map(resource => {
+                  const name = resource.name || "resource";
+                  const type = resource.type ? ` (${resource.type})` : "";
+                  const weight = resource.weight !== undefined && resource.weight !== "" ? `: ${resource.weight}` : "";
+                  return `${name}${type}${weight}`;
+              })
+              .join(", ");
+      };
+
+      const promptBlocks = prompts.map((item, idx) => {
+          const settings = settingLine(item);
+          const resources = resourcesLine(item.resources);
+          const fullPrompt = [
+              item.prompt ? `Prompt:\n${item.prompt}` : "",
+              item.negative_prompt ? `Negative:\n${item.negative_prompt}` : "",
+              settings ? `Settings:\n${settings}` : "",
+              resources ? `Resources:\n${resources}` : "",
+          ].filter(Boolean).join("\n\n");
+          return `
+            <div style="background:var(--umi-ground);border:1px solid var(--umi-rule);border-radius:6px;padding:10px;margin-bottom:12px;">
+                <div style="display:flex;gap:10px;align-items:flex-start;">
+                    ${item.url ? `<img src="${this.escapeHtmlAttr(item.url)}" style="width:96px;height:128px;object-fit:contain;background:var(--umi-sunken);border-radius:4px;border:1px solid var(--umi-rule);flex-shrink:0;" />` : ""}
+                    <div style="min-width:0;flex:1;">
+                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                            <div style="font-size:12px;font-weight:600;color:var(--umi-accent);">Preview ${this.escapeHtml(String(item.index || idx + 1))}</div>
+                            <button class="umi-lb-btn" data-action="copy-preview-prompt" data-preview-index="${idx}">Copy</button>
+                        </div>
+                        ${settings ? `<div style="font-size:11px;color:var(--umi-ink);margin-bottom:8px;">${this.escapeHtml(settings)}</div>` : ""}
+                        ${item.prompt ? `<div class="umi-lb-detail-label">Prompt</div><div class="umi-lb-detail-box" style="max-height:180px;margin-bottom:8px;">${this.escapeHtml(item.prompt)}</div>` : ""}
+                        ${item.negative_prompt ? `<div class="umi-lb-detail-label">Negative</div><div class="umi-lb-detail-box" style="max-height:120px;margin-bottom:8px;">${this.escapeHtml(item.negative_prompt)}</div>` : ""}
+                        ${resources ? `<div class="umi-lb-detail-label">Resources</div><div class="umi-lb-detail-box" style="max-height:100px;">${this.escapeHtml(resources)}</div>` : ""}
+                    </div>
+                </div>
+            </div>
+            <textarea data-role="preview-copy-${idx}" style="display:none;">${this.escapeHtml(fullPrompt)}</textarea>
+          `;
+      }).join("");
+
+      const body = this.createModal("Preview Prompts", `<div style="max-height:65vh;overflow-y:auto;">${promptBlocks}</div>`);
+      body.querySelectorAll('[data-action="copy-preview-prompt"]').forEach(btn => {
+          btn.addEventListener("click", () => {
+              const idx = btn.dataset.previewIndex;
+              const source = body.querySelector(`[data-role="preview-copy-${idx}"]`);
+              const text = source ? source.value : "";
+              if (!text) return;
+              navigator.clipboard.writeText(text);
+              this.showNotification("Copied preview prompt");
+          });
+      });
+  }
+
   async fetchInternalTags(lora) {
+      const request = this.tagsRequest = (this.tagsRequest || 0) + 1;
       try {
           this.updateStatus("Loading tags...", lora.name);
           const res = await fetch("/umiapp/loras/internal_tags", {
@@ -608,16 +864,14 @@ regex:^SDXL.* - Regex search
               body: JSON.stringify({ lora_name: lora.name })
           });
           const data = await res.json();
-          if (data.success) {
-              this.showInternalTagsModal(data.tag_pairs || []);
-              this.updateStatus("Ready");
-          } else {
-              this.showInternalTagsModal([]);
-              this.updateStatus("Ready");
-          }
+          if (request !== this.tagsRequest) return;
+          if (!res.ok || !data?.success) throw new Error(data?.error || `Request failed (HTTP ${res.status})`);
+          this.showInternalTagsModal(data.tag_pairs || []);
+          this.updateStatus("Ready");
       } catch (e) {
+          if (request !== this.tagsRequest) return;
           console.error(e);
-          this.showInternalTagsModal([]);
+          this.showNotification(`Could not load tags for ${lora.name}: ${e.message}`, true);
           this.updateStatus("Ready");
       }
   }
@@ -630,8 +884,22 @@ regex:^SDXL.* - Regex search
   }
 
   bindEvents() {
+    this.element.querySelector('[data-action="toggle-filters"]')?.addEventListener('click', (event) => {
+      const sidebar = this.element.querySelector('.umi-lb-sidebar');
+      sidebar.classList.toggle('filters-open');
+      event.currentTarget.setAttribute('aria-expanded', String(sidebar.classList.contains('filters-open')));
+    });
     const closeBtn = this.element.querySelector('[data-action="close"]');
     closeBtn.addEventListener("click", () => this.hide());
+
+    document.addEventListener('click', () => this.closeDropdowns());
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && this.element.style.display !== 'none') {
+        const modal = this.element.querySelector('#umi-lb-modal');
+        if (modal?.classList.contains('open')) modal.classList.remove('open');
+        else this.hide();
+      }
+    });
 
     const refreshBtn = this.element.querySelector('[data-action="refresh"]');
     refreshBtn.addEventListener("click", () => {
@@ -646,10 +914,24 @@ regex:^SDXL.* - Regex search
     searchInput.addEventListener("input", (e) => {
       this.searchTerm = e.target.value.toLowerCase();
       this.currentPage = 0;
+      this.scheduleSearch();
+    });
+
+    const metadataFilter = this.element.querySelector('[data-role="metadata-filter"]');
+    metadataFilter.addEventListener("change", (e) => {
+      this.metadataFilter = e.target.value;
+      this.currentPage = 0;
       this.renderLoras();
     });
 
-    // Base model filters are rendered dynamically; no static listeners needed here.
+    const sortSelect = this.element.querySelector('[data-role="sort"]');
+    sortSelect.addEventListener("change", (e) => {
+      this.sortBy = e.target.value;
+      this.currentPage = 0;
+      this.renderLoras();
+    });
+
+    // Base model and folder filters are rendered dynamically; no static listeners needed here.
 
     const expandTags = this.element.querySelector('[data-role="expand-tags"]');
     expandTags.addEventListener("change", (e) => {
@@ -690,7 +972,7 @@ regex:^SDXL.* - Regex search
                 this.showNotification("Uploading image...");
                 const res = await fetch("/umiapp/loras/upload_preview", { method: 'POST', body: formData });
                 const data = await res.json();
-                if (data.success) {
+                if (res.ok && data.success) {
                     this.showNotification("Preview updated");
                     // Save state before hard refresh
                     const selectedName = this.selected.name;
@@ -698,10 +980,10 @@ regex:^SDXL.* - Regex search
                     this.selected = this.loras.find(l => l.name === selectedName);
                     this.renderDetails();
                 } else {
-                    this.showNotification("Upload failed", true);
+                    this.showNotification(data.error || "Upload failed", true);
                 }
             } catch (err) {
-                this.showNotification("Error uploading", true);
+                this.showNotification(err?.message || "Error uploading", true);
             }
         }
         fileInput.value = '';
@@ -774,7 +1056,7 @@ regex:^SDXL.* - Regex search
             const lora = this.loras.find(l => (l.filename || l.name) === filename);
             if (lora) {
                 this.selected = lora;
-                this.localStrength = this.globalStrength; 
+                this.localStrength = this.getLoraStrength(lora);
                 this.renderFolderTree();
                 this.renderDetails();
             }
@@ -787,7 +1069,7 @@ regex:^SDXL.* - Regex search
     if (!container) return;
     container.innerHTML = "";
     if (!this.baseModels || !this.baseModels.length) {
-      container.innerHTML = `<div style="font-size:11px;color:#7b8499;">No base models detected</div>`;
+      container.innerHTML = `<div style="font-size:11px;color:var(--umi-ink-2);">No base models detected</div>`;
       return;
     }
 
@@ -808,6 +1090,39 @@ regex:^SDXL.* - Regex search
         else this.selectedBaseModels.add(model);
         this.currentPage = 0;
         this.renderBaseModelFilters();
+        this.renderLoras();
+      });
+      container.appendChild(chip);
+    });
+  }
+
+  renderFolderFilters() {
+    const container = this.element.querySelector('[data-role="folder-filters"]');
+    if (!container) return;
+    container.innerHTML = "";
+    if (!this.folders || !this.folders.length) {
+      container.innerHTML = `<div style="font-size:11px;color:var(--umi-ink-2);">No folders detected</div>`;
+      return;
+    }
+
+    this.folders.slice(0, 80).forEach((folder) => {
+      const chip = document.createElement("div");
+      chip.className = "umi-lb-tag";
+      chip.textContent = folder;
+      chip.title = folder;
+      chip.style.cursor = "pointer";
+      chip.style.userSelect = "none";
+      if (this.selectedFolders.has(folder)) {
+        chip.style.background = "rgba(79, 195, 247, 0.35)";
+        chip.style.border = "1px solid rgba(79, 195, 247, 0.5)";
+      } else {
+        chip.style.border = "1px solid rgba(255,255,255,0.05)";
+      }
+      chip.addEventListener("click", () => {
+        if (this.selectedFolders.has(folder)) this.selectedFolders.delete(folder);
+        else this.selectedFolders.add(folder);
+        this.currentPage = 0;
+        this.renderFolderFilters();
         this.renderLoras();
       });
       container.appendChild(chip);
@@ -854,12 +1169,18 @@ regex:^SDXL.* - Regex search
 
   getPreviewUrl(lora) {
     const override = lora.override || {};
-    // Timestamp helps force browser refresh of thumbnails when they change
-    const timestamp = `&t=${Date.now()}`;
-    if (lora.local_preview) return `/umiapp/preview?path=${encodeURIComponent(lora.local_preview)}${timestamp}`;
     if (override.preview_url) return override.preview_url;
+    if (lora.local_preview) {
+      const timestamp = lora.preview_mtime ? `&t=${encodeURIComponent(lora.preview_mtime)}` : '';
+      return `/umiapp/preview?path=${encodeURIComponent(lora.local_preview)}${timestamp}`;
+    }
     if (lora.civitai?.preview_url) return lora.civitai.preview_url;
     return null;
+  }
+
+  getLoraStrength(lora) {
+    const saved = Number(lora?.override?.strength);
+    return Number.isFinite(saved) ? Math.max(0, Math.min(3, saved)) : this.globalStrength;
   }
 
   async loadLoras(force = false) {
@@ -874,38 +1195,69 @@ regex:^SDXL.* - Regex search
     // Perform fetch
     if (force || !this.hasLoaded) {
         grid.innerHTML = '<div class="umi-lb-details-empty">Loading...</div>';
-        await this.fetchLoras();
+        if (await this.fetchLoras(force) === null) return;
         this.hasLoaded = true;
     }
     
     this.recalculatePageSize();
     this.renderFolderTree();
     this.renderBaseModelFilters();
+    this.renderFolderFilters();
     this.renderLoras();
   }
 
   renderLoras() {
     const grid = this.element.querySelector('[data-role="grid"]');
-    this.filtered = this.applyFilters(this.loras);
-    if (!this.filtered.length) {
-      grid.innerHTML = '<div class="umi-lb-details-empty">No results found</div>';
+    this.filtered = this.sortLoras(this.applyFilters(this.loras));
+    if (this.lastError) {
+      grid.innerHTML = `<div class="umi-lb-details-empty" style="color:var(--umi-danger);">Failed to load LoRAs: ${this.escapeHtml(this.lastError)}<br />Use Refresh LoRAs to retry.</div>`;
       this.renderPagination();
+      this.renderSelectionBar();
       return;
     }
+    if (!this.filtered.length) {
+      grid.innerHTML = `<div class="umi-lb-details-empty">${this.loras.length ? "No results found" : "No LoRAs found"}</div>`;
+      this.renderPagination();
+      this.renderSelectionBar();
+      return;
+    }
+
+    const totalPages = Math.ceil(this.filtered.length / this.pageSize);
+    if (this.currentPage >= totalPages) this.currentPage = Math.max(0, totalPages - 1);
 
     const start = this.currentPage * this.pageSize;
     const end = start + this.pageSize;
     const pageItems = this.filtered.slice(start, end);
     grid.innerHTML = pageItems.map((lora) => this.createCardHTML(lora)).join("");
     grid.querySelectorAll(".umi-lb-card").forEach((card, idx) => {
-      card.addEventListener("click", () => {
-        this.selected = pageItems[idx];
-        this.localStrength = this.globalStrength; 
+      const selectCard = (event) => {
+        const lora = pageItems[idx];
+        const id = lora.filename || lora.name;
+        if (event.ctrlKey || event.metaKey) {
+          if (this.selectedIds.has(id)) this.selectedIds.delete(id);
+          else this.selectedIds.add(id);
+        } else if (event.shiftKey) {
+          this.selectedIds.add(id);
+        } else {
+          this.selectedIds.clear();
+          this.selectedIds.add(id);
+        }
+        this.selected = lora;
+        this.localStrength = this.getLoraStrength(lora);
         this.renderFolderTree(); 
+        this.renderLoras();
         this.renderDetails();
+      };
+      card.addEventListener("click", selectCard);
+      card.addEventListener("keydown", (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          selectCard(event);
+        }
       });
     });
     this.renderPagination();
+    this.renderSelectionBar();
   }
 
   renderPagination() {
@@ -942,6 +1294,124 @@ regex:^SDXL.* - Regex search
     }
   }
 
+  renderSelectionBar() {
+    const bar = this.element.querySelector('[data-role="selection-bar"]');
+    if (!bar) return;
+    const count = this.selectedIds.size;
+    if (!count) {
+      bar.className = "umi-lb-selection-bar";
+      bar.innerHTML = "";
+      return;
+    }
+
+    bar.className = "umi-lb-selection-bar active";
+    bar.innerHTML = `
+      <span class="umi-lb-chip">${count} selected</span>
+      <button class="umi-lb-btn" data-action="select-page">Select page</button>
+      <button class="umi-lb-btn" data-action="clear-selection">Clear</button>
+      <button class="umi-lb-btn" data-action="copy-selected">Copy LoRA tags</button>
+      <button class="umi-lb-btn" data-action="append-selected-wildcard">Append to wildcard</button>
+      <button class="umi-lb-btn" data-action="fetch-selected">Fetch selected</button>
+      <span class="umi-lb-selection-spacer"></span>
+    `;
+
+    bar.querySelector('[data-action="select-page"]').addEventListener("click", () => {
+      const start = this.currentPage * this.pageSize;
+      const end = start + this.pageSize;
+      this.filtered.slice(start, end).forEach(lora => this.selectedIds.add(lora.filename || lora.name));
+      this.renderLoras();
+    });
+    bar.querySelector('[data-action="clear-selection"]').addEventListener("click", () => {
+      this.selectedIds.clear();
+      this.renderLoras();
+    });
+    bar.querySelector('[data-action="copy-selected"]').addEventListener("click", () => this.copySelectedLoraTags());
+    bar.querySelector('[data-action="append-selected-wildcard"]').addEventListener("click", () => this.appendSelectedToWildcard());
+    bar.querySelector('[data-action="fetch-selected"]').addEventListener("click", () => this.fetchSelectedCivitai());
+  }
+
+  selectedLoras() {
+    return Array.from(this.selectedIds)
+      .map(id => this.loras.find(lora => (lora.filename || lora.name) === id))
+      .filter(Boolean);
+  }
+
+  async copySelectedLoraTags() {
+    const tags = this.selectedLoras().map(lora => `<lora:${lora.filename || lora.name}:${this.globalStrength.toFixed(1)}>`).join(", ");
+    if (!tags) return;
+    await this.copyText(tags, `Copied ${this.selectedIds.size} LoRA tags`);
+  }
+
+  loraWildcardLine(lora, includeActivation = false, strength = this.localStrength) {
+    const loraName = lora.filename || lora.name;
+    const numericStrength = Number(strength);
+    const loraText = `<lora:${loraName}:${(Number.isFinite(numericStrength) ? numericStrength : 1).toFixed(1)}>`;
+    if (!includeActivation) return loraText;
+    const activation = this.getActivationTags(lora);
+    const tags = activation.tags || [];
+    return tags.length ? `${loraText}, ${tags.join(", ")}` : loraText;
+  }
+
+  wildcardName() {
+    return this.element?.querySelector('[data-role="wildcard-name"]')?.value?.trim() || this.wildcardTarget || "";
+  }
+
+  async writeWildcard(name, content, mode = "append") {
+    const target = String(name || "").trim();
+    if (!target) {
+      this.showNotification("Choose a wildcard name", true);
+      return false;
+    }
+    if (!String(content || "").trim()) {
+      this.showNotification("Nothing to write", true);
+      return false;
+    }
+    try {
+      const response = await fetch("/umiapp/wildcards/text/write", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: target, mode, content }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.success === false) {
+        throw new Error(data.error || "Wildcard write failed");
+      }
+      this.wildcardTarget = data.name || target;
+      await this.fetchWildcards();
+      this.showNotification(mode === "append" ? "Added to wildcard" : "Wildcard saved");
+      this.renderDetails();
+      return true;
+    } catch (error) {
+      this.showNotification(error.message || "Wildcard write failed", true);
+      return false;
+    }
+  }
+
+  async appendSelectedToWildcard() {
+    const selected = this.selectedLoras();
+    if (!selected.length) return;
+    const name = prompt("Append selected LoRAs to wildcard:", this.wildcardTarget || "");
+    if (!name) return;
+    const content = selected.map(lora => this.loraWildcardLine(lora, false, this.globalStrength)).join("\n");
+    await this.writeWildcard(name, content, "append");
+  }
+
+  async fetchSelectedCivitai() {
+    const selected = this.selectedLoras();
+    if (!selected.length) return;
+    const apiToken = localStorage.getItem("umi_civitai_api_token") || "";
+    let processed = 0;
+    let failed = 0;
+    for (let i = 0; i < selected.length; i++) {
+      this.updateStatus(`Fetching ${i + 1}/${selected.length}`, selected[i].filename || selected[i].name);
+      const result = await this.fetchSingleCivitai(selected[i], false, "replace_civitai_info", apiToken);
+      if (result && result.success) processed += 1;
+      else failed += 1;
+    }
+    await this.loadLoras(true);
+    this.updateStatus("Ready", `Fetched ${processed}/${selected.length}${failed ? `, ${failed} failed` : ""}`);
+  }
+
   createCardHTML(lora) {
     const activation = this.getActivationTags(lora);
     const previewUrl = this.getPreviewUrl(lora);
@@ -951,12 +1421,15 @@ regex:^SDXL.* - Regex search
     const baseModel = lora.base_model || lora.civitai?.base_model || "";
     const badge = baseModel ? `<div class="umi-lb-badge">${this.escapeHtml(baseModel)}</div>` : "";
     const selectedClass = this.selected && this.selected.name === lora.name ? "selected" : "";
+    const multiSelectedClass = this.selectedIds.has(lora.filename || lora.name) ? "selected" : "";
+    const missingPreview = !previewUrl ? `<div class="umi-lb-badge" style="right:auto;left:6px;background:rgba(160,90,40,0.9);">No preview</div>` : "";
 
     return `
-            <div class="umi-lb-card ${selectedClass}">
+            <div class="umi-lb-card ${selectedClass || multiSelectedClass}" role="button" tabindex="0" aria-label="Select ${this.escapeHtmlAttr(cleanName)}">
                 <div class="umi-lb-thumb">
-                    ${previewUrl ? `<img src="${previewUrl}" alt="${this.escapeHtmlAttr(cleanName)}" loading="lazy" />` : ""}
+                    ${previewUrl ? `<img src="${this.escapeHtmlAttr(previewUrl)}" alt="${this.escapeHtmlAttr(cleanName)}" loading="lazy" />` : ""}
                     ${badge}
+                    ${missingPreview}
                     <div class="umi-lb-overlay">
                         <div class="umi-lb-card-name">${this.escapeHtml(cleanName)}</div>
                         <div class="umi-lb-tags">${tagHtml}</div>
@@ -969,29 +1442,33 @@ regex:^SDXL.* - Regex search
   renderDetails() {
     const details = this.element.querySelector('[data-role="details"]');
     if (!this.selected) {
-      details.innerHTML = '<div class="umi-lb-details-empty" style="color:#7b8499;text-align:center;padding:20px;font-size:12px;">Select a LoRA</div>';
+      details.classList.remove('has-selection');
+      details.innerHTML = '<div class="umi-lb-details-empty" style="color:var(--umi-ink-2);text-align:center;padding:20px;font-size:12px;">Select a LoRA</div>';
       return;
     }
+    details.classList.add('has-selection');
 
     const lora = this.selected;
     const activation = this.getActivationTags(lora);
     const civitai = lora.civitai || {};
     const previewUrl = this.getPreviewUrl(lora);
     const override = lora.override || {};
+    const previewPrompts = this.getPreviewPrompts(lora);
     
     // Check local metadata for URL first
     const civitaiUrl = civitai.url || (lora.metadata && lora.metadata.url) || null;
     
     const displayName = override.nickname || this.getCleanFileName(lora.filename || lora.name);
     const tagList = override.activation_text || activation.tags.join(", ");
-    const baseModel = civitai.base_model || "Unknown";
+    const baseModel = lora.base_model || civitai.base_model || "Unknown";
     const rawDescription = override.description || civitai.description || lora.local?.description || "";
     const description = this.stripHtml(rawDescription);
 
     details.innerHTML = `
+            <button class="umi-lb-btn umi-lb-detail-back" data-action="close-details">Back to LoRAs</button>
             <div class="umi-lb-detail-section">
                 <div class="umi-lb-detail-image-container">
-                    ${previewUrl ? `<img class="umi-lb-detail-image" src="${previewUrl}" />` : ""}
+                    ${previewUrl ? `<img class="umi-lb-detail-image" src="${this.escapeHtmlAttr(previewUrl)}" />` : ""}
                 </div>
                 
                 <div class="umi-lb-detail-title umi-lb-editable" contenteditable="true" data-role="edit-name" title="Click to edit name">${this.escapeHtml(displayName)}</div>
@@ -1017,13 +1494,14 @@ regex:^SDXL.* - Regex search
                         </div>
                     </div>
                     ${civitaiUrl ? `<button class="umi-lb-btn" data-action="open">Open CivitAI</button>` : `<button class="umi-lb-btn" data-action="fetch">Fetch</button>`}
+                    <button class="umi-lb-btn" data-action="view-preview-prompts">Preview Prompts${previewPrompts.length ? ` (${previewPrompts.length})` : ""}</button>
                     
                     <!-- New Manage Button -->
                     <div style="position:relative; display:inline-block;">
                         <button class="umi-lb-btn" data-action="manage">Manage</button>
                         <div class="umi-lb-dropdown" id="umi-lb-manage-menu">
                             <div class="umi-lb-dropdown-item" data-action="manage-open">Open Location</div>
-                            <div class="umi-lb-dropdown-item" style="color:#ff6b6b" data-action="manage-delete">Delete Lora</div>
+                            <div class="umi-lb-dropdown-item" style="color:var(--umi-danger)" data-action="manage-delete">Delete Lora</div>
                         </div>
                     </div>
 
@@ -1035,13 +1513,25 @@ regex:^SDXL.* - Regex search
                 <div class="umi-lb-detail-box umi-lb-editable" contenteditable="true" data-role="edit-tags">${this.escapeHtml(tagList)}</div>
                 <button class="umi-lb-btn umi-lb-btn-gold" data-action="view-internal-tags">Internal Tags</button>
             </div>
+
+            <div class="umi-lb-detail-section">
+                <div class="umi-lb-detail-label">Wildcard</div>
+                <input class="umi-lb-input" data-role="wildcard-name" list="umi-lb-wildcards" placeholder="AlexLora or folder/my_loras" value="${this.escapeHtmlAttr(this.wildcardTarget)}" />
+                <datalist id="umi-lb-wildcards">${this.wildcards.map(name => `<option value="${this.escapeHtmlAttr(name)}"></option>`).join("")}</datalist>
+                <div class="umi-lb-detail-box" style="margin-top:8px;max-height:92px;">${this.escapeHtml(this.loraWildcardLine(lora, true))}</div>
+                <div class="umi-lb-detail-actions">
+                    <button class="umi-lb-btn" data-action="append-wildcard">Append LoRA</button>
+                    <button class="umi-lb-btn" data-action="append-wildcard-tags">Append LoRA + tags</button>
+                    <button class="umi-lb-btn" data-action="overwrite-wildcard">Overwrite</button>
+                </div>
+            </div>
             
             <div class="umi-lb-detail-section">
                 <div class="umi-lb-detail-label">Description (Edit and click Save)</div>
-                <div class="umi-lb-detail-box umi-lb-editable" contenteditable="true" data-role="edit-desc">${this.escapeHtml(description || "No description")}</div>
+                <div class="umi-lb-detail-box umi-lb-editable" contenteditable="true" data-role="edit-desc" data-placeholder="No description">${this.escapeHtml(description)}</div>
             </div>
 
-            <button class="umi-lb-btn umi-lb-btn-gold" data-action="save-metadata" style="margin-top:10px; background:#4CAF50; color:white; border-color:#388E3C;">Save Metadata Changes</button>
+            <button class="umi-lb-btn umi-lb-btn-gold" data-action="save-metadata" style="margin-top:10px; background:var(--umi-ok); color:white; border-color:var(--umi-ok);">Save Metadata Changes</button>
         `;
 
     const locSlider = details.querySelector('[data-role="local-strength"]');
@@ -1053,24 +1543,45 @@ regex:^SDXL.* - Regex search
         });
     }
 
+    details.querySelector('[data-action="close-details"]')?.addEventListener('click', () => {
+        this.selected = null;
+        this.renderFolderTree();
+        this.renderLoras();
+        this.renderDetails();
+    });
+
     const nameEl = details.querySelector('[data-role="edit-name"]');
     const tagsEl = details.querySelector('[data-role="edit-tags"]');
     const descEl = details.querySelector('[data-role="edit-desc"]');
+    const wildcardEl = details.querySelector('[data-role="wildcard-name"]');
+    if (wildcardEl) {
+        wildcardEl.addEventListener("input", () => {
+            this.wildcardTarget = wildcardEl.value.trim();
+        });
+    }
 
     // Logic for the Save Button
     const saveBtn = details.querySelector('[data-action="save-metadata"]');
     saveBtn.addEventListener('click', async () => {
-        const nickname = nameEl.textContent.trim();
-        const activationText = tagsEl.textContent.trim();
-        const description = descEl.textContent.trim();
-        const currentOverride = lora.override || {};
-        await this.saveLoraOverride(lora.name, {
-            ...currentOverride,
-            nickname: nickname === this.getCleanFileName(lora.filename||lora.name) ? "" : nickname,
-            activation_text: activationText,
-            description: description
-        });
-        this.showNotification("Metadata Saved");
+        saveBtn.disabled = true;
+        try {
+            const nickname = nameEl.textContent.trim();
+            const activationText = tagsEl.textContent.trim();
+            const description = descEl.textContent.trim();
+            const currentOverride = lora.override || {};
+            await this.saveLoraOverride(lora.name, {
+                ...currentOverride,
+                nickname: nickname === this.getCleanFileName(lora.filename||lora.name) ? "" : nickname,
+                activation_text: activationText,
+                description,
+                strength: this.localStrength
+            });
+            this.showNotification("Metadata Saved");
+        } catch (error) {
+            this.showNotification(error?.message || "Metadata save failed", true);
+        } finally {
+            if (saveBtn.isConnected) saveBtn.disabled = false;
+        }
     });
 
     // Preview Dropdown
@@ -1114,22 +1625,20 @@ regex:^SDXL.* - Regex search
         previewDropdown.classList.remove('show'); // close other
     });
 
-    const closeDropdowns = () => {
-        previewDropdown.classList.remove('show');
-        manageDropdown.classList.remove('show');
-        manageDropdown.style.position = '';
-    };
-    document.addEventListener('click', closeDropdowns);
-
     // Manage Actions
     details.querySelector('[data-action="manage-open"]').addEventListener('click', async () => {
         try {
-            this.showNotification("Opening folder...");
-            await fetch("/umiapp/loras/manage/open", { 
+            const response = await fetch("/umiapp/loras/manage/open", {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ lora_name: lora.name, filename: lora.filename })
             });
-        } catch(e) { console.error(e); }
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.error || 'Could not open location');
+            this.showNotification("Opened location");
+        } catch(e) {
+            console.error(e);
+            this.showNotification(e?.message || "Could not open location", true);
+        }
     });
 
     details.querySelector('[data-action="manage-delete"]').addEventListener('click', async () => {
@@ -1142,10 +1651,11 @@ regex:^SDXL.* - Regex search
                 const data = await res.json();
                 if(data.success) {
                     this.showNotification("Deleted");
+                    this.selectedIds.delete(lora.filename || lora.name);
                     this.selected = null;
                     await this.loadLoras(true);
                 } else {
-                    this.showNotification("Delete failed", true);
+                    this.showNotification(data.error || "Delete failed", true);
                 }
             } catch(e) { console.error(e); this.showNotification("Delete failed", true); }
         }
@@ -1166,17 +1676,30 @@ regex:^SDXL.* - Regex search
         this.fetchInternalTags(lora);
     });
 
+    const previewPromptsBtn = details.querySelector('[data-action="view-preview-prompts"]');
+    if (previewPromptsBtn) {
+        previewPromptsBtn.addEventListener('click', () => this.showPreviewPromptsModal(lora));
+    }
+
     details.querySelector('[data-action="insert"]').addEventListener("click", () => this.insertLora(lora));
-    details.querySelector('[data-action="copy"]').addEventListener("click", () => {
+    details.querySelector('[data-action="copy"]').addEventListener("click", async () => {
       const text = `<lora:${lora.filename || lora.name}:${this.localStrength.toFixed(1)}>`;
-      navigator.clipboard.writeText(text);
-      this.showNotification("Copied");
+      await this.copyText(text, "Copied");
+    });
+    details.querySelector('[data-action="append-wildcard"]').addEventListener("click", () => {
+      this.writeWildcard(this.wildcardName(), this.loraWildcardLine(lora, false), "append");
+    });
+    details.querySelector('[data-action="append-wildcard-tags"]').addEventListener("click", () => {
+      this.writeWildcard(this.wildcardName(), this.loraWildcardLine(lora, true), "append");
+    });
+    details.querySelector('[data-action="overwrite-wildcard"]').addEventListener("click", () => {
+      this.writeWildcard(this.wildcardName(), this.loraWildcardLine(lora, false), "overwrite");
     });
     
     const openBtn = details.querySelector('[data-action="open"]');
     if (openBtn) openBtn.addEventListener("click", () => window.open(civitaiUrl, "_blank"));
     const fetchBtn = details.querySelector('[data-action="fetch"]');
-    if (fetchBtn) fetchBtn.addEventListener("click", () => this.fetchSingleCivitai(lora));
+    if (fetchBtn) fetchBtn.addEventListener("click", () => this.fetchSingleCivitai(lora, true, "replace_civitai_info", localStorage.getItem("umi_civitai_api_token") || ""));
   }
 
   insertLora(lora) {
@@ -1196,8 +1719,7 @@ regex:^SDXL.* - Regex search
         this.showNotification(`Inserted`);
       }
     } else {
-      navigator.clipboard.writeText(loraText);
-      this.showNotification("Copied");
+      this.copyText(loraText, "Copied");
     }
   }
 
@@ -1212,16 +1734,17 @@ regex:^SDXL.* - Regex search
     return app.graph._nodes.find(n => n.type.startsWith("UmiAIWildcard")) || null;
   }
 
-  async fetchSingleCivitai(lora) {
+  async fetchSingleCivitai(lora, refreshAfter = true, mode = "replace_civitai_info", apiToken = "") {
     try {
       this.updateStatus("Fetching...", lora.name);
-      this.showNotification("Fetching...");
+      if (refreshAfter) this.showNotification("Fetching...");
       const res = await fetch("/umiapp/loras/civitai/single", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lora_name: lora.name }),
+        body: JSON.stringify({ lora_name: lora.name, mode, api_token: apiToken }),
       });
       const data = await res.json();
       if (data.success) {
+        if (!refreshAfter) return data;
         const currentName = this.selected?.name;
         const currentPage = this.currentPage;
         await this.loadLoras(true);
@@ -1229,15 +1752,18 @@ regex:^SDXL.* - Regex search
         this.currentPage = currentPage;
         this.renderLoras();
         this.renderDetails();
-        this.updateStatus("Ready");
-        this.showNotification("Fetch Complete");
+        this.updateStatus(data.warning ? "Completed with warning" : "Ready", data.warning || "");
+        this.showNotification(data.warning || "Fetch Complete", Boolean(data.warning));
+        return true;
       } else {
-        this.updateStatus("Error", "Fetch failed");
-        this.showNotification("Fetch Failed", true);
+        this.updateStatus("Error", data.error || "Fetch failed");
+        if (refreshAfter) this.showNotification(data.error || "Fetch Failed", true);
+        return data;
       }
     } catch (e) {
         this.updateStatus("Error", e.message);
-        this.showNotification("Error", true);
+        if (refreshAfter) this.showNotification("Error", true);
+        return { success: false, error: e.message };
     }
   }
 
@@ -1246,17 +1772,20 @@ regex:^SDXL.* - Regex search
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ lora_name: loraName, override }),
     });
-    const data = await res.json();
-    if (data.success) {
-        // Persist navigation and selection state
-        const prevPage = this.currentPage;
-        const prevName = this.selected?.name;
-        await this.loadLoras(true);
-        this.selected = this.loras.find(i => i.name === prevName) || null;
-        this.currentPage = prevPage;
-        this.renderLoras();
-        this.renderDetails();
+    let data = null;
+    try { data = await res.json(); } catch (_) { data = null; }
+    if (!res.ok || !data || !data.success) {
+      throw new Error(data?.error || `Metadata save failed (HTTP ${res.status})`);
     }
+    // Persist navigation and selection state
+    const prevPage = this.currentPage;
+    const prevName = this.selected?.name;
+    await this.loadLoras(true);
+    this.selected = this.loras.find(i => i.name === prevName) || null;
+    this.currentPage = prevPage;
+    this.renderLoras();
+    this.renderDetails();
+    return true;
   }
 
   async replaceLoraPreviewFromUrl(loraName, url) {
@@ -1268,7 +1797,7 @@ regex:^SDXL.* - Regex search
         body: JSON.stringify({ lora_name: loraName, url }),
       });
       const data = await res.json();
-      if (data.success) {
+      if (res.ok && data.success) {
         const prevName = this.selected?.name;
         const prevPage = this.currentPage;
         await this.loadLoras(true);
@@ -1288,17 +1817,59 @@ regex:^SDXL.* - Regex search
 
   showNotification(msg, isError = false) {
     const n = document.createElement("div");
-    n.style.cssText = `position:fixed;top:20px;right:20px;background:${isError ? "#be5046" : "#2f7d4b"};color:white;padding:8px 14px;border-radius:6px;z-index:10002;font-size:12px;`;
+    n.style.cssText = `position:fixed;top:20px;right:20px;background:${isError ? "var(--umi-danger)" : "var(--umi-ok-soft)"};color:white;padding:8px 14px;border-radius:6px;z-index:10002;font-size:12px;`;
     n.textContent = msg;
     document.body.appendChild(n);
     setTimeout(() => n.remove(), 1500);
   }
 
+  async copyText(text, successMessage = "Copied") {
+    try {
+      await navigator.clipboard.writeText(String(text || ""));
+      this.showNotification(successMessage);
+      return true;
+    } catch (error) {
+      console.error("[Umi LoRA Browser] Clipboard write failed:", error);
+      this.showNotification("Clipboard access failed", true);
+      return false;
+    }
+  }
+
   escapeHtml(t) { return !t ? "" : String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;"); }
   escapeHtmlAttr(t) { return this.escapeHtml(t).replace(/\n/g, " "); }
   stripHtml(v) { if (!v) return ""; let doc = new DOMParser().parseFromString(String(v), "text/html"); return doc.body.textContent.trim() || ""; }
-  async show() { if (!this.element) this.createPanel(); this.element.style.display = "block"; await this.loadLoras(); }
-  hide() { if (this.element) this.element.style.display = "none"; }
+  async show() {
+    this.previousFocus = document.activeElement;
+    if (!this.element) this.createPanel();
+    this.element.style.display = "block";
+    this.element.querySelector('[data-role="search"]')?.focus();
+    await Promise.all([this.fetchWildcards(), this.loadLoras()]);
+    if (this.element.style.display === 'none') return;
+    this.renderSelectionBar();
+    this.renderDetails();
+  }
+  scheduleSearch() {
+    clearTimeout(this.searchTimer);
+    this.searchTimer = setTimeout(() => {
+      this.searchTimer = null;
+      this.renderLoras();
+    }, 100);
+  }
+
+  hide() {
+    clearTimeout(this.searchTimer);
+    this.searchTimer = null;
+    this.tagsRequest = (this.tagsRequest || 0) + 1;
+    this.fetchGeneration++;
+    if (this.element) {
+      this.element.querySelector('.umi-lb-sidebar')?.classList.remove('filters-open');
+      this.element.querySelector('[data-action="toggle-filters"]')?.setAttribute('aria-expanded', 'false');
+      this.closeDropdowns();
+      this.element.style.display = "none";
+      this.selectedIds.clear();
+      if (this.previousFocus && typeof this.previousFocus.focus === 'function') this.previousFocus.focus();
+    }
+  }
 }
 
 const loraBrowser = new LoraBrowserPanel();
@@ -1313,6 +1884,6 @@ app.registerExtension({
       btn.onclick = () => loraBrowser.show();
       menu.appendChild(btn);
     }
-    document.addEventListener("keydown", (e) => { if (e.ctrlKey && e.key === "l") { e.preventDefault(); loraBrowser.show(); } });
+    document.addEventListener("keydown", (e) => { if (e.altKey && !e.ctrlKey && e.key.toLowerCase() === "l") { e.preventDefault(); loraBrowser.show(); } });
   }
 });

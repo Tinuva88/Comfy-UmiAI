@@ -1,4 +1,5 @@
-import { app } from "../../scripts/app.js";
+﻿import { app } from "../../scripts/app.js";
+import { ensureUmiTheme } from "./umi_theme.js";
 
 // Phase 8: Keyboard Shortcuts Panel - Show all available shortcuts
 
@@ -9,13 +10,8 @@ class ShortcutsPanel {
             {
                 category: "Browser Panels",
                 items: [
-                    { keys: "Ctrl+L", description: "Open LoRA Browser", icon: "📦" },
+                    { keys: "Alt+L", description: "Open LoRA Browser", icon: "📦" },
                     { keys: "Ctrl+I", description: "Open Image Browser", icon: "🖼️" },
-                    { keys: "Ctrl+P", description: "Open Preset Manager", icon: "💾" },
-                    { keys: "Ctrl+H", description: "Open Prompt History", icon: "📜" },
-                    { keys: "Ctrl+E", description: "Open File Editor", icon: "📝" },
-                    { keys: "Ctrl+Shift+Y", description: "Open YAML Tag Manager", icon: "🏷️" },
-                    { keys: "Ctrl+M", description: "Open Model Manager", icon: "🔧" },
                     { keys: "Ctrl+?", description: "Show Keyboard Shortcuts", icon: "⌨️" }
                 ]
             },
@@ -86,8 +82,8 @@ class ShortcutsPanel {
             width: 800px;
             max-width: 90vw;
             max-height: 85vh;
-            background: #1e1e1e;
-            border: 2px solid #61afef;
+            background: var(--umi-ground);
+            border: 2px solid var(--umi-accent);
             border-radius: 8px;
             box-shadow: 0 8px 32px rgba(0,0,0,0.8);
             z-index: 10000;
@@ -95,10 +91,11 @@ class ShortcutsPanel {
             flex-direction: column;
         `;
 
+        ensureUmiTheme();
         panel.innerHTML = `
-            <div style="padding: 15px; border-bottom: 1px solid #444; display: flex; justify-content: space-between; align-items: center;">
-                <h2 style="margin: 0; color: #61afef; font-size: 18px;">⌨️ Keyboard Shortcuts & Syntax</h2>
-                <button class="umi-close-btn" style="background: #e06c75; color: white; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 16px;">✕</button>
+            <div style="padding: 15px; border-bottom: 1px solid var(--umi-rule-strong); display: flex; justify-content: space-between; align-items: center;">
+                <h2 style="margin: 0; color: var(--umi-accent); font-size: 18px;">⌨️ Keyboard Shortcuts & Syntax</h2>
+                <button class="umi-close-btn" style="background: var(--umi-danger); color: white; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 16px;">✕</button>
             </div>
 
             <div class="umi-shortcuts-content" style="
@@ -109,7 +106,7 @@ class ShortcutsPanel {
                 ${this.renderShortcuts()}
             </div>
 
-            <div style="padding: 10px; border-top: 1px solid #444; background: #252525; color: #888; font-size: 11px; text-align: center;">
+            <div style="padding: 10px; border-top: 1px solid var(--umi-rule-strong); background: var(--umi-surface); color: var(--umi-ink-2); font-size: 11px; text-align: center;">
                 Press Ctrl+? anytime to view this guide
             </div>
         `;
@@ -139,7 +136,7 @@ class ShortcutsPanel {
     renderShortcuts() {
         return this.shortcuts.map(category => `
             <div style="margin-bottom: 25px;">
-                <h3 style="color: #98c379; font-size: 15px; margin-bottom: 12px; border-bottom: 1px solid #444; padding-bottom: 6px;">
+                <h3 style="color: var(--umi-ok); font-size: 15px; margin-bottom: 12px; border-bottom: 1px solid var(--umi-rule-strong); padding-bottom: 6px;">
                     ${category.category}
                 </h3>
                 <div style="display: grid; gap: 10px;">
@@ -149,23 +146,23 @@ class ShortcutsPanel {
                             justify-content: space-between;
                             align-items: center;
                             padding: 10px 12px;
-                            background: #2c2c2c;
+                            background: var(--umi-surface-alt);
                             border-radius: 6px;
-                            border: 1px solid #444;
+                            border: 1px solid var(--umi-rule-strong);
                             transition: all 0.2s;
-                        " onmouseover="this.style.borderColor='#61afef'" onmouseout="this.style.borderColor='#444'">
+                        " onmouseover="this.style.borderColor='var(--umi-accent)'" onmouseout="this.style.borderColor='var(--umi-rule-strong)'">
                             <div style="display: flex; align-items: center; gap: 12px;">
                                 <span style="font-size: 20px;">${item.icon}</span>
-                                <span style="color: #abb2bf; font-size: 13px;">${item.description}</span>
+                                <span style="color: var(--umi-ink); font-size: 13px;">${item.description}</span>
                             </div>
                             <kbd style="
                                 padding: 4px 10px;
-                                background: #3e4451;
-                                color: #61afef;
+                                background: var(--umi-surface-hover);
+                                color: var(--umi-accent);
                                 border-radius: 4px;
                                 font-family: monospace;
                                 font-size: 12px;
-                                border: 1px solid #555;
+                                border: 1px solid var(--umi-rule-hover);
                                 box-shadow: 0 2px 0 #222;
                             ">${item.keys}</kbd>
                         </div>

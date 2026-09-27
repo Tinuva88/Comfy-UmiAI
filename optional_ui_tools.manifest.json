@@ -1,0 +1,6 @@
+{
+  "bundle": "ui_tools",
+  "bundle_version": "0.5.0",
+  "minimum_core_api": 1,
+  "maximum_core_api": 1
+}

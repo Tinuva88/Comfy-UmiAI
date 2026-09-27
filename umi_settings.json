@@ -1,13 +1,16 @@
 {
-    "use_folder_paths": false,
-    "csv_namespace": true,
-    "yaml_namespace": true,
-    "rng_streams": false,
-    "auto_clean": true,
-    "error_lint": true,
-    "lint_cleaner_enabled": true,
-    "enable_llm_features": false,
-    "enable_danbooru_features": false,
-    "enable_tag_autocomplete": true,
-    "enable_debug_output": false
+  "use_folder_paths": false,
+  "csv_namespace": true,
+  "yaml_namespace": true,
+  "rng_streams": false,
+  "auto_clean": true,
+  "preserve_newlines": false,
+  "max_expansion_iterations": 50,
+  "max_expanded_prompt_chars": 1000000,
+  "error_lint": false,
+  "lint_cleaner_enabled": true,
+  "enable_tag_autocomplete": true,
+  "enable_debug_output": false,
+  "persist_prompt_history": false,
+  "persist_run_inspector": false
 }

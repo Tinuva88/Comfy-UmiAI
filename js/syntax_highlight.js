@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { ensureUmiTheme } from "./umi_theme.js";
 
 // =============================================================================
 // SYNTAX HIGHLIGHTER FOR UMI WILDCARDS
@@ -7,35 +8,34 @@ import { app } from "../../scripts/app.js";
 
 const HIGHLIGHT_COLORS = {
     // === CORE WILDCARDS (Green family) ===
-    wildcard: "#98c379",       // Green - __wildcards__
-    promptFile: "#7ec699",     // Lighter green - __@filename__
+    wildcard: "var(--umi-wildcard)",       // Green - __wildcards__
+    promptFile: "var(--umi-prompt-file)",     // Lighter green - __@filename__
 
     // === SELECTIONS (Yellow/Gold family) ===
-    dynamicChoice: "#e5c07b",  // Yellow - {a|b|c}
-    rangeSelect: "#ffd43b",    // Gold - __2-4$$tag__
-    tagSelect: "#61afef",      // Blue - <[tag]>
+    dynamicChoice: "var(--umi-choice)",  // Yellow - {a|b|c}
+    rangeSelect: "var(--umi-range)",    // Gold - __2-4$$tag__
+    tagSelect: "var(--umi-tag-select)",      // Blue - <[tag]>
 
     // === CONTROL (Cyan/Teal family) ===
-    conditional: "#56b6c2",    // Cyan - [if ...: ... | ...]
-    function: "#20c997",       // Teal - [shuffle:], [clean:]
+    conditional: "var(--umi-conditional)",    // Cyan - [if ...: ... | ...]
+    function: "var(--umi-function)",       // Teal - [shuffle:], [clean:]
 
     // === MODELS & TRIGGERS (Orange/Pink family) ===
-    lora: "#ff922b",           // Orange - <lora:...>
-    trigger: "#ff79c6",        // Magenta/Pink - <sks>, trigger words
-    character: "#e879f9",      // Light purple - @@character@@
+    lora: "var(--umi-lora)",           // Orange - <lora:...>
+    trigger: "var(--umi-trigger)",        // Magenta/Pink - <sks>, trigger words
 
     // === MODIFIERS (Purple/Tan family) ===
-    variable: "#c678dd",       // Purple - $variable
-    weight: "#d19a66",         // Tan/Orange - (text:1.2)
+    variable: "var(--umi-variable)",       // Purple - $variable
+    weight: "var(--umi-weight)",         // Tan/Orange - (text:1.2)
 
     // === SPECIAL ===
-    breakKeyword: "#f472b6",   // Hot pink - BREAK keyword
-    negative: "#ff6b6b",       // Warning red - **neg** or --neg:
-    comment: "#5c6370",        // Gray - # comments
+    breakKeyword: "var(--umi-trigger)",   // Hot pink - BREAK keyword
+    negative: "var(--umi-negative)",       // Warning red - **neg** or --neg:
+    comment: "var(--umi-comment)",        // Gray - # comments
 
     // === UI ===
-    text: "#abb2bf",           // Default text color
-    error: "#ff4444",          // Error red
+    text: "var(--umi-ink)",    // Default text color
+    error: "var(--umi-danger)",          // Error red
 };
 
 // Store known wildcards and loras for validation
@@ -52,6 +52,9 @@ async function fetchWildcardsForLinting() {
         const response = await fetch("/umiapp/wildcards");
         if (response.ok) {
             const data = await response.json();
+            knownWildcards = Array.isArray(data)
+                ? data
+                : (data.wildcards || data.files || []);
             knownLoras = data.loras || [];
             if (data.lint_cleaner_enabled !== undefined) {
                 lintCleanerEnabled = data.lint_cleaner_enabled;
@@ -62,11 +65,10 @@ async function fetchWildcardsForLinting() {
             updateAllLintBars();
         }
 
-        // Also fetch characters and autocomplete tags for the autocomplete system
+        // Also fetch autocomplete tags for the autocomplete system
         // This ensures they're loaded when the syntax highlighter refreshes
         const ext = app?.extensions?.find(e => e.name === "UmiAI.WildcardSystem");
         if (ext) {
-            if (ext.fetchCharacters) await ext.fetchCharacters();
             if (ext.fetchAutocompleteTags) await ext.fetchAutocompleteTags();
         }
     } catch (e) {
@@ -119,6 +121,15 @@ const HIGHLIGHT_STYLES = `
         width: 100% !important;
         height: 100% !important;
     }
+
+    .umi-syntax-container:focus-within {
+        box-shadow: 0 0 0 1px var(--umi-accent);
+        border-radius: 8px;
+    }
+
+    .umi-syntax-backdrop, .umi-syntax-textarea {
+        border-radius: 8px !important;
+    }
     
     .umi-syntax-backdrop {
         position: absolute !important;
@@ -129,7 +140,7 @@ const HIGHLIGHT_STYLES = `
         padding: 6px 8px !important;
         margin: 0 !important;
         border: none !important;
-        background: #1e1e1e !important;
+        background: var(--umi-field) !important;
         font-family: 'Consolas', 'Monaco', 'Courier New', monospace !important;
         font-size: 13px !important;
         line-height: 1.5 !important;
@@ -155,7 +166,7 @@ const HIGHLIGHT_STYLES = `
         font-size: 13px !important;
         line-height: 1.5 !important;
         color: transparent !important;
-        caret-color: #61afef !important;
+        caret-color: var(--umi-accent) !important;
         resize: none !important;
         box-sizing: border-box !important;
         z-index: 2 !important;
@@ -180,7 +191,6 @@ const HIGHLIGHT_STYLES = `
     .umi-hl-range { color: ${HIGHLIGHT_COLORS.rangeSelect} !important; }
     .umi-hl-prompt-file { color: ${HIGHLIGHT_COLORS.promptFile} !important; font-weight: 500; }
     .umi-hl-break { color: ${HIGHLIGHT_COLORS.breakKeyword} !important; font-weight: bold; }
-    .umi-hl-character { color: ${HIGHLIGHT_COLORS.character} !important; font-weight: 600; }
     .umi-hl-trigger { color: ${HIGHLIGHT_COLORS.trigger} !important; font-weight: 600; }
     
     /* Error highlighting for linting */
@@ -204,7 +214,7 @@ const HIGHLIGHT_STYLES = `
         right: 0 !important;
         height: 20px !important;
         background: rgba(30, 30, 30, 0.95) !important;
-        border-top: 1px solid #333 !important;
+        border-top: 1px solid var(--umi-rule-strong) !important;
         display: flex !important;
         align-items: center !important;
         padding: 0 8px !important;
@@ -215,7 +225,7 @@ const HIGHLIGHT_STYLES = `
     }
     
     .umi-lint-bar-clean {
-        color: #98c379 !important;
+        color: var(--umi-ok) !important;
     }
     
     .umi-lint-bar-errors {
@@ -242,7 +252,7 @@ const HIGHLIGHT_STYLES = `
         right: 0 !important;
         max-height: 150px !important;
         background: rgba(30, 30, 30, 0.98) !important;
-        border: 1px solid #444 !important;
+        border: 1px solid var(--umi-rule-strong) !important;
         border-bottom: none !important;
         border-radius: 6px 6px 0 0 !important;
         overflow-y: auto !important;
@@ -259,8 +269,8 @@ const HIGHLIGHT_STYLES = `
     
     .umi-error-item {
         padding: 4px 10px !important;
-        border-bottom: 1px solid #333 !important;
-        color: #e5c07b !important;
+        border-bottom: 1px solid var(--umi-rule-strong) !important;
+        color: var(--umi-choice) !important;
         display: flex !important;
         align-items: center !important;
         justify-content: space-between !important;
@@ -279,9 +289,9 @@ const HIGHLIGHT_STYLES = `
     }
     
     .umi-fix-btn {
-        background: #3a3a3a !important;
-        border: 1px solid #555 !important;
-        color: #98c379 !important;
+        background: var(--umi-surface-hover) !important;
+        border: 1px solid var(--umi-rule-strong) !important;
+        color: var(--umi-ok) !important;
         padding: 2px 8px !important;
         border-radius: 4px !important;
         cursor: pointer !important;
@@ -290,15 +300,15 @@ const HIGHLIGHT_STYLES = `
     }
     
     .umi-fix-btn:hover {
-        background: #4a4a4a !important;
-        border-color: #98c379 !important;
+        background: var(--umi-surface-hover) !important;
+        border-color: var(--umi-ok) !important;
     }
     
     /* Auto-clean toggle - positioned inside lint bar */
     .umi-autoclean-toggle {
-        background: #3a3a3a !important;
-        border: 1px solid #555 !important;
-        color: #aaa !important;
+        background: var(--umi-surface-hover) !important;
+        border: 1px solid var(--umi-rule-strong) !important;
+        color: var(--umi-ink) !important;
         padding: 2px 8px !important;
         border-radius: 3px !important;
         cursor: pointer !important;
@@ -310,26 +320,26 @@ const HIGHLIGHT_STYLES = `
     }
     
     .umi-autoclean-toggle:hover {
-        background: #3a3a3a !important;
-        border-color: #666 !important;
+        background: var(--umi-surface-hover) !important;
+        border-color: var(--umi-rule-hover) !important;
     }
     
     .umi-autoclean-toggle.active {
-        background: #2d4a2d !important;
-        border-color: #98c379 !important;
-        color: #98c379 !important;
+        background: var(--umi-surface-hover) !important;
+        border-color: var(--umi-ok) !important;
+        color: var(--umi-ok) !important;
     }
     
     /* Hover preview tooltip */
     .umi-preview-tooltip {
         position: fixed !important;
-        background: #252526 !important;
-        border: 1px solid #454545 !important;
+        background: var(--umi-surface) !important;
+        border: 1px solid var(--umi-rule-strong) !important;
         border-radius: 6px !important;
         padding: 8px 12px !important;
         font-family: 'Consolas', 'Monaco', monospace !important;
         font-size: 12px !important;
-        color: #e0e0e0 !important;
+        color: var(--umi-ink) !important;
         max-width: 350px !important;
         max-height: 250px !important;
         overflow-y: auto !important;
@@ -339,11 +349,11 @@ const HIGHLIGHT_STYLES = `
     }
     
     .umi-preview-header {
-        color: #61afef !important;
+        color: var(--umi-accent) !important;
         font-weight: 600 !important;
         margin-bottom: 6px !important;
         padding-bottom: 4px !important;
-        border-bottom: 1px solid #333 !important;
+        border-bottom: 1px solid var(--umi-rule-strong) !important;
         display: flex !important;
         justify-content: space-between !important;
         align-items: center !important;
@@ -351,8 +361,8 @@ const HIGHLIGHT_STYLES = `
     
     .umi-preview-type {
         font-size: 10px !important;
-        color: #888 !important;
-        background: #333 !important;
+        color: var(--umi-ink-2) !important;
+        background: var(--umi-surface-hover) !important;
         padding: 1px 5px !important;
         border-radius: 3px !important;
     }
@@ -365,14 +375,14 @@ const HIGHLIGHT_STYLES = `
     
     .umi-preview-item {
         padding: 2px 0 !important;
-        color: #98c379 !important;
+        color: var(--umi-ok) !important;
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
     }
     
     .umi-preview-more {
-        color: #888 !important;
+        color: var(--umi-ink-2) !important;
         font-style: italic !important;
     }
     
@@ -381,7 +391,7 @@ const HIGHLIGHT_STYLES = `
     }
     
     .umi-preview-loading {
-        color: #888 !important;
+        color: var(--umi-ink-2) !important;
         font-style: italic !important;
     }
 `;
@@ -390,6 +400,7 @@ const HIGHLIGHT_STYLES = `
 let stylesInjected = false;
 function injectStyles() {
     if (stylesInjected) return;
+    ensureUmiTheme();
     const styleEl = document.createElement("style");
     styleEl.id = "umi-syntax-highlight-styles";
     styleEl.textContent = HIGHLIGHT_STYLES;
@@ -854,34 +865,118 @@ function highlightSyntax(text, errors = []) {
 
     result = protectComments(result);
 
+    // 1b. Escaped syntax: \__literal__ and \{a|b} are plain text to the engine,
+    // so they must not be coloured as live syntax either. Park them behind
+    // placeholders for the duration and restore them at the end.
+    const escapePlaceholders = [];
+    const parkEscape = (content) => {
+        const token = `%%UMI_ESCAPED_${escapePlaceholders.length}%%`;
+        escapePlaceholders.push(content);
+        return token;
+    };
+    result = result.replace(/\\(?:__[^\r\n]*?__|\{[^{}\r\n]*\})/g, (m) => parkEscape(m));
+
     // 2. LoRA tags: <lora:name:strength> or <lora:name>
-    result = result.replace(/(&lt;lora:[^&]*?&gt;)/gi, '<span class="umi-hl-lora">$1</span>');
+    // Lazy up to the first closing bracket, so a name containing an escaped
+    // ampersand (&amp;) no longer breaks the match.
+    result = result.replace(/(&lt;lora:.*?&gt;)/gi, '<span class="umi-hl-lora">$1</span>');
 
     // 3. Tag selection: <[...]> (including spaces like <[Dark Skin]>)
     result = result.replace(/(&lt;\[[^\]]+\]&gt;)/g, '<span class="umi-hl-tag-select">$1</span>');
 
+    // A wildcard body is any run of non-newline characters that never contains
+    // a second "__". That single guard is what stops "__a__ __b__" collapsing
+    // into one span (\w includes the underscore, so a greedy class swallowed
+    // the closing delimiter and reopened) and stops a span spanning lines.
+    const BODY = String.raw`(?:(?!__)[^\r\n])+`;
+    const wildcardRe = (prefix) => new RegExp(`(__${prefix}${BODY}__)`, "g");
+
     // 4. Prompt file loader: __@filename__
-    result = result.replace(/(__@[\w\-\/\s]+__)/g, '<span class="umi-hl-prompt-file">$1</span>');
+    result = result.replace(wildcardRe(String.raw`@`), '<span class="umi-hl-prompt-file">$1</span>');
 
     // 5. Range wildcards: __2-4$$tag__ or __~tag__
-    result = result.replace(/(__[\d\-]+\$\$[^_]+__)/g, '<span class="umi-hl-range">$1</span>');
-    result = result.replace(/(__~[\w\-\/\s]+__)/g, '<span class="umi-hl-range">$1</span>');
+    // The name may contain underscores, so it cannot be excluded from the class.
+    result = result.replace(wildcardRe(String.raw`[\d\-]+\$\$`), '<span class="umi-hl-range">$1</span>');
+    result = result.replace(wildcardRe(String.raw`~`), '<span class="umi-hl-range">$1</span>');
 
-    // 6. Regular wildcards: __tag__ (including spaces, apostrophes, etc. like __A Centaur's Life__)
-    result = result.replace(/(__[\w\-\/\[\]\s']+__)/g, '<span class="umi-hl-wildcard">$1</span>');
+    // 6. Regular wildcards, including the documented fallback form
+    // __name|fallback text__.
+    result = result.replace(wildcardRe(""), '<span class="umi-hl-wildcard">$1</span>');
 
-    // 7. Conditionals: [if condition: true | false]
-    result = result.replace(/(\[if\s+[^\]]+\])/gi, '<span class="umi-hl-conditional">$1</span>');
+    // Bracket constructs are matched by counting, not by regex. A regex can
+    // only tolerate a fixed nesting depth, which truncated things like
+    // [if $x==1: [choose: [sample 2 from: a|b] | c] else: d] partway through.
+    //
+    // `openers` maps an anchored opener pattern to a CSS class. Unbalanced
+    // brackets are left as plain text rather than being greedily consumed.
+    const wrapBracketed = (value, openers) => {
+        let out = "";
+        let i = 0;
+        while (i < value.length) {
+            if (value[i] !== "[") {
+                out += value[i];
+                i += 1;
+                continue;
+            }
+            const rest = value.slice(i);
+            const hit = openers.find(([pattern]) => pattern.test(rest));
+            if (!hit) {
+                out += value[i];
+                i += 1;
+                continue;
+            }
+            const opener = rest.match(hit[0])[0];
+            let depth = 0;
+            let end = -1;
+            for (let j = i; j < value.length; j += 1) {
+                if (value[j] === "[") depth += 1;
+                else if (value[j] === "]") {
+                    depth -= 1;
+                    if (depth === 0) { end = j; break; }
+                }
+            }
+            if (end === -1) {
+                out += value[i];
+                i += 1;
+                continue;
+            }
+            // Recurse into the interior only, so a nested construct gets its
+            // own span. Recursing over the whole match would re-match the same
+            // opener forever.
+            const body = value.slice(i + opener.length, end);
+            out += `<span class="${hit[1]}">${opener}${wrapBracketed(body, openers)}]</span>`;
+            i = end + 1;
+        }
+        return out;
+    };
 
-    // 8. Functions: [shuffle:...] and [clean:...]
-    result = result.replace(/(\[(shuffle|clean):[^\]]*\])/gi, '<span class="umi-hl-function">$1</span>');
+    // 8. Function names must match the dispatcher in shared_utils.py; anything
+    // implemented there and missing here reads to the user as unsupported
+    // syntax. Longer anima_* names precede the short one.
+    const FUNCTION_NAMES = [
+        "clean", "shuffle", "choose", "and", "or", "xor", "lora",
+        "require", "assert", "forbid", "prefer", "warn",
+        "preset", "section",
+        "anima_order", "anima_natural", "anima_lint", "anima",
+    ].join("|");
 
-    // 9. Negative markers: **text** and --neg: text
+    // 7-9. Conditionals, functions and bracketed negatives, in one pass.
+    result = wrapBracketed(result, [
+        [/^\[if\s+/i, "umi-hl-conditional"],
+        [new RegExp(String.raw`^\[(?:${FUNCTION_NAMES}):`, "i"), "umi-hl-function"],
+        [/^\[sample\s+[^\]:]*:/i, "umi-hl-function"],
+        [/^\[neg(?:_if)?:/i, "umi-hl-negative"],
+    ]);
+
+    result = result.replace(/(\[\/?negative\])/gi, '<span class="umi-hl-negative">$1</span>');
     result = result.replace(/(\*\*[^*]+\*\*)/g, '<span class="umi-hl-negative">$1</span>');
     result = result.replace(/(--neg:[^\n,]+)/gi, '<span class="umi-hl-negative">$1</span>');
 
-    // 10. Variables: $variable (word characters only)
-    result = result.replace(/(\$[\w]+)/g, '<span class="umi-hl-variable">$1</span>');
+    // 10. Variables: $variable and the scoped form $@variable. The
+    // lookaround keeps the rule off the second "$" of a "$$" range marker,
+    // which it used to colour as a variable. Without the optional '@' the
+    // scoped form read as unsupported syntax.
+    result = result.replace(/((?<!\$)\$(?!\$)@?[\w]+)/g, '<span class="umi-hl-variable">$1</span>');
 
     // 11. Dynamic choices: {option1|option2|option3}
     result = result.replace(/(\{[^{}]+\})/g, '<span class="umi-hl-dynamic">$1</span>');
@@ -892,14 +987,14 @@ function highlightSyntax(text, errors = []) {
     // 13. BREAK keyword - stands out in magenta/pink
     result = result.replace(/\b(BREAK)\b/g, '<span class="umi-hl-break">$1</span>');
 
-    // 14. Character references: @@name:outfit:emotion@@ and @@name.costume.name.part@@
-    // Dot notation (VNCCS-style): @@char.costume.name.part@@, @@char.emotion.name@@, @@char.info.field@@
-    result = result.replace(/(@@[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+){2,3}@@)/g, '<span class="umi-hl-character">$1</span>');
-    // Colon notation (original): @@char:outfit:emotion@@
-    result = result.replace(/(@@[a-zA-Z0-9_-]+(?::[a-zA-Z0-9_-]+)?(?::[a-zA-Z0-9_-]+)?@@)/g, '<span class="umi-hl-character">$1</span>');
-
     // 15. LoRA trigger words: <sks>, <ohwx>, <lora_trigger>, etc.
     result = result.replace(/(&lt;(?!lora:|lyco:)[a-zA-Z0-9_-]+&gt;)/gi, '<span class="umi-hl-trigger">$1</span>');
+
+    // Restore escaped syntax as plain, uncoloured text
+    escapePlaceholders.forEach((content, index) => {
+        const token = `%%UMI_ESCAPED_${index}%%`;
+        result = result.split(token).join(content);
+    });
 
     // Restore protected comment ranges
     commentPlaceholders.forEach((content, index) => {
@@ -1119,7 +1214,7 @@ function applyHighlighting(textareaEl, widget = null, node = null, nodeLintEnabl
         // Add "Fix All" button at the bottom
         const fixAllItem = document.createElement('div');
         fixAllItem.className = 'umi-error-item';
-        fixAllItem.style.background = '#2a2a2a';
+        fixAllItem.style.background = 'var(--umi-surface-alt)';
 
         const fixAllBtn = document.createElement('button');
         fixAllBtn.className = 'umi-fix-btn';
@@ -1297,6 +1392,30 @@ function applyHighlighting(textareaEl, widget = null, node = null, nodeLintEnabl
 // =============================================================================
 // AUTO-APPLY TO UMI NODES
 // =============================================================================
+function resolveWidgetInputElement(widget) {
+    if (!widget) return null;
+
+    const candidates = [
+        widget.inputEl,
+        widget.element,
+        widget.domElement,
+        widget.input,
+    ];
+
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        if (candidate instanceof HTMLTextAreaElement || candidate instanceof HTMLInputElement) {
+            return candidate;
+        }
+        if (candidate instanceof HTMLElement) {
+            const input = candidate.querySelector("textarea, input");
+            if (input) return input;
+        }
+    }
+
+    return null;
+}
+
 app.registerExtension({
     name: "UmiAI.SyntaxHighlight",
 
@@ -1330,9 +1449,9 @@ app.registerExtension({
                     return;
                 }
 
-                const inputEl = textWidget.inputEl;
+                const inputEl = resolveWidgetInputElement(textWidget);
                 if (!inputEl) {
-                    console.log("[UmiAI Syntax] No inputEl found on text widget");
+                    console.log("[UmiAI Syntax] No textarea/input element found on text widget", textWidget);
                     return;
                 }
 

@@ -8,24 +8,121 @@ import json
 import random
 import re
 import yaml
-import csv
-import fnmatch
 import hashlib
+import difflib
 from datetime import datetime
 import time
 import folder_paths
 
+from .prompt_extensions import get_anima_extension
+
+try:
+    from .prompt_parser import find_negative_spans, parse_conditional_specs, parse_function_specs, parse_lora_specs, parse_wildcard_specs, remove_spans, split_escaped_csv
+except Exception:
+    from prompt_parser import find_negative_spans, parse_conditional_specs, parse_function_specs, parse_lora_specs, parse_wildcard_specs, remove_spans, split_escaped_csv
+
 # ==============================================================================
 # CONSTANTS
 # ==============================================================================
-ALL_KEY = 'all_files_index'
+ANIMA_BASE_POSITIVE_PREFIX = ("masterpiece", "best quality", "score_7")
+ANIMA_BASE_NEGATIVE_DEFAULT = (
+    "worst quality", "low quality", "score_1", "score_2", "score_3",
+    "artist name", "blurry", "jpeg artifacts", "chromatic aberration",
+)
+ANIMA_AESTHETIC_POSITIVE_PREFIX = ("masterpiece", "best quality")
+ANIMA_AESTHETIC_NEGATIVE_DEFAULT = (
+    "worst quality", "low quality", "artist name", "blurry",
+    "jpeg artifacts", "chromatic aberration",
+)
+ANIMA_TURBO_POSITIVE_PREFIX = ANIMA_BASE_POSITIVE_PREFIX
+ANIMA_TURBO_NEGATIVE_DEFAULT = ANIMA_BASE_NEGATIVE_DEFAULT
 
+# Compatibility names used by existing workflows and third-party imports.
+ANIMA_POSITIVE_PREFIX = ANIMA_BASE_POSITIVE_PREFIX
+ANIMA_NEGATIVE_DEFAULT = ANIMA_BASE_NEGATIVE_DEFAULT
+ANIMA_PROFILE_DEFAULTS = {
+    "base": (ANIMA_BASE_POSITIVE_PREFIX, ANIMA_BASE_NEGATIVE_DEFAULT),
+    "aesthetic": (ANIMA_AESTHETIC_POSITIVE_PREFIX, ANIMA_AESTHETIC_NEGATIVE_DEFAULT),
+    "turbo": (ANIMA_TURBO_POSITIVE_PREFIX, ANIMA_TURBO_NEGATIVE_DEFAULT),
+}
+ANIMA_SAFETY_TAGS = {"safe", "sensitive", "nsfw", "explicit"}
+ANIMA_SUBJECT_RE = re.compile(r"^(?:[1-9]\d*)?(?:girl|boy|other|person|people|woman|man|female|male)s?$")
+ANIMA_SCORE_RE = re.compile(r"^score_[1-9]$")
+ANIMA_YEAR_RE = re.compile(r"^year\s+\d{4}$")
+ANIMA_META_TAGS = {
+    "highres", "absurdres", "anime screenshot", "jpeg artifacts", "official art",
+    "newest", "recent", "mid", "early", "old", "masterpiece", "best quality",
+    "good quality", "normal quality", "low quality", "worst quality",
+}
+ANIMA_STYLE_PRESETS = {
+    "anime illustration": ("anime illustration", "clean lineart", "vibrant colors"),
+    "clean lineart": ("clean lineart", "sharp lines", "flat colors"),
+    "painterly": ("digital painting", "painterly", "soft brushwork"),
+    "official art": ("official art", "polished illustration", "highres"),
+    "flat color": ("flat colors", "simple shading", "clean lineart"),
+    "high detail": ("highly detailed", "detailed background", "polished illustration"),
+}
+BASE_DIR = os.path.dirname(__file__)
+PROMPT_PRESETS_PATH = os.path.join(BASE_DIR, "prompt_presets.yaml")
+PROMPT_PROFILES_PATH = os.path.join(BASE_DIR, "prompt_profiles.yaml")
+
+DEFAULT_PROMPT_PRESETS = {
+    "anime portrait base": {
+        "prompt": "1girl, solo, upper body, looking at viewer, detailed eyes",
+        "negative": "worst quality, low quality, bad anatomy",
+        "description": "Simple character portrait scaffold.",
+    },
+    "studio lighting": {
+        "prompt": "soft studio lighting, clean background, balanced composition",
+        "negative": "",
+        "description": "Quiet controlled lighting for character work.",
+    },
+    "background detail": {
+        "prompt": "detailed background, environmental storytelling, coherent perspective",
+        "negative": "empty background, inconsistent perspective",
+        "description": "Adds scene richness without picking a specific location.",
+    },
+}
+DEFAULT_PROMPT_PROFILES = {
+    "None": {
+        "positive": (),
+        "negative": (),
+        "min_words": 3,
+        "style": "generic",
+        "description": "No model-specific defaults.",
+    },
+    "Illustrious": {
+        "positive": ("masterpiece", "best quality", "very aesthetic", "absurdres"),
+        "negative": ("worst quality", "low quality", "bad anatomy", "bad hands", "text", "watermark"),
+        "min_words": 10,
+        "style": "anime_tags",
+        "description": "Anime tag model profile with quality and artifact defaults.",
+    },
+    "Pony": {
+        "positive": ("score_9", "score_8_up", "score_7_up", "source_anime"),
+        "negative": ("score_4", "score_3", "score_2", "score_1", "bad anatomy", "bad hands"),
+        "min_words": 10,
+        "style": "anime_tags",
+        "description": "Pony-style score/source tag defaults.",
+    },
+    "SDXL": {
+        "positive": ("high quality", "detailed", "sharp focus"),
+        "negative": ("low quality", "blurry", "jpeg artifacts", "distorted", "bad anatomy"),
+        "min_words": 16,
+        "style": "prose_or_tags",
+        "description": "General SDXL-friendly quality and clarity defaults.",
+    },
+    "Flux": {
+        "positive": (),
+        "negative": (),
+        "min_words": 24,
+        "style": "prose",
+        "description": "Flux-style descriptive prose guidance without forced quality soup.",
+    },
+}
 # ==============================================================================
-# GLOBAL CACHES (shared between Full and Lite)
+# GLOBAL CACHES
 # ==============================================================================
-GLOBAL_CACHE = {}
-GLOBAL_INDEX = {'built': False, 'files': set(), 'entries': {}, 'tags': set()}
-FILE_MTIME_CACHE = {}
 ALIAS_CACHE = {}
 
 # ==============================================================================
@@ -42,7 +139,7 @@ def _debug_print(*args, **kwargs):
         try:
             settings_path = os.path.join(os.path.dirname(__file__), "umi_settings.json")
             if os.path.exists(settings_path):
-                with open(settings_path, 'r', encoding='utf-8') as f:
+                with open(settings_path, 'r', encoding='utf-8-sig') as f:
                     settings = json.load(f)
                     _DEBUG_SETTINGS_CACHE['enabled'] = settings.get('enable_debug_output', False)
             _DEBUG_SETTINGS_CACHE['loaded'] = True
@@ -83,7 +180,12 @@ def strip_prompt_comments(text):
     clean_lines = []
     for line in protected_text.splitlines():
         line = _strip_double_slash_comments(line)
-        if '#' in line and not line.strip().startswith("#"):
+        # A line that starts with '#' is a comment in full. This used to be
+        # excluded from stripping entirely, so whole-line comments survived
+        # into the prompt.
+        if line.strip().startswith("#"):
+            continue
+        if '#' in line:
             if ' #' in line:
                 line = line.split(' #')[0]
         line = line.strip()
@@ -94,38 +196,981 @@ def strip_prompt_comments(text):
     return cleaned.replace('___UMI_HASH_PROTECT___', '#').replace('<___UMI_HASH_PROTECT___', '<#')
 
 
+def _split_prompt_tags(text):
+    if not text:
+        return []
+
+    parts = []
+    current = []
+    quote = None
+    angle_depth = 0
+    paren_depth = 0
+
+    for char in str(text):
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+            current.append(char)
+            continue
+        if char == '<':
+            angle_depth += 1
+        elif char == '>' and angle_depth:
+            angle_depth -= 1
+        elif char == '(':
+            paren_depth += 1
+        elif char == ')' and paren_depth:
+            paren_depth -= 1
+        if char == ',' and angle_depth == 0 and paren_depth == 0:
+            item = "".join(current).strip()
+            if item:
+                parts.append(item)
+            current = []
+            continue
+        current.append(char)
+
+    item = "".join(current).strip()
+    if item:
+        parts.append(item)
+    return parts
+
+
+def _normalize_anima_tag(tag):
+    tag = re.sub(r'\s+', ' ', str(tag).strip())
+    if not tag:
+        return ""
+    if tag.startswith("<") or tag.startswith("@") or "__" in tag:
+        return tag
+    if ANIMA_SCORE_RE.match(tag):
+        return tag
+    return tag.replace("_", " ")
+
+
+def _dedupe_keep_order(items):
+    seen = set()
+    result = []
+    for item in items:
+        key = item.lower()
+        if not item or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _looks_like_character(tag):
+    words = tag.split()
+    if not words or len(words) > 4:
+        return False
+    if tag.startswith("@") or ANIMA_SUBJECT_RE.match(tag) or tag in ANIMA_META_TAGS or tag in ANIMA_SAFETY_TAGS:
+        return False
+    return any(word[:1].isupper() for word in words)
+
+
+def _looks_like_series(tag):
+    lowered = tag.lower()
+    series_markers = (" no ", " of ", " yuri", "frieren", "project", "impact", "chronicles", "academy")
+    return any(marker in lowered for marker in series_markers)
+
+
+def order_anima_prompt(text, style_preset="none", add_prefix=False, positive_prefix=None):
+    tags = [_normalize_anima_tag(tag) for tag in _split_prompt_tags(text)]
+    tags = [tag for tag in tags if tag]
+
+    quality_meta = []
+    subjects = []
+    characters = []
+    series = []
+    artists = []
+    general = []
+
+    for tag in tags:
+        lowered = tag.lower()
+        if tag.startswith("@"):
+            artists.append(tag)
+        elif lowered in ANIMA_META_TAGS or lowered in ANIMA_SAFETY_TAGS or ANIMA_SCORE_RE.match(lowered) or ANIMA_YEAR_RE.match(lowered):
+            quality_meta.append(lowered)
+        elif ANIMA_SUBJECT_RE.match(lowered):
+            subjects.append(lowered)
+        elif _looks_like_character(tag):
+            characters.append(tag)
+        elif _looks_like_series(tag):
+            series.append(tag)
+        else:
+            general.append(lowered if tag == tag.lower() else tag)
+
+    if style_preset and style_preset.lower() not in ("none", "off", "false", "0"):
+        general.extend(ANIMA_STYLE_PRESETS.get(style_preset.lower(), (style_preset,)))
+
+    ordered = []
+    if add_prefix:
+        ordered.extend(positive_prefix or ANIMA_POSITIVE_PREFIX)
+    ordered.extend(quality_meta)
+    ordered.extend(subjects)
+    ordered.extend(characters)
+    ordered.extend(series)
+    ordered.extend(artists)
+    ordered.extend(general)
+    return ", ".join(_dedupe_keep_order(ordered))
+
+
+def lint_anima_prompt(text, negative_text="", variant="base"):
+    variant_key = str(variant or "base").strip().lower()
+    _, negative_defaults = ANIMA_PROFILE_DEFAULTS.get(
+        variant_key, ANIMA_PROFILE_DEFAULTS["base"]
+    )
+    tags = [_normalize_anima_tag(tag).lower() for tag in _split_prompt_tags(text)]
+    tag_set = set(tags)
+    warnings = []
+
+    if not tag_set.intersection(ANIMA_SAFETY_TAGS):
+        warnings.append("Anima: add a safety tag such as safe, sensitive, nsfw, or explicit.")
+    if (
+        variant_key != "aesthetic"
+        and not ({"masterpiece", "best quality"} & tag_set)
+        and not any(ANIMA_SCORE_RE.match(tag) for tag in tag_set)
+    ):
+        warnings.append("Anima: add quality guidance such as masterpiece, best quality, or score_7.")
+    if len([tag for tag in tags if tag]) < 6 and len(str(text).split()) < 18:
+        warnings.append("Anima: short prompts can be unstable; add subject, appearance, style, and composition details.")
+    if re.search(r"(^|,\s*)(?!@)[a-z0-9 ]+\s+artist(\s*,|$)", str(text), re.IGNORECASE):
+        warnings.append("Anima: artist names should be prefixed with @.")
+    if re.search(r"\b(realistic|photorealistic|photo|dslr|cinematic photo)\b", str(text), re.IGNORECASE):
+        warnings.append("Anima: the base model is illustration/anime focused and does not do realism well.")
+
+    neg_tags = {_normalize_anima_tag(tag).lower() for tag in _split_prompt_tags(negative_text)}
+    if negative_text and not neg_tags.intersection(set(negative_defaults)):
+        warnings.append("Anima: negative prompt should include low-quality/low-score negatives.")
+    if variant_key == "aesthetic" and (
+        any(ANIMA_SCORE_RE.match(tag) for tag in tag_set)
+        or any(ANIMA_SCORE_RE.match(tag) for tag in neg_tags)
+    ):
+        warnings.append(
+            "Anima Aesthetic: score_* tags are usually unnecessary and can overcook the image."
+        )
+    return warnings
+
+
+def apply_anima_profile(
+    text,
+    negative_text="",
+    mode="profile",
+    style_preset="none",
+    variant="base",
+):
+    variant_key = str(variant or "base").strip().lower()
+    positive_prefix, negative_defaults = ANIMA_PROFILE_DEFAULTS.get(
+        variant_key, ANIMA_PROFILE_DEFAULTS["base"]
+    )
+    mode_key = str(mode or "profile").strip().lower()
+    add_prefix = mode_key in ("profile", "base", "full", "prefix")
+    prompt = order_anima_prompt(
+        text,
+        style_preset=style_preset,
+        add_prefix=add_prefix,
+        positive_prefix=positive_prefix,
+    )
+    negative = negative_text or ""
+    if mode_key in ("profile", "base", "full", "negative"):
+        existing = _split_prompt_tags(negative)
+        negative = ", ".join(_dedupe_keep_order(list(negative_defaults) + existing))
+    return prompt, negative, lint_anima_prompt(prompt, negative, variant=variant_key)
+
+
+def _coerce_text_list(value):
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return tuple(part.strip() for part in split_escaped_csv(value) if part.strip())
+    if isinstance(value, (list, tuple)):
+        return tuple(str(part).strip() for part in value if str(part).strip())
+    return ()
+
+
+def _load_yaml_mapping(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        _debug_print(f"[UmiAI] Failed loading prompt config {path}: {e}")
+        return {}
+
+
+def _normalize_prompt_presets(data):
+    normalized = {}
+    for name, preset in (data or {}).items():
+        if not isinstance(preset, dict):
+            continue
+        clean_name = str(name).strip().lower()
+        if not clean_name:
+            continue
+        normalized[clean_name] = {
+            "prompt": str(preset.get("prompt", "") or ""),
+            "negative": str(preset.get("negative", "") or ""),
+            "description": str(preset.get("description", "") or ""),
+        }
+    return normalized
+
+
+def _normalize_prompt_profiles(data):
+    normalized = {}
+    for name, profile in (data or {}).items():
+        if not isinstance(profile, dict):
+            continue
+        clean_name = str(name).strip()
+        if not clean_name:
+            continue
+        normalized[clean_name] = {
+            "positive": _coerce_text_list(profile.get("positive")),
+            "negative": _coerce_text_list(profile.get("negative")),
+            "min_words": int(profile.get("min_words", 8) or 8),
+            "style": str(profile.get("style", "generic") or "generic"),
+            "description": str(profile.get("description", "") or ""),
+        }
+    return normalized
+
+
+def load_prompt_presets():
+    presets = _normalize_prompt_presets(DEFAULT_PROMPT_PRESETS)
+    anima_extension = get_anima_extension()
+    if anima_extension is not None:
+        presets.update(_normalize_prompt_presets(anima_extension.prompt_presets))
+    configured = _normalize_prompt_presets(_load_yaml_mapping(PROMPT_PRESETS_PATH))
+    if anima_extension is None:
+        configured.pop("anima clean negative", None)
+        configured.pop("anima clean lineart", None)
+    presets.update(configured)
+    return presets
+
+
+def load_prompt_profiles():
+    profiles = _normalize_prompt_profiles(DEFAULT_PROMPT_PROFILES)
+    anima_extension = get_anima_extension()
+    if anima_extension is not None:
+        profiles.update(_normalize_prompt_profiles(anima_extension.prompt_profiles))
+    configured = _normalize_prompt_profiles(_load_yaml_mapping(PROMPT_PROFILES_PATH))
+    if anima_extension is None:
+        for anima_profile in ("Anima Base", "Anima Aesthetic", "Anima Turbo"):
+            configured.pop(anima_profile, None)
+    profiles.update(configured)
+    if "None" not in profiles:
+        profiles["None"] = _normalize_prompt_profiles({"None": DEFAULT_PROMPT_PROFILES["None"]})["None"]
+    return profiles
+
+
+def list_prompt_profiles():
+    return list(load_prompt_profiles().keys())
+
+
+def get_prompt_profile(name):
+    requested = str(name or "None").strip().lower()
+    profiles = load_prompt_profiles()
+    for profile_name, profile in profiles.items():
+        if profile_name.lower() == requested:
+            return profile_name, profile
+    return "None", profiles["None"]
+
+
+def apply_named_prompt_profile(profile_name, prompt, negative_text="", style_preset="none"):
+    resolved_name, profile = get_prompt_profile(profile_name)
+    if resolved_name in ("Anima Base", "Anima Aesthetic", "Anima Turbo"):
+        anima_extension = get_anima_extension()
+        if anima_extension is not None:
+            variant = resolved_name.removeprefix("Anima ").lower()
+            return (*anima_extension.apply_profile(
+                prompt,
+                negative_text,
+                mode="profile",
+                style_preset=style_preset,
+                variant=variant,
+            ), resolved_name)
+    if resolved_name == "None":
+        return prompt, negative_text or "", lint_prompt_profile(resolved_name, prompt, negative_text), resolved_name
+
+    positive = list(profile.get("positive", ()))
+    negative_defaults = list(profile.get("negative", ()))
+    prompt_parts = _split_prompt_tags(prompt)
+    negative_parts = _split_prompt_tags(negative_text)
+    merged_prompt = ", ".join(_dedupe_keep_order(positive + prompt_parts))
+    merged_negative = ", ".join(_dedupe_keep_order(negative_defaults + negative_parts))
+    warnings = lint_prompt_profile(resolved_name, merged_prompt, merged_negative)
+    return merged_prompt, merged_negative, warnings, resolved_name
+
+
+def expand_anima_natural_language(text):
+    prompt = str(text or "").strip()
+    if not prompt:
+        return ""
+    sentence_count = len(re.findall(r'[.!?](?:\s|$)', prompt))
+    if sentence_count >= 2 or len(prompt.split()) >= 28:
+        return prompt
+    return (
+        f"{prompt}. Describe the subject's core appearance, outfit, pose, expression, "
+        "composition, background, lighting, and illustration style with clear visual details."
+    )
+
+
+ANIMA_COHESION_HINTS = {
+    "subject": (
+        "character", "subject", "person", "girl", "boy", "woman", "man",
+        "species", "creature", "animal", "body", "face", "hair", "eyes",
+        "age", "ethnicity", "attire", "outfit", "clothing", "costume",
+        "accessor", "appearance",
+    ),
+    "action": (
+        "pose", "action", "gesture", "expression", "emotion", "movement",
+        "interaction",
+    ),
+    "setting": (
+        "background", "setting", "scene", "location", "environment",
+        "landscape", "interior", "architecture", "weather", "time",
+    ),
+    "composition": (
+        "composition", "camera", "framing", "angle", "shot", "view",
+        "perspective", "lens", "focal",
+    ),
+    "lighting": (
+        "lighting", "light", "palette", "color", "colour", "atmosphere",
+        "fog", "glow", "shadow",
+    ),
+    "style": (
+        "style", "medium", "render", "aesthetic", "technique", "lineart",
+        "illustration", "painting", "artist",
+    ),
+}
+
+
+def _is_anima_artist_fragment(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(re.search(r"(^|::|\()\s*@[^\s,()]+", text))
+
+
+def split_anima_artist_chain(text, remove=False):
+    """Extract artist tokens in the syntax accepted by Anima Artist Mixer."""
+
+    artists = []
+    retained = []
+    for part in _split_prompt_tags(text):
+        clean = _normalize_anima_tag(part)
+        if _is_anima_artist_fragment(clean):
+            artists.append(clean)
+            if not remove:
+                retained.append(clean)
+        else:
+            retained.append(clean)
+    return ", ".join(_dedupe_keep_order(retained)), ", ".join(
+        _dedupe_keep_order(artists)
+    )
+
+
+def _anima_cohesion_category(value, hint=""):
+    normalized_hint = str(hint or "").lower().replace("_", " ")
+    combined = str(value or "").lower().replace("_", " ")
+    for category, markers in ANIMA_COHESION_HINTS.items():
+        if normalized_hint and any(marker in normalized_hint for marker in markers):
+            return category
+
+    if re.search(
+        r"\b(standing|sitting|kneeling|running|walking|flying|looking|holding|"
+        r"smiling|crying|fighting|reaching|leaning|lying)\b",
+        combined,
+    ):
+        return "action"
+    if re.search(
+        r"\b(forest|city|street|room|beach|mountain|sky|space|garden|temple|"
+        r"castle|school|ocean|indoors|outdoors|background)\b",
+        combined,
+    ):
+        return "setting"
+    if re.search(
+        r"\b(close[- ]?up|portrait|full body|upper body|wide shot|low angle|"
+        r"high angle|from (?:above|below|behind)|depth of field)\b",
+        combined,
+    ):
+        return "composition"
+    if re.search(
+        r"\b(anime|illustration|painting|watercolor|oil paint|lineart|"
+        r"cel shading|sketch|manga|comic|3d render|pixel art)\b",
+        combined,
+    ):
+        return "style"
+    if re.search(
+        r"\b(rim light|backlight|sunlight|moonlight|neon|chiaroscuro|"
+        r"golden hour|soft light|dramatic light|pastel|monochrome)\b",
+        combined,
+    ):
+        return "lighting"
+    return "subject"
+
+
+def _anima_trace_hints(wildcard_trace):
+    hints = {}
+    for record in wildcard_trace or ():
+        if not isinstance(record, dict) or record.get("type") != "wildcard":
+            continue
+        hint = str(record.get("wildcard", "") or "")
+        values = record.get("values")
+        if not isinstance(values, (list, tuple)):
+            values = [record.get("result", "")]
+        for value in values:
+            for part in _split_prompt_tags(value):
+                key = _normalize_anima_tag(part).lower()
+                if key:
+                    hints.setdefault(key, hint)
+    return hints
+
+
+def compose_anima_wildcard_prompt(
+    text,
+    wildcard_trace=None,
+    mode="off",
+    artist_mode="keep in prompt",
+):
+    """Turn resolved wildcard fragments into an ordered or cohesive Anima prompt.
+
+    This composer is intentionally deterministic. It uses wildcard source names as
+    semantic hints and does not require a second generative text model.
+    """
+
+    mode_key = str(mode or "off").strip().lower()
+    split_artists = str(artist_mode or "").strip().lower().startswith("split")
+    if mode_key in ("off", "none", "disabled"):
+        prompt, artist_chain = split_anima_artist_chain(text, remove=split_artists)
+        return prompt, artist_chain, {
+            "mode": "off",
+            "artist_mode": artist_mode,
+            "categories": {},
+        }
+
+    trace_hints = _anima_trace_hints(wildcard_trace)
+    meta = []
+    protected = []
+    artists = []
+    categories = {
+        "subject": [],
+        "action": [],
+        "setting": [],
+        "composition": [],
+        "lighting": [],
+        "style": [],
+    }
+
+    for raw_part in _split_prompt_tags(text):
+        part = _normalize_anima_tag(raw_part)
+        if not part:
+            continue
+        lowered = part.lower()
+
+        if _is_anima_artist_fragment(part):
+            artists.append(part)
+            if not split_artists:
+                categories["style"].append(part)
+            continue
+        if part.startswith("<") or "@@" in part:
+            protected.append(part)
+            continue
+        if (
+            lowered in ANIMA_META_TAGS
+            or lowered in ANIMA_SAFETY_TAGS
+            or ANIMA_SCORE_RE.match(lowered)
+            or ANIMA_YEAR_RE.match(lowered)
+            or lowered in ("masterpiece", "best quality", "high quality")
+        ):
+            meta.append(lowered)
+            continue
+
+        hint = trace_hints.get(lowered, "")
+        category = _anima_cohesion_category(part, hint)
+        categories[category].append(part)
+
+    meta = _dedupe_keep_order(meta)
+    protected = _dedupe_keep_order(protected)
+    artists = _dedupe_keep_order(artists)
+    categories = {
+        key: _dedupe_keep_order(values) for key, values in categories.items()
+    }
+
+    if mode_key in ("ordered", "ordered tags", "anima ordered tags"):
+        ordered_parts = (
+            meta
+            + categories["subject"]
+            + categories["action"]
+            + categories["setting"]
+            + categories["composition"]
+            + categories["lighting"]
+            + categories["style"]
+            + protected
+        )
+        prompt = ", ".join(_dedupe_keep_order(ordered_parts))
+    else:
+        sentences = []
+        if meta:
+            sentences.append(", ".join(meta).rstrip(".") + ".")
+
+        subject = categories["subject"]
+        action = categories["action"]
+        if subject:
+            sentence = "Depict " + ", ".join(subject)
+            if action:
+                sentence += ", " + ", ".join(action)
+            sentences.append(sentence.rstrip(".") + ".")
+        elif action:
+            sentences.append("Show " + ", ".join(action).rstrip(".") + ".")
+
+        if categories["setting"]:
+            sentences.append(
+                "Place the scene in "
+                + ", ".join(categories["setting"]).rstrip(".")
+                + "."
+            )
+        if categories["composition"]:
+            sentences.append(
+                "Frame it with "
+                + ", ".join(categories["composition"]).rstrip(".")
+                + "."
+            )
+        if categories["lighting"]:
+            sentences.append(
+                "Use "
+                + ", ".join(categories["lighting"]).rstrip(".")
+                + "."
+            )
+        if categories["style"]:
+            sentences.append(
+                "Render it with "
+                + ", ".join(categories["style"]).rstrip(".")
+                + "."
+            )
+
+        prompt = " ".join(sentences).strip()
+        if protected:
+            prompt = " ".join(
+                part for part in (prompt, ", ".join(protected)) if part
+            )
+        if not prompt:
+            prompt = str(text or "").strip()
+
+    return prompt, ", ".join(artists), {
+        "mode": "ordered tags" if mode_key in (
+            "ordered", "ordered tags", "anima ordered tags"
+        ) else "cohesive prompt",
+        "artist_mode": "split for artist mixer" if split_artists else "keep in prompt",
+        "artists": artists,
+        "categories": categories,
+        "meta": meta,
+        "protected": protected,
+    }
+
+
+def list_prompt_presets():
+    return sorted(load_prompt_presets().keys())
+
+
+def get_prompt_preset(name):
+    key = str(name or "").strip().lower()
+    return load_prompt_presets().get(key)
+
+
+def apply_prompt_preset(prompt, negative_text="", preset_name="none", placement="append"):
+    preset = get_prompt_preset(preset_name)
+    if not preset:
+        return prompt, negative_text, []
+
+    preset_prompt = preset.get("prompt", "").strip()
+    preset_negative = preset.get("negative", "").strip()
+    placement_key = str(placement or "append").strip().lower()
+
+    prompt_parts = [str(prompt or "").strip()]
+    if preset_prompt:
+        if placement_key == "prepend":
+            prompt_parts = [preset_prompt] + prompt_parts
+        elif placement_key == "replace":
+            prompt_parts = [preset_prompt]
+        else:
+            prompt_parts.append(preset_prompt)
+
+    negative_parts = [str(negative_text or "").strip()]
+    if preset_negative:
+        negative_parts.append(preset_negative)
+
+    merged_prompt = ", ".join(part for part in prompt_parts if part)
+    merged_negative = ", ".join(part for part in negative_parts if part)
+    return merged_prompt, merged_negative, [f"Preset applied: {preset_name}"]
+
+
+def resolve_preset_directive(content):
+    """Resolve the body of a [preset:name | include=...] directive to text."""
+    content = str(content or "").strip()
+    name = content
+    opts = {}
+    if "|" in content:
+        parts = [part.strip() for part in content.split("|")]
+        name = parts[0]
+        for part in parts[1:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                opts[key.strip().lower()] = value.strip()
+    preset = get_prompt_preset(name)
+    if not preset:
+        return f"[PRESET_NOT_FOUND: {name}]"
+    include = opts.get("include", "prompt").lower()
+    if include in ("negative", "neg"):
+        return preset.get("negative", "")
+    if include == "both":
+        prompt = preset.get("prompt", "")
+        negative = preset.get("negative", "")
+        return ", ".join(part for part in (prompt, f"**{negative}**" if negative else "") if part)
+    return preset.get("prompt", "")
+
+
+def expand_prompt_presets(text):
+    return re.sub(
+        r'\[preset:([^\]]+)\]',
+        lambda match: resolve_preset_directive(match.group(1)),
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+
+
+def lint_prompt_profile(profile, prompt, negative_text="", lora_info=""):
+    profile_key = str(profile or "None").strip().lower()
+    warnings = []
+    if profile_key in ("anima base", "anima aesthetic", "anima turbo"):
+        variant = profile_key.removeprefix("anima ")
+        warnings.extend(lint_anima_prompt(prompt, negative_text, variant=variant))
+    elif profile_key in ("none", ""):
+        if len(str(prompt or "").strip()) < 12:
+            warnings.append("Prompt is very short; consider adding subject, composition, and style details.")
+    else:
+        resolved_name, profile_data = get_prompt_profile(profile)
+        tag_set = {tag.lower() for tag in _split_prompt_tags(prompt)}
+        neg_set = {tag.lower() for tag in _split_prompt_tags(negative_text)}
+        expected_positive = {tag.lower() for tag in profile_data.get("positive", ())}
+        expected_negative = {tag.lower() for tag in profile_data.get("negative", ())}
+        if expected_positive and not tag_set.intersection(expected_positive):
+            warnings.append(f"{resolved_name}: consider adding profile quality/source tags.")
+        if expected_negative and negative_text and not neg_set.intersection(expected_negative):
+            warnings.append(f"{resolved_name}: negative prompt may be missing profile negatives.")
+        min_words = int(profile_data.get("min_words", 8))
+        if len(str(prompt or "").split()) < min_words and len(_split_prompt_tags(prompt)) < 6:
+            warnings.append(f"{resolved_name}: prompt is short; add subject, composition, style, and scene details.")
+        if profile_data.get("style") == "prose" and "," in str(prompt or "") and len(str(prompt or "").split(".")) <= 1:
+            warnings.append(f"{resolved_name}: this profile tends to work better with descriptive sentences than pure tag lists.")
+    if "<lora:" in str(prompt or "").lower() and not lora_info:
+        warnings.append("LoRA tags were present but no LoRA info was produced; check filenames or loading mode.")
+    return _dedupe_keep_order(warnings)
+
+
+def extract_prompt_sections(text):
+    sections = {}
+    order = []
+    remainder = []
+    pattern = re.compile(r'^\s*\[section:([^\]]+)\]\s*(.*)$', re.IGNORECASE)
+
+    for line in str(text or "").splitlines():
+        match = pattern.match(line)
+        if not match:
+            remainder.append(line)
+            continue
+        name = match.group(1).strip().lower()
+        body = match.group(2).strip()
+        if name not in sections:
+            sections[name] = []
+            order.append(name)
+        if body:
+            sections[name].append(body)
+
+    return {
+        "sections": {name: "\n".join(parts).strip() for name, parts in sections.items()},
+        "order": order,
+        "remainder": "\n".join(remainder).strip(),
+    }
+
+
+def apply_prompt_sections(text, order=None):
+    parsed = extract_prompt_sections(text)
+    sections = parsed["sections"]
+    if not sections:
+        return text, parsed
+
+    requested = []
+    if order:
+        requested = [name.strip().lower() for name in str(order).split(",") if name.strip()]
+
+    section_order = []
+    for name in requested:
+        if name in sections and name not in section_order:
+            section_order.append(name)
+    for name in parsed["order"]:
+        if name not in section_order:
+            section_order.append(name)
+
+    parts = []
+    if parsed["remainder"]:
+        parts.append(parsed["remainder"])
+    for name in section_order:
+        if sections.get(name):
+            parts.append(sections[name])
+    return "\n".join(part for part in parts if part).strip(), parsed
+
+
+def build_prompt_diff(before, after):
+    before_parts = _split_prompt_tags(before)
+    after_parts = _split_prompt_tags(after)
+    before_set = {item.lower() for item in before_parts}
+    after_set = {item.lower() for item in after_parts}
+    added = [item for item in after_parts if item.lower() not in before_set]
+    removed = [item for item in before_parts if item.lower() not in after_set]
+    changed = str(before or "").strip() != str(after or "").strip()
+    return {
+        "changed": changed,
+        "added": added,
+        "removed": removed,
+        "input_length": len(str(before or "")),
+        "output_length": len(str(after or "")),
+    }
+
+
+def lint_prompt_join_boundaries(prompt):
+    """Catch likely wildcard/helper joins such as '__pose__in-universe_location'."""
+    warnings = []
+    text = str(prompt or "")
+    text = re.sub(r'\[(?:neg|negative)\]', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[neg_if:[^\]]+\]', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[section:[^\]]+\]', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[/\s*(?:neg|negative|neg_if|section)\]', ' ', text, flags=re.IGNORECASE)
+    patterns = [
+        (r"__[A-Za-z0-9_./-]+__[A-Za-z0-9_-]", "wildcard followed by text without comma/space"),
+        (r"__[^\r\n_,]+____\s*[A-Za-z0-9]", "wildcard has an extra '__' before following text"),
+        (r"@@[A-Za-z0-9_.:-]+@@[A-Za-z0-9_-]", "character helper followed by text without comma/space"),
+        # ``]__`` is the normal close of a filtered wildcard such as
+        # ``__pose[calm]__``; it is not an inline-helper/text join.
+        (r"\](?!__)(?!\s*\[/?(?:neg|negative|neg_if|section)\b)[A-Za-z0-9_-]", "inline helper followed by text without comma/space"),
+    ]
+    for pattern, message in patterns:
+        match = re.search(pattern, text)
+        if match:
+            warnings.append(f"Possible joined prompt token: {message} near '{match.group(0)}'.")
+    return warnings
+
+
+def _lint_balanced_delimiters(text):
+    errors = []
+    pairs = {"[": "]", "{": "}", "(": ")"}
+    stack = []
+    escape = False
+    for idx, ch in enumerate(str(text or "")):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch in pairs:
+            stack.append((ch, idx))
+            continue
+        if ch in pairs.values():
+            if not stack or pairs[stack[-1][0]] != ch:
+                errors.append(f"Unmatched '{ch}' at character {idx}.")
+                continue
+            stack.pop()
+    for ch, idx in stack:
+        errors.append(f"Unclosed '{ch}' at character {idx}.")
+    return errors
+
+
+WILDCARD_FILE_EXTENSIONS = ('.txt', '.yaml', '.yml', '.csv')
+
+
+def scan_wildcard_files(wildcard_paths):
+    """(root, relative_path, mtime_ns, size) for every wildcard file, in os.walk
+    order; a missing root is (root, "missing") and an unstatable file
+    (root, relative_path, "missing").
+
+    DirEntry.stat() is served from the directory listing on Windows, so this
+    avoids one stat call per file; on a 5,000-file collection that is about
+    20x faster than os.walk plus os.stat. Symlinked folders are not entered,
+    as with os.walk.
+    """
+    signature = []
+
+    def scan(directory, prefix, root):
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError:
+            return
+        subdirs = []
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir() and not entry.is_symlink()
+            except OSError:
+                is_dir = False
+            if is_dir:
+                subdirs.append(entry)
+            elif entry.name.endswith(WILDCARD_FILE_EXTENSIONS):
+                try:
+                    stat = entry.stat()
+                    signature.append((root, prefix + entry.name, stat.st_mtime_ns, stat.st_size))
+                except OSError:
+                    signature.append((root, prefix + entry.name, "missing"))
+        for entry in subdirs:
+            scan(entry.path, prefix + entry.name + '/', root)
+
+    for wildcard_path in wildcard_paths or ():
+        root = os.path.abspath(wildcard_path)
+        if not os.path.exists(wildcard_path):
+            signature.append((root, "missing"))
+            continue
+        scan(wildcard_path, '', root)
+    return tuple(signature)
+
+
+def _wildcard_file_catalog(wildcard_paths):
+    """Index wildcard names once for linting without parsing file contents."""
+    catalog = {}
+    for item in scan_wildcard_files(wildcard_paths):
+        if len(item) == 2:
+            continue
+        relative, extension = os.path.splitext(item[1])
+        # Match TagLoader's path-first-or-basename behavior. Earlier
+        # wildcard roots keep precedence when names collide.
+        catalog.setdefault(relative.lower(), (relative, extension))
+        catalog.setdefault(relative.rsplit("/", 1)[-1].lower(), (relative, extension))
+    return catalog
+
+
+def lint_prompt_syntax(prompt, negative_text="", profile="None", wildcard_paths=None):
+    """Return structured prompt syntax warnings without expanding randomness."""
+    text = str(prompt or "")
+    errors = []
+    warnings = []
+    notes = []
+    missing_wildcards = []
+    wildcard_specs = parse_wildcard_specs(text)
+
+    errors.extend(_lint_balanced_delimiters(text))
+
+    if text.count("__") % 2:
+        errors.append("Wildcard marker '__' appears to be unclosed.")
+    if text.count("<lora:") > text.count(">"):
+        errors.append("LoRA tag appears to be missing a closing '>'.")
+    if text.count("@@") % 2:
+        errors.append("Settings/helper marker '@@' appears to be unclosed.")
+
+    for spec in wildcard_specs:
+        if spec.kind in ("simple", "range", "file_logic", "prompt_file") and not spec.key:
+            errors.append("Wildcard has an empty name.")
+        if spec.kind == "range":
+            if spec.count_min > spec.count_max:
+                errors.append(f"Wildcard range for '{spec.key}' has min greater than max.")
+            if spec.count_max > 25:
+                warnings.append(f"Wildcard range for '{spec.key}' may create a very long prompt.")
+        if spec.kind in ("yaml_logic", "file_logic") and not spec.logic:
+            errors.append("Wildcard logic filter is empty.")
+
+    if wildcard_paths is not None:
+        catalog = _wildcard_file_catalog(wildcard_paths)
+        aliases = load_aliases_from_paths(wildcard_paths).get("wildcards", {})
+        suggestions = sorted({display for display, _ in catalog.values()}, key=str.lower)
+        for spec in wildcard_specs:
+            if spec.kind not in ("simple", "range", "file_logic", "prompt_file") or not spec.key:
+                continue
+            requested = spec.key.strip().replace("\\", "/").strip("/")
+            if requested.lower().endswith(".txt"):
+                requested = requested[:-4]
+            resolved = str(aliases.get(requested.lower(), requested)).replace("\\", "/").strip("/")
+            match = catalog.get(resolved.lower())
+            if match and (spec.kind != "prompt_file" or match[1] == ".txt"):
+                continue
+
+            missing_wildcards.append(spec.key)
+            if spec.fallback:
+                notes.append(f"Wildcard '{spec.key}' was not found; its fallback will be used.")
+                continue
+            close = difflib.get_close_matches(resolved, suggestions, n=1, cutoff=0.55)
+            suggestion = f" Did you mean '{close[0]}'?" if close else ""
+            kind = "Prompt file" if spec.kind == "prompt_file" else "Wildcard"
+            warnings.append(f"{kind} '{spec.key}' was not found.{suggestion}")
+
+    for spec in parse_lora_specs(text):
+        if spec.strength < -5.0 or spec.strength > 5.0:
+            warnings.append(f"LoRA strength for '{spec.name}' will be clamped to [-5.0, 5.0].")
+        trigger_option = spec.options.get("trigger") or spec.options.get("triggers")
+        if trigger_option and trigger_option not in ("on", "off", "true", "false", "0", "1"):
+            warnings.append(f"LoRA trigger option for '{spec.name}' is unusual: {trigger_option}.")
+
+    for spec in parse_conditional_specs(text):
+        if not spec.branches and not spec.else_text:
+            errors.append("Conditional block has no branches.")
+
+    warnings.extend(lint_prompt_join_boundaries(text))
+    warnings.extend(lint_prompt_profile(profile, text, negative_text))
+
+    if "[PRESET_NOT_FOUND:" in text:
+        warnings.append("Prompt contains a missing preset marker.")
+    if text.strip() != text:
+        notes.append("Prompt has leading or trailing whitespace.")
+
+    errors = _dedupe_keep_order(errors)
+    warnings = _dedupe_keep_order(warnings)
+    notes = _dedupe_keep_order(notes)
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "notes": notes,
+        "counts": {
+            "wildcards": len(wildcard_specs),
+            "missing_wildcards": len(set(missing_wildcards)),
+            "loras": len(parse_lora_specs(text)),
+            "conditionals": len(parse_conditional_specs(text)),
+            "negative_spans": len(find_negative_spans(text)),
+        },
+    }
+
+
 def expand_prompt_files(text, tag_loader, max_depth=5):
     """Expand __@prompt__ file references without other wildcard processing."""
     if not text:
         return ""
 
-    pattern = re.compile(r'__@([a-zA-Z0-9_\-\/\s]+)__')
     expanded = text
 
     for _ in range(max_depth):
-        match = pattern.search(expanded)
-        if not match:
+        prompt_file_specs = [spec for spec in parse_wildcard_specs(expanded) if spec.kind == "prompt_file"]
+        if not prompt_file_specs:
             break
+        spec = prompt_file_specs[0]
 
-        def _replace(match_obj):
-            filename = match_obj.group(1).strip()
+        filename = spec.key
+        try:
             content = tag_loader.load_prompt_file(filename)
-            if not content:
-                content = f"[PROMPT_FILE_NOT_FOUND: {filename}]"
+        except (OSError, ValueError, UnicodeError) as e:
+            content = spec.fallback or f"[PROMPT_FILE_ERROR: {filename}: {e}]"
+        if not content:
+            content = spec.fallback or f"[PROMPT_FILE_NOT_FOUND: {filename}]"
 
-            start = match_obj.start()
-            end = match_obj.end()
-            before = expanded[start - 1] if start > 0 else ""
-            after = expanded[end] if end < len(expanded) else ""
+        start = spec.span.start
+        end = spec.span.end
+        before = expanded[start - 1] if start > 0 else ""
+        after = expanded[end] if end < len(expanded) else ""
 
-            if content:
-                if before and before != "\n":
-                    content = "\n" + content
-                if after and after != "\n":
-                    content = content + "\n"
-            return content
+        if content:
+            if before and before != "\n":
+                content = "\n" + content
+            if after and after != "\n":
+                content = content + "\n"
 
-        expanded = pattern.sub(_replace, expanded, count=1)
+        expanded = expanded[:start] + content + expanded[end:]
 
     return expanded
 
@@ -173,21 +1218,36 @@ class _FileLock:
         return False
 
 
-def _atomic_write_json(path, data, indent=2, ensure_ascii=False):
-    directory = os.path.dirname(path)
+def _atomic_write_json(path, data, indent=2, ensure_ascii=False, default=None):
+    """Atomically replace `path` with the JSON serialization of `data`.
+
+    Writes to a unique temp file in the same directory, fsyncs it, then
+    os.replace()s it over the target so readers never observe a truncated or
+    half-written file. On failure the original file is left untouched and the
+    temp file is removed."""
+    directory = os.path.dirname(path) or "."
     base = os.path.basename(path)
     tmp_name = f".{base}.tmp.{os.getpid()}.{random.randint(0, 999999)}"
     tmp_path = os.path.join(directory, tmp_name)
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=indent, ensure_ascii=ensure_ascii)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=indent, ensure_ascii=ensure_ascii, default=default)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _read_json_file(path, default):
     if not os.path.exists(path):
         return default
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except Exception:
         return default
@@ -236,7 +1296,7 @@ def load_aliases_from_paths(paths):
             data = cached.get('data', {})
         else:
             try:
-                with open(alias_path, 'r', encoding='utf-8') as f:
+                with open(alias_path, 'r', encoding='utf-8-sig') as f:
                     raw = yaml.safe_load(f) or {}
             except Exception:
                 raw = {}
@@ -254,84 +1314,6 @@ def resolve_lora_alias(name, wildcard_paths):
         return name
     aliases = load_aliases_from_paths(wildcard_paths)
     return aliases.get('loras', {}).get(str(name).strip().lower(), name)
-
-
-def escape_unweighted_colons(prompt):
-    """
-    Escapes colons that are NOT part of SD weight syntax (token:weight) inside parentheses.
-    This prevents tags like 'reverse:1999' from being misinterpreted as weights by SD.
-
-    Examples:
-    - 'reverse:1999' -> 'reverse\\:1999' (escaped)
-    - '(red:1.2)' -> '(red:1.2)' (unchanged - valid weight)
-    - 'vertin_(reverse:1999)' -> 'vertin_(reverse\\:1999)' (escaped - not a weight)
-    """
-    if not prompt or ':' not in prompt:
-        return prompt
-
-    result = []
-    i = 0
-
-    while i < len(prompt):
-        char = prompt[i]
-
-        if char == ':':
-            # Look back and forward to determine if this is SD weight syntax
-            # SD weight syntax: (token:number) where opening paren is immediately before token
-
-            # Look ahead: check if followed by a number
-            j = i + 1
-            while j < len(prompt) and prompt[j] in ' \t':
-                j += 1
-
-            has_number = False
-            if j < len(prompt):
-                if prompt[j] == '-':
-                    j += 1
-                has_digit = False
-                has_decimal = False
-                while j < len(prompt) and (prompt[j].isdigit() or (prompt[j] == '.' and not has_decimal)):
-                    if prompt[j].isdigit():
-                        has_digit = True
-                    if prompt[j] == '.':
-                        has_decimal = True
-                    j += 1
-                if has_digit:
-                    has_number = True
-
-            # Look back: check if we're in a weight context (opening paren before token)
-            # For SD weights like (red:1.2), the pattern is: , (token:num) or start (token:num)
-            # NOT like tag_(sub:123) where underscore precedes the paren
-            is_weight_context = False
-            if has_number and j < len(prompt) and prompt[j] == ')':
-                # Find the matching opening paren
-                k = i - 1
-                # Skip back through the token
-                while k >= 0 and prompt[k] not in '(,\n':
-                    k -= 1
-                # Check if we hit an opening paren (not preceded by underscore/alphanumeric)
-                if k >= 0 and prompt[k] == '(':
-                    # Check what's before the opening paren
-                    if k == 0:
-                        is_weight_context = True
-                    elif k > 0 and prompt[k-1] in ', \t\n':
-                        is_weight_context = True
-                    # If preceded by underscore or alphanumeric, it's part of a tag name
-                    elif k > 0 and (prompt[k-1].isalnum() or prompt[k-1] == '_'):
-                        is_weight_context = False
-
-            if is_weight_context:
-                # Valid SD weight syntax - keep colon
-                result.append(char)
-            else:
-                # Not a weight - escape it
-                result.append('\\:')
-            i += 1
-        else:
-            result.append(char)
-            i += 1
-
-    return ''.join(result)
 
 
 def parse_wildcard_weight(line):
@@ -368,34 +1350,34 @@ def get_all_wildcard_paths():
     Get all wildcard search paths.
     Returns list of directories to search for wildcard files.
     """
-    paths = set()
+    paths = []
 
-    # Internal wildcards path (in the extension directory)
-    internal_path = os.path.join(os.path.dirname(__file__), "wildcards")
-    if os.path.exists(internal_path):
-        paths.add(internal_path)
+    def add_path(path):
+        if not path or not os.path.exists(path):
+            return
+        normalized = os.path.abspath(path)
+        if normalized not in paths:
+            paths.append(normalized)
 
-    # Root wildcards path
-    root_wildcards = os.path.join(folder_paths.base_path, "wildcards")
-    if os.path.exists(root_wildcards):
-        paths.add(root_wildcards)
-
-    # Models wildcards path
-    models_wildcards = os.path.join(folder_paths.models_dir, "wildcards")
-    if os.path.exists(models_wildcards):
-        paths.add(models_wildcards)
-
-    # Extension-registered wildcard paths
+    # Prefer user/configured wildcard roots over bundled defaults when names collide.
     try:
         ext_paths = folder_paths.get_folder_paths("wildcards")
         if ext_paths:
             for p in ext_paths:
-                if os.path.exists(p):
-                    paths.add(p)
+                add_path(p)
     except:
         pass
 
-    return list(paths)
+    # Root wildcards path
+    add_path(os.path.join(folder_paths.base_path, "wildcards"))
+
+    # Models wildcards path
+    add_path(os.path.join(folder_paths.models_dir, "wildcards"))
+
+    # Bundled extension wildcards are a fallback.
+    add_path(os.path.join(os.path.dirname(__file__), "wildcards"))
+
+    return paths
 
 
 def log_prompt_to_history(prompt, negative="", seed=None):
@@ -426,56 +1408,6 @@ def log_prompt_to_history(prompt, negative="", seed=None):
         _debug_print(f"[UmiAI] Warning: Could not log prompt to history: {e}")
 
 
-def parse_tag(tag):
-    """Parse and clean a wildcard tag"""
-    if tag is None:
-        return ""
-    tag = tag.replace("__", "").replace('<', '').replace('>', '').strip()
-    if tag.startswith('#'):
-        return tag
-    return tag
-
-
-def read_file_lines(file):
-    """Read and parse lines from a wildcard text file"""
-    f_lines = file.read().splitlines()
-    lines = []
-    def strip_double_slash_comments(line):
-        i = 0
-        in_comment = False
-        out = []
-        while i < len(line):
-            if line[i] == '/' and i + 1 < len(line) and line[i + 1] == '/':
-                in_comment = not in_comment
-                i += 2
-                continue
-            if in_comment:
-                i += 1
-                continue
-            out.append(line[i])
-            i += 1
-        return "".join(out).strip()
-
-    for line in f_lines:
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith('#'):
-            continue
-        if '//' in line:
-            line = strip_double_slash_comments(line)
-            if not line:
-                continue
-        if '#' in line:
-            line = line.split('#')[0].strip()
-
-        # Parse using shared utility function
-        parsed = parse_wildcard_weight(line)
-        lines.append(parsed)
-
-    return lines
-
-
 def parse_wildcard_range(range_str, num_variants):
     """Parse range syntax like '2-5' or '3'"""
     if range_str is None:
@@ -493,49 +1425,6 @@ def parse_wildcard_range(range_str, num_variants):
         return val, val
     except:
         return 1, 1
-
-
-def process_wildcard_range(tag, lines, rng):
-    """Process wildcard range selection like '2-5$$tag'"""
-    if not lines:
-        return ""
-    if tag.startswith('#'):
-        return None
-
-    if "$$" not in tag:
-        selected = rng.choice(lines)
-        if isinstance(selected, dict):
-            selected = selected.get('value', '')
-        if '#' in str(selected):
-            selected = str(selected).split('#')[0].strip()
-        return selected
-
-    range_str, tag_name = tag.split("$$", 1)
-    try:
-        low, high = parse_wildcard_range(range_str, len(lines))
-        num_items = rng.randint(low, high)
-        if num_items == 0:
-            return ""
-
-        selected = rng.sample(lines, min(num_items, len(lines)))
-        result = []
-        for item in selected:
-            if isinstance(item, dict):
-                val = item.get('value', '')
-            else:
-                val = str(item)
-            if '#' in val:
-                val = val.split('#')[0].strip()
-            result.append(val)
-        return ", ".join(result)
-    except Exception as e:
-        _debug_print(f"Error processing wildcard range: {e}")
-        selected = rng.choice(lines)
-        if isinstance(selected, dict):
-            selected = selected.get('value', '')
-        if '#' in str(selected):
-            selected = str(selected).split('#')[0].strip()
-        return selected
 
 
 # ==============================================================================
@@ -853,6 +1742,13 @@ class LogicEvaluator:
                         if re.search(r'\s', token_lower):
                             return token_lower in context_text
                         return re.search(r'\b' + re.escape(token_lower) + r'\b', context_text) is not None
+                    if isinstance(context, dict):
+                        if token_lower in context:
+                            return _coerce_bool(context[token_lower])
+                        for key, value in context.items():
+                            if str(key).lower() == token_lower:
+                                return _coerce_bool(value)
+                        return False
                     return token_lower in context
                 if kind == 'bool':
                     return bool(operand.get('value'))
@@ -1002,9 +1898,10 @@ class DynamicPromptReplacer:
     Supports: random choice, percentage chance, range selection, sequential mode
     """
     def __init__(self, seed):
-        self.re_combinations = re.compile(r"\{([^{}]*)\}")
+        self.re_combinations = re.compile(r"(?<!\\)\{([^{}]*)\}")
         self.seed = seed
         self.rng = random.Random(seed)
+        self.sync_indices = {}
 
     def replace_combinations(self, match):
         if not match:
@@ -1106,15 +2003,24 @@ class DynamicPromptReplacer:
             selected = self.rng.sample(variants, min(count, len(variants)))
             return ", ".join(selected)
 
-        # Standard random choice
+        # Standard random choice.
+        #
+        # Each occurrence rolls on its own. This used to be cached on the
+        # literal brace text, so ten identical {0|1|2|3|4} all produced the
+        # same digit -- and, because the key was the raw text, {a|b} and
+        # {a |b} were treated as unrelated, making the sharing inconsistent
+        # even on its own terms. SYNTAX.md has always presented inline choices
+        # as the way to get independent picks. To make two places agree, assign
+        # once and reuse: $c={red|blue}, $c shirt, $c pants.
         variants = [s.strip() for s in content.split("|")]
         if not variants:
             return ""
-        return self.rng.choice(variants)
+        return variants[self.rng.randrange(len(variants))]
 
     def replace(self, template):
         if not template:
             return ""
+        self.sync_indices = {}
         # Replace nested choice blocks iteratively
         prev = None
         while prev != template:
@@ -1198,6 +2104,22 @@ class VariableReplacer:
                 i += 1
             return i - 1 if depth == 0 else -1
 
+        def _starts_assignment(text_value, idx):
+            """True when text_value[idx] begins a `$name=` assignment.
+
+            Used to end an undelimited value before the next assignment rather
+            than consuming it.
+            """
+            j = idx + 1
+            while j < len(text_value) and (text_value[j].isalnum() or text_value[j] == '_'):
+                j += 1
+            if j == idx + 1:
+                return False
+            while j < len(text_value) and text_value[j].isspace():
+                j += 1
+            return j < len(text_value) and text_value[j] == '=' and \
+                not (j + 1 < len(text_value) and text_value[j + 1] == '=')
+
         def _parse_assignment(text_value, idx):
             if text_value[idx] != '$':
                 return None
@@ -1214,6 +2136,8 @@ class VariableReplacer:
             while k < len(text_value) and text_value[k].isspace():
                 k += 1
             if k >= len(text_value) or text_value[k] != '=':
+                return None
+            if k + 1 < len(text_value) and text_value[k + 1] == '=':
                 return None
 
             k += 1
@@ -1250,12 +2174,29 @@ class VariableReplacer:
                 end = text_value.find('>', k + 1)
                 value_end = end + 1 if end != -1 else len(text_value)
             else:
+                # An undelimited value is one fragment. It used to run to ';' or
+                # end of line, so "$m=happy, portrait" swallowed the rest of the
+                # prompt and left nothing to render. A comma ends it, as does
+                # the start of the next assignment, so "$a=1 $b=2" works too.
+                # Use braces or quotes for a value that must contain a comma.
                 k = value_start
-                while k < len(text_value) and text_value[k] not in ';\n':
+                while k < len(text_value):
+                    ch = text_value[k]
+                    if ch in ',;\n':
+                        break
+                    if ch == '$' and _starts_assignment(text_value, k):
+                        break
                     k += 1
                 value_end = k
 
             raw_value = text_value[value_start:value_end].strip()
+
+            # A quoted value keeps its quotes otherwise, which shows up verbatim
+            # in the prompt. Quotes are the way to put a comma inside a value
+            # now that a bare one ends at the first comma, so they have to come
+            # back off.
+            if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in ("'", '"'):
+                raw_value = raw_value[1:-1]
 
             # Skip a trailing semicolon if present
             value_end = value_end + 1 if value_end < len(text_value) and text_value[value_end] == ';' else value_end
@@ -1279,12 +2220,22 @@ class VariableReplacer:
 
             var_name, raw_value, end_idx = parsed
             resolved_value = raw_value
-            for _ in range(10):  # Max iterations to prevent infinite loops
-                prev_value = resolved_value
-                resolved_value = tag_replacer.replace(resolved_value)
-                resolved_value = dynamic_replacer.replace(resolved_value)
-                if prev_value == resolved_value:
-                    break
+            # Each assignment is its own roll context: two variables fed by the
+            # same wildcard file are separate requests, while bare occurrences in
+            # body text keep sharing one resolved value.
+            selector = getattr(tag_replacer, 'tag_selector', None)
+            if selector is not None:
+                selector.assignment_scope = var_name
+            try:
+                for _ in range(10):  # Max iterations to prevent infinite loops
+                    prev_value = resolved_value
+                    resolved_value = tag_replacer.replace(resolved_value)
+                    resolved_value = dynamic_replacer.replace(resolved_value)
+                    if prev_value == resolved_value:
+                        break
+            finally:
+                if selector is not None:
+                    selector.assignment_scope = None
 
             self.variables[var_name] = resolved_value
             self.variable_sources[var_name] = self._infer_source(raw_value)
@@ -1301,6 +2252,28 @@ class VariableReplacer:
         return processed_text
 
     def replace_variables(self, text):
+        def _apply_methods(value, methods_str):
+            value = str(value)
+            if methods_str:
+                methods = methods_str.split('.')[1:]
+                for method in methods:
+                    if method == 'clean':
+                        value = value.replace('_', ' ').replace('-', ' ')
+                    elif method == 'anima':
+                        # Anima prompt form uses spaces for booru underscores,
+                        # while meaningful tag hyphens (for example
+                        # ``back-to-back``) must remain intact.
+                        value = value.replace('_', ' ')
+                    elif method == 'upper':
+                        value = value.upper()
+                    elif method == 'lower':
+                        value = value.lower()
+                    elif method == 'title':
+                        value = value.title()
+                    elif method == 'capitalize':
+                        value = value.capitalize()
+            return value
+
         # Nested variable resolution - resolve variables that reference other variables
         max_depth = 10
         resolved_vars = {}
@@ -1312,12 +2285,17 @@ class VariableReplacer:
             # Keep resolving until no more $ references or max depth reached
             while '$' in resolved_value and depth < max_depth:
                 changed = False
-                for other_var_name, other_var_value in self.variables.items():
-                    if other_var_name != var_name:
-                        pattern = r'\$' + re.escape(other_var_name) + r'(?!\w)'
-                        if re.search(pattern, resolved_value):
-                            resolved_value = re.sub(pattern, str(other_var_value), resolved_value)
-                            changed = True
+
+                def _replace_nested_use(match):
+                    nonlocal changed
+                    other_var_name = match.group(1)
+                    methods_str = match.group(2)
+                    if other_var_name == var_name or other_var_name not in self.variables:
+                        return match.group(0)
+                    changed = True
+                    return _apply_methods(self.variables[other_var_name], methods_str)
+
+                resolved_value = self.use_regex.sub(_replace_nested_use, resolved_value)
                 if not changed:
                     break
                 depth += 1
@@ -1432,27 +2410,13 @@ class VariableReplacer:
             value = self.variables.get(var_name)
             if value is None:
                 return match.group(0)
-
-            if methods_str:
-                methods = methods_str.split('.')[1:]
-                for method in methods:
-                    if method == 'clean':
-                        value = value.replace('_', ' ').replace('-', ' ')
-                    elif method == 'upper':
-                        value = value.upper()
-                    elif method == 'lower':
-                        value = value.lower()
-                    elif method == 'title':
-                        value = value.title()
-                    elif method == 'capitalize':
-                        value = value.capitalize()
-
-            return value
+            return _apply_methods(value, methods_str)
 
         result = self.default_regex.sub(_replace_default, text)
         result = self.coalesce_regex.sub(_replace_coalesce, result)
         result = self.use_regex.sub(_replace_use, result)
-        self.variables = original_vars  # Restore original for next iteration
+        self.variables.clear()
+        self.variables.update(original_vars)  # Preserve shared references for selector-injected variables.
         return result
 
     def _infer_source(self, raw_value):
@@ -1497,32 +2461,7 @@ class NegativePromptGenerator:
             self.add(t)
 
     def _split_neg_list(self, text):
-        if text is None:
-            return []
-        parts = []
-        current = []
-        escape = False
-        for ch in text:
-            if escape:
-                current.append(ch)
-                escape = False
-                continue
-            if ch == '\\':
-                escape = True
-                continue
-            if ch == ',':
-                part = "".join(current).strip()
-                if part:
-                    parts.append(part)
-                current = []
-                continue
-            current.append(ch)
-        if escape:
-            current.append('\\')
-        part = "".join(current).strip()
-        if part:
-            parts.append(part)
-        return parts
+        return split_escaped_csv(text)
 
     def _extract_negatives(self, text):
         if not text or "--neg:" not in text:
@@ -1576,21 +2515,63 @@ class NegativePromptGenerator:
             i = j
         return "".join(out), negatives
 
-    def strip_negative_tags(self, text):
+    def _extract_bracket_negatives(self, text, variables=None):
+        if not text:
+            return text, []
+
+        variables = variables or {}
+        negatives = []
+
+        def _add_parts(raw):
+            negatives.extend(self._split_neg_list(raw))
+            return ""
+
+        def _neg_if(match):
+            condition = match.group(1).strip()
+            neg_text = match.group(2).strip()
+            if not condition or not neg_text:
+                return ""
+            try:
+                should_add = LogicEvaluator(condition, variables).evaluate(text)
+            except Exception:
+                should_add = condition.lower() in text.lower()
+            if should_add:
+                _add_parts(neg_text)
+            return ""
+
+        text = re.sub(r'\[neg_if:([^\]]+)\]([\s\S]*?)\[/neg_if\]', _neg_if, text, flags=re.IGNORECASE)
+        text = re.sub(r'\[(?:neg|negative)\]([\s\S]*?)\[/\s*(?:neg|negative)\]', lambda m: _add_parts(m.group(1)), text, flags=re.IGNORECASE)
+        text = re.sub(r'\[(?:neg|negative):([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', lambda m: _add_parts(m.group(1)), text, flags=re.IGNORECASE)
+
+        return text, negatives
+
+    def strip_negative_tags(self, text, variables=None):
         """Extract **negatives** from text and add them, return cleaned text"""
-        # Handle **negative** syntax
-        matches = re.findall(r'\*\*.*?\*\*', text)
-        for match in matches:
-            tag = match.replace("**", "").strip()
-            self.add(tag)
-            text = text.replace(match, "")
-        
-        # Handle --neg: syntax (quoted or unquoted, supports escaping commas)
-        text, negatives = self._extract_negatives(text)
-        if negatives:
-            self.add_list(negatives)
-        
-        return text
+        if not text:
+            return text
+
+        variables = variables or {}
+        spans = []
+        for span in find_negative_spans(text):
+            if span.condition:
+                try:
+                    if not LogicEvaluator(span.condition, variables).evaluate(text):
+                        continue
+                except Exception:
+                    if span.condition.lower() not in text.lower():
+                        continue
+            spans.append(span)
+
+        if not spans:
+            return text
+
+        cursor = 0
+        for span in spans:
+            if span.start < cursor:
+                continue
+            self.add_list(split_escaped_csv(span.content))
+            cursor = span.end
+        return remove_spans(text, spans)
 
     def get_negative_string(self):
         """Return combined negative string, deduplicated"""
@@ -1609,6 +2590,52 @@ class ConditionalReplacer:
         # Simple pattern to find [if starts - we'll parse brackets manually
         self.if_start = re.compile(r'\[if\s+', re.IGNORECASE)
         self.local_assign_prefix = "$@"
+        # Optional replacers used to resolve a $@ value once, at assignment.
+        self.value_replacers = None
+
+    def set_value_replacers(self, tag_replacer=None, dynamic_replacer=None):
+        """Let $@name pin one value.
+
+        Without these, a $@ assignment substitutes its value as raw text, so
+        "$@d={soft|sharp}" used three times rolled three times -- the opposite
+        of what a variable is for. Resolving once at assignment makes every
+        later use agree.
+        """
+        self.value_replacers = (tag_replacer, dynamic_replacer)
+
+    def _resolve_local_value(self, raw_value):
+        if not self.value_replacers:
+            return raw_value
+        tag_replacer, dynamic_replacer = self.value_replacers
+        resolved = raw_value
+        try:
+            if tag_replacer is not None:
+                resolved = tag_replacer.replace(resolved)
+            if dynamic_replacer is not None:
+                resolved = dynamic_replacer.replace(resolved)
+        except Exception:
+            return raw_value
+        return resolved
+
+    def apply_local_vars(self, text_value, variables):
+        """Public entry point for $@ assignments outside a conditional."""
+        return self._apply_local_vars(text_value, variables)
+
+    def _starts_assignment(self, text_value, idx):
+        """True when text_value[idx] begins a `$name=` or `$@name=` assignment."""
+        j = idx + 1
+        if j < len(text_value) and text_value[j] == '@':
+            j += 1
+        start = j
+        while j < len(text_value) and (text_value[j].isalnum() or text_value[j] == '_'):
+            j += 1
+        if j == start:
+            return False
+        while j < len(text_value) and text_value[j].isspace():
+            j += 1
+        if j >= len(text_value) or text_value[j] != '=':
+            return False
+        return not (j + 1 < len(text_value) and text_value[j + 1] == '=')
 
     def _parse_local_assignment(self, text_value, idx):
         if text_value[idx:idx + 2] != self.local_assign_prefix:
@@ -1626,6 +2653,8 @@ class ConditionalReplacer:
         while k < len(text_value) and text_value[k].isspace():
             k += 1
         if k >= len(text_value) or text_value[k] != '=':
+            return None
+        if k + 1 < len(text_value) and text_value[k + 1] == '=':
             return None
 
         k += 1
@@ -1673,12 +2702,25 @@ class ConditionalReplacer:
             end = text_value.find('>', k + 1)
             value_end = end + 1 if end != -1 else len(text_value)
         else:
+            # An undelimited value is one fragment, ending at a comma just as
+            # a plain $name= assignment does. Running to ';' or end of line
+            # made "$@d=soft, $@d a, $@d b" swallow every later use as part of
+            # the value, leaving nothing behind to substitute into. Use braces
+            # or quotes for a value that must contain a comma.
             k = value_start
-            while k < len(text_value) and text_value[k] not in ';\n':
+            while k < len(text_value):
+                ch = text_value[k]
+                if ch in ',;' or ch == chr(10):
+                    break
+                if ch == '$' and self._starts_assignment(text_value, k):
+                    break
                 k += 1
             value_end = k
 
         raw_value = text_value[value_start:value_end].strip()
+        # A quoted value keeps its quotes out of the prompt, as $name= does.
+        if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in ("'", '"'):
+            raw_value = raw_value[1:-1]
         value_end = value_end + 1 if value_end < len(text_value) and text_value[value_end] == ';' else value_end
 
         return var_name, raw_value, value_end
@@ -1700,7 +2742,7 @@ class ConditionalReplacer:
                 continue
 
             var_name, raw_value, end_idx = parsed
-            local_vars[var_name] = raw_value
+            local_vars[var_name] = self._resolve_local_value(raw_value)
 
             if isinstance(variables, dict):
                 trace_val = variables.get('trace')
@@ -1715,37 +2757,19 @@ class ConditionalReplacer:
             cleaned = re.sub(pattern, value, cleaned)
         return cleaned
 
-    def find_matching_bracket(self, text, start):
-        """Find the closing ] that matches the opening [ at start, accounting for nested brackets."""
-        depth = 1
-        i = start + 1
-        while i < len(text) and depth > 0:
-            if text[i] == '[':
-                depth += 1
-            elif text[i] == ']':
-                depth -= 1
-            i += 1
-        return i - 1 if depth == 0 else -1
-
     def mask_conditionals(self, text):
         """Mask [if ...] blocks to prevent premature expansion."""
         masked_text = text
         blocks = {}
         counter = 0
 
-        while True:
-            match = self.if_start.search(masked_text)
-            if not match:
-                break
-            bracket_idx = match.start()
-            end = self.find_matching_bracket(masked_text, bracket_idx)
-            if end == -1:
-                break
-
-            block_content = masked_text[bracket_idx:end + 1]
+        for spec in reversed(parse_conditional_specs(masked_text)):
+            bracket_idx = spec.span.start
+            end = spec.span.end
+            block_content = masked_text[bracket_idx:end]
             token = f"%%UMI_IF_BLOCK_{counter}%%"
             blocks[token] = block_content
-            masked_text = masked_text[:bracket_idx] + token + masked_text[end + 1:]
+            masked_text = masked_text[:bracket_idx] + token + masked_text[end:]
             counter += 1
 
         return masked_text, blocks
@@ -1755,175 +2779,6 @@ class ConditionalReplacer:
         for token, content in blocks.items():
             text = text.replace(token, content)
         return text
-
-    def parse_conditional(self, text, start):
-        """
-        Parse a conditional starting at position 'start'.
-        Returns (start_pos, end_pos, branches, else_text) or None if invalid.
-        """
-        # Find the [ position
-        bracket_start = text.rfind('[', 0, start + 4)  # [if is 3 chars before content
-        if bracket_start == -1:
-            return None
-        
-        # Find matching ]
-        end = self.find_matching_bracket(text, bracket_start)
-        if end == -1:
-            return None
-        
-        # Extract full content between [if and ]
-        inner = text[bracket_start + 1:end]
-        
-        # Parse: "if condition : true_text | false_text" or "if condition : true_text"
-        if_match = re.match(r'if\s+(.+?)\s*:\s*', inner, re.IGNORECASE | re.DOTALL)
-        if not if_match:
-            return None
-        
-        condition = if_match.group(1).strip()
-        rest = inner[if_match.end():]
-        
-        def _find_colon(s, start_idx):
-            depth_bracket = 0
-            depth_brace = 0
-            in_quote = False
-            quote_char = ""
-            i = start_idx
-            while i < len(s):
-                c = s[i]
-                if in_quote:
-                    if c == quote_char:
-                        in_quote = False
-                        quote_char = ""
-                    i += 1
-                    continue
-                if c in ("'", '"'):
-                    in_quote = True
-                    quote_char = c
-                    i += 1
-                    continue
-                if c == '[':
-                    depth_bracket += 1
-                elif c == ']':
-                    depth_bracket -= 1
-                elif c == '{':
-                    depth_brace += 1
-                elif c == '}':
-                    depth_brace -= 1
-                elif c == ':' and depth_bracket == 0 and depth_brace == 0:
-                    return i
-                i += 1
-            return -1
-
-        # Find the | or else/elif separators (but not inside nested brackets or braces)
-        depth_bracket = 0
-        depth_brace = 0
-        in_quote = False
-        quote_char = ""
-        pipe_pos = -1
-        else_pos = -1
-        has_elif_else = False
-        
-        for i, c in enumerate(rest):
-            if in_quote:
-                if c == quote_char:
-                    in_quote = False
-                    quote_char = ""
-                continue
-            if c in ("'", '"'):
-                in_quote = True
-                quote_char = c
-                continue
-            if c == '[':
-                depth_bracket += 1
-            elif c == ']':
-                depth_bracket -= 1
-            elif c == '{':
-                depth_brace += 1
-            elif c == '}':
-                depth_brace -= 1
-            elif c == '|' and depth_bracket == 0 and depth_brace == 0:
-                pipe_pos = i
-            elif depth_bracket == 0 and depth_brace == 0:
-                if rest[i:i+5].lower() == 'else:' and (i == 0 or rest[i-1].isspace()):
-                    else_pos = i
-                    has_elif_else = True
-                    break
-                if rest[i:i+4].lower() == 'elif' and (i == 0 or rest[i-1].isspace()):
-                    has_elif_else = True
-                    break
-        
-        if not has_elif_else:
-            if pipe_pos == -1 and else_pos == -1:
-                true_text = rest
-                false_text = ""
-            elif pipe_pos != -1:
-                true_text = rest[:pipe_pos]
-                false_text = rest[pipe_pos + 1:]
-            else:
-                true_text = rest[:else_pos]
-                false_text = rest[else_pos + 5:]
-            branches = [(condition, true_text.strip())]
-            return (bracket_start, end + 1, branches, false_text.strip())
-
-        branches = []
-        current_cond = condition
-        segment_start = 0
-        i = 0
-        depth_bracket = 0
-        depth_brace = 0
-        in_quote = False
-        quote_char = ""
-        while i < len(rest):
-            c = rest[i]
-            if in_quote:
-                if c == quote_char:
-                    in_quote = False
-                    quote_char = ""
-                i += 1
-                continue
-            if c in ("'", '"'):
-                in_quote = True
-                quote_char = c
-                i += 1
-                continue
-            if c == '[':
-                depth_bracket += 1
-                i += 1
-                continue
-            if c == ']':
-                depth_bracket -= 1
-                i += 1
-                continue
-            if c == '{':
-                depth_brace += 1
-                i += 1
-                continue
-            if c == '}':
-                depth_brace -= 1
-                i += 1
-                continue
-
-            if depth_bracket == 0 and depth_brace == 0:
-                if rest[i:i+5].lower() == 'else:' and (i == 0 or rest[i-1].isspace()):
-                    branches.append((current_cond, rest[segment_start:i].strip()))
-                    else_text = rest[i+5:].strip()
-                    return (bracket_start, end + 1, branches, else_text)
-                if rest[i:i+4].lower() == 'elif' and (i == 0 or rest[i-1].isspace()):
-                    branches.append((current_cond, rest[segment_start:i].strip()))
-                    cond_start = i + 4
-                    while cond_start < len(rest) and rest[cond_start].isspace():
-                        cond_start += 1
-                    colon_pos = _find_colon(rest, cond_start)
-                    if colon_pos == -1:
-                        return None
-                    current_cond = rest[cond_start:colon_pos].strip()
-                    segment_start = colon_pos + 1
-                    i = segment_start
-                    continue
-            i += 1
-
-        branches.append((current_cond, rest[segment_start:].strip()))
-        return (bracket_start, end + 1, branches, "")
 
     def evaluate_logic(self, condition, context, variables=None):
         """Evaluate a logical condition against the context."""
@@ -1941,16 +2796,14 @@ class ConditionalReplacer:
         iteration = 0
         
         while iteration < max_iterations:
-            match = self.if_start.search(prompt)
-            if not match:
+            specs = parse_conditional_specs(prompt)
+            if not specs:
                 break
-            
-            parsed = self.parse_conditional(prompt, match.start())
-            if not parsed:
-                # Invalid conditional, skip past it
-                break
-            
-            start_pos, end_pos, branches, else_text = parsed
+            spec = specs[0]
+            start_pos = spec.span.start
+            end_pos = spec.span.end
+            branches = spec.branches
+            else_text = spec.else_text
             
             # Clean the context by removing current tag to avoid self-reference
             context = prompt[:start_pos] + prompt[end_pos:]
@@ -2002,39 +2855,31 @@ class TagLoaderBase:
         return self.aliases.get('loras', {}).get(str(name).strip().lower(), name)
 
     def load_globals(self):
-        """Load global variables from globals.yaml files."""
+        """Load global variables from globals.yaml files in wildcard folders."""
         merged_globals = {}
         for location in self.wildcard_paths:
             global_path = os.path.join(location, 'globals.yaml')
-            if os.path.exists(global_path):
-                try:
-                    with open(global_path, 'r', encoding='utf-8') as f:
-                        data = yaml.safe_load(f)
-                        if isinstance(data, dict):
-                            merged_globals.update({str(k): str(v) for k, v in data.items()})
-                except yaml.YAMLError as e:
-                    _debug_print(f"[UmiAI] ERROR: Malformed globals.yaml at {global_path}: {e}")
-                except UnicodeDecodeError as e:
-                    _debug_print(f"[UmiAI] ERROR: Encoding issue in globals.yaml at {global_path}: {e}")
-                except Exception as e:
-                    _debug_print(f"[UmiAI] WARNING: Error loading globals.yaml at {global_path}: {e}")
+            if not os.path.exists(global_path):
+                continue
+            try:
+                with open(global_path, 'r', encoding='utf-8-sig') as f:
+                    data = yaml.safe_load(f)
+                if isinstance(data, dict):
+                    # Store by bare name: $hair in a prompt resolves
+                    # variables['hair'], so "$hair:" and "hair:" keys
+                    # must both land on the same un-prefixed key.
+                    for k, v in data.items():
+                        key = str(k).strip().lstrip('$')
+                        if key:
+                            merged_globals[key] = str(v)
+            except yaml.YAMLError as e:
+                print(f"[UmiAI] ERROR: Malformed globals.yaml at {global_path}: {e}")
+                print("[UmiAI] Global variables from this file will not be loaded. Please fix YAML syntax.")
+            except UnicodeDecodeError as e:
+                print(f"[UmiAI] ERROR: Encoding issue in globals.yaml at {global_path}: {e}")
+            except Exception as e:
+                print(f"[UmiAI] WARNING: Error loading globals.yaml at {global_path}: {e}")
         return merged_globals
-
-    def load_prompt_file(self, file_key):
-        """Load entire .txt file content as a prompt (no parsing)."""
-        key = self.resolve_wildcard_alias(file_key.strip())
-        if key.lower().endswith('.txt'):
-            key = key[:-4]
-        for location in self.wildcard_paths:
-            file_path = os.path.join(location, f"{key}.txt")
-            if os.path.exists(file_path):
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        return strip_prompt_comments(f.read().strip())
-                except Exception as e:
-                    if self.verbose:
-                        _debug_print(f"[UmiAI] Error reading prompt file {file_path}: {e}")
-        return None
 
     def process_yaml_entry(self, title, entry_data):
         """Process a YAML entry to extract structured data."""
@@ -2229,19 +3074,6 @@ class LoRAHandlerBase:
 
         return fused_dict
 
-    def parse_lora_tag(self, lora_tag):
-        """Parse a LoRA tag like 'name:strength' or 'name:str1:str2'."""
-        parts = lora_tag.split(':')
-        if len(parts) >= 2:
-            name = parts[0]
-            try:
-                strength = float(parts[1])
-            except ValueError:
-                strength = 1.0
-            return name, strength
-        return lora_tag, 1.0
-
-
 # ==============================================================================
 # TAG REPLACER BASE
 # ==============================================================================
@@ -2253,19 +3085,128 @@ class TagReplacerBase:
     def __init__(self, tag_selector):
         self.tag_selector = tag_selector
         self.replacement_history = []  # Track replacements for cycle detection
-        # Use more flexible patterns that can handle content with brackets
-        self.clean_regex = re.compile(r'\[clean:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
-        self.shuffle_regex = re.compile(r'\[shuffle:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
-        self.require_regex = re.compile(r'\[require:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
-        self.forbid_regex = re.compile(r'\[forbid:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
-        self.prefer_regex = re.compile(r'\[prefer:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
-        self.assert_regex = re.compile(r'\[assert:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
-        self.warn_regex = re.compile(r'\[warn:([^\[\]]*(?:\[[^\]]*\][^\[\]]*)*)\]', re.IGNORECASE)
+
+    def _split_pipe_args(self, content):
+        """Split function arguments on top-level '|' only.
+
+        Pipes inside nested {...} or [...] (e.g. "[choose: {red|blue} hair | green]")
+        belong to the nested construct and must not split the argument list.
+        """
+        parts = []
+        current = []
+        escape = False
+        quote = ""
+        depth_brace = 0
+        depth_bracket = 0
+        for ch in str(content or ""):
+            if escape:
+                current.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if quote:
+                if ch == quote:
+                    quote = ""
+                current.append(ch)
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                current.append(ch)
+                continue
+            if ch == "{":
+                depth_brace += 1
+            elif ch == "}":
+                depth_brace = max(0, depth_brace - 1)
+            elif ch == "[":
+                depth_bracket += 1
+            elif ch == "]":
+                depth_bracket = max(0, depth_bracket - 1)
+            elif ch == "|" and depth_brace == 0 and depth_bracket == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+            current.append(ch)
+        if escape:
+            current.append("\\")
+        parts.append("".join(current).strip())
+        return [part for part in parts if part]
+
+    def _weighted_local_choice_detailed(self, content):
+        """Weighted exactly-one choice.
+
+        Returns (result, values, weights, selected_index). Consumes exactly
+        one rng draw for non-empty input, none for empty input.
+        """
+        items = []
+        for part in self._split_pipe_args(content):
+            value = part
+            weight = 1.0
+            if ":" in part:
+                maybe_value, maybe_weight = part.rsplit(":", 1)
+                try:
+                    weight = max(0.0, float(maybe_weight.strip()))
+                    value = maybe_value.strip()
+                except ValueError:
+                    value = part
+                    weight = 1.0
+            if value and weight > 0:
+                items.append((value, weight))
+
+        if not items:
+            return "", [], [], None
+
+        values = [value for value, _ in items]
+        weights = [weight for _, weight in items]
+        rng = getattr(self.tag_selector, 'rng', None) or getattr(self.tag_selector, 'random', None) or random
+        total = sum(weights)
+        roll = rng.random() * total
+        upto = 0.0
+        for index, (value, weight) in enumerate(items):
+            upto += weight
+            if roll <= upto:
+                return value, values, weights, index
+        return values[-1], values, weights, len(items) - 1
+
+    def _weighted_local_choice(self, content):
+        return self._weighted_local_choice_detailed(content)[0]
+
+    def _expand_lora_alias(self, content):
+        content = str(content or "").strip()
+        if not content:
+            return ""
+
+        tokens = content.split()
+        option_tokens = []
+        while tokens and "=" in tokens[-1]:
+            option_tokens.insert(0, tokens.pop())
+        spec = " ".join(tokens).strip()
+        options = " ".join(option_tokens).strip()
+        if not spec:
+            return ""
+
+        name = spec
+        strength = "1.0"
+        if ":" in spec:
+            candidate_name, candidate_strength = spec.rsplit(":", 1)
+            try:
+                float(candidate_strength)
+                name = candidate_name.strip()
+                strength = candidate_strength.strip()
+            except ValueError:
+                name = spec
+
+        resolver = getattr(getattr(self.tag_selector, "tag_loader", None), "resolve_lora_alias", None)
+        if resolver:
+            name = resolver(name)
+
+        suffix = f" {options}" if options else ""
+        return f"<lora:{name}:{strength}{suffix}>"
 
     def replace_functions(self, text):
-        """Process [shuffle:] and [clean:] tags."""
-        def _shuffle(match):
-            content = match.group(1)
+        """Process bracket function tags."""
+        def _shuffle_content(content):
             items = [x.strip() for x in content.split(',')]
             # Use rng if available (base class), otherwise random
             rng = getattr(self.tag_selector, 'rng', None) or getattr(self.tag_selector, 'random', None)
@@ -2275,8 +3216,7 @@ class TagReplacerBase:
                 random.shuffle(items)
             return ", ".join(items)
 
-        def _clean(match):
-            content = match.group(1)
+        def _clean_content(content):
             # Remove extra whitespace
             content = re.sub(r'\s+', ' ', content)
             # Remove empty commas (,,)
@@ -2287,8 +3227,137 @@ class TagReplacerBase:
             # Remove leading/trailing commas and spaces
             return content.strip(', ')
 
-        def _require(match):
-            content = match.group(1).strip()
+        def _sample_content(content):
+            match = re.match(r'^(\d+)(?:\s*-\s*(\d+))?\s+from\s*:\s*(.*)$', str(content or "").strip(), flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                return ""
+            min_count = int(match.group(1))
+            max_count = int(match.group(2) or match.group(1))
+            if max_count < min_count:
+                min_count, max_count = max_count, min_count
+            items = self._split_pipe_args(match.group(3))
+            if not items or max_count <= 0:
+                return ""
+            rng = getattr(self.tag_selector, 'rng', None) or getattr(self.tag_selector, 'random', None) or random
+            count = rng.randint(min_count, max_count) if max_count > min_count else min_count
+            count = max(0, min(count, len(items)))
+            return ", ".join(rng.sample(items, count))
+
+        def _record_function_trace(name, raw, args, result, selected_indices, mode, **extra):
+            # Additive trace for the Run Inspector. Rides the selector's
+            # existing wildcard_trace list, which explain_json already emits.
+            trace = getattr(self.tag_selector, 'wildcard_trace', None)
+            if not isinstance(trace, list):
+                return
+            record = {
+                "type": "prompt_function",
+                "name": name,
+                "raw": raw,
+                "args": list(args),
+                "result": result,
+                "selected_indices": list(selected_indices),
+                "selection_mode": mode,
+            }
+            record.update(extra)
+            trace.append(record)
+
+        def _and_content(content, raw=""):
+            # [and: a | b | c] -> every item, source order, deterministic.
+            items = self._split_pipe_args(content)
+            if not items:
+                return ""
+            result = ", ".join(items)
+            _record_function_trace("and", raw, items, result, range(len(items)), "all")
+            return result
+
+        def _or_content(content, raw=""):
+            # [or: a | b | c] -> seeded non-empty subset: k uniform in 1..n,
+            # k items sampled without replacement, emitted in source order.
+            items = self._split_pipe_args(content)
+            if not items:
+                return ""
+            rng = getattr(self.tag_selector, 'rng', None) or getattr(self.tag_selector, 'random', None) or random
+            count = rng.randint(1, len(items))
+            selected = sorted(rng.sample(range(len(items)), count))
+            result = ", ".join(items[idx] for idx in selected)
+            _record_function_trace("or", raw, items, result, selected, "subset", count=count)
+            return result
+
+        def _xor_content(content, raw=""):
+            # Exactly-one selection; same weighted machinery as [choose:].
+            result, values, weights, selected_index = self._weighted_local_choice_detailed(content)
+            if not values:
+                return ""
+            extra = {}
+            if any(weight != 1.0 for weight in weights):
+                extra["weights"] = list(weights)
+            _record_function_trace(
+                "xor", raw, values, result,
+                [selected_index] if selected_index is not None else [],
+                "exactly_one", **extra,
+            )
+            return result
+
+        def _replace_parser_functions(value):
+            specs = parse_function_specs(value, names=(
+                "clean", "shuffle", "choose", "lora", "sample",
+                "and", "or", "xor",
+                "require", "forbid", "prefer", "assert", "warn",
+                "anima", "anima_order", "anima_natural", "anima_lint", "preset",
+            ))
+            if not specs:
+                return value
+            parts = []
+            cursor = 0
+            for spec in specs:
+                span = spec.span
+                if span.start < cursor:
+                    continue
+                parts.append(value[cursor:span.start])
+                if spec.name == "clean":
+                    parts.append(_clean_content(spec.content))
+                elif spec.name == "shuffle":
+                    parts.append(_shuffle_content(spec.content))
+                elif spec.name == "choose":
+                    parts.append(self._weighted_local_choice(spec.content))
+                elif spec.name == "and":
+                    parts.append(_and_content(spec.content, value[span.start:span.end]))
+                elif spec.name == "or":
+                    parts.append(_or_content(spec.content, value[span.start:span.end]))
+                elif spec.name == "xor":
+                    parts.append(_xor_content(spec.content, value[span.start:span.end]))
+                elif spec.name == "lora":
+                    parts.append(self._expand_lora_alias(spec.content))
+                elif spec.name == "sample":
+                    parts.append(_sample_content(spec.content))
+                elif spec.name == "require":
+                    parts.append(_require_content(spec.content))
+                elif spec.name == "forbid":
+                    parts.append(_forbid_content(spec.content, value))
+                elif spec.name == "prefer":
+                    parts.append(_prefer_content(spec.content, value))
+                elif spec.name == "assert":
+                    parts.append(_assert_content(spec.content, value))
+                elif spec.name == "warn":
+                    parts.append(_warn_content(spec.content, value))
+                elif spec.name == "anima":
+                    parts.append(_anima_content(spec.content))
+                elif spec.name == "anima_order":
+                    parts.append(_anima_order_content(spec.content))
+                elif spec.name == "anima_natural":
+                    parts.append(expand_anima_natural_language(spec.content.strip()))
+                elif spec.name == "anima_lint":
+                    parts.append(_anima_lint_content(spec.content))
+                elif spec.name == "preset":
+                    parts.append(resolve_preset_directive(spec.content))
+                else:
+                    parts.append(value[span.start:span.end])
+                cursor = span.end
+            parts.append(value[cursor:])
+            return "".join(parts)
+
+        def _require_content(content):
+            content = str(content or "").strip()
             if not content:
                 return ""
             var_part = content
@@ -2326,8 +3395,8 @@ class TagReplacerBase:
                         return content[:i].strip(), content[i + 1:].strip()
             return "", ""
 
-        def _forbid(match):
-            content = match.group(1).strip()
+        def _forbid_content(content, context_text):
+            content = str(content or "").strip()
             if not content:
                 return ""
             condition, neg_text = _split_forbid(content)
@@ -2336,14 +3405,14 @@ class TagReplacerBase:
 
             variables = getattr(self.tag_selector, 'variables', {}) or {}
             evaluator = LogicEvaluator(condition, variables)
-            if not evaluator.evaluate(text):
+            if not evaluator.evaluate(context_text):
                 return ""
 
             parts = [t.strip() for t in neg_text.split(',') if t.strip()]
             return " ".join(f"**{t}**" for t in parts)
 
-        def _prefer(match):
-            content = match.group(1).strip()
+        def _prefer_content(content, context_text):
+            content = str(content or "").strip()
             if not content:
                 return ""
             condition, pos_text = _split_forbid(content)
@@ -2352,14 +3421,14 @@ class TagReplacerBase:
 
             variables = getattr(self.tag_selector, 'variables', {}) or {}
             evaluator = LogicEvaluator(condition, variables)
-            if not evaluator.evaluate(text):
+            if not evaluator.evaluate(context_text):
                 return ""
 
             parts = [t.strip() for t in pos_text.split(',') if t.strip()]
             return ", ".join(parts)
 
-        def _assert(match):
-            content = match.group(1).strip()
+        def _assert_content(content, context_text):
+            content = str(content or "").strip()
             if not content:
                 return ""
             condition, label = _split_forbid(content)
@@ -2370,12 +3439,12 @@ class TagReplacerBase:
 
             variables = getattr(self.tag_selector, 'variables', {}) or {}
             evaluator = LogicEvaluator(condition, variables)
-            if evaluator.evaluate(text):
+            if evaluator.evaluate(context_text):
                 return ""
             return f"<<ERROR_ASSERT:{label}>>"
 
-        def _warn(match):
-            content = match.group(1).strip()
+        def _warn_content(content, context_text):
+            content = str(content or "").strip()
             if not content:
                 return ""
             condition, message = _split_forbid(content)
@@ -2391,17 +3460,47 @@ class TagReplacerBase:
             if not enabled:
                 return ""
             evaluator = LogicEvaluator(condition, variables)
-            if evaluator.evaluate(text):
+            if evaluator.evaluate(context_text):
                 return f"<<WARN:{message}>>"
             return ""
 
-        text = self.shuffle_regex.sub(_shuffle, text)
-        text = self.clean_regex.sub(_clean, text)
-        text = self.require_regex.sub(_require, text)
-        text = self.forbid_regex.sub(_forbid, text)
-        text = self.prefer_regex.sub(_prefer, text)
-        text = self.assert_regex.sub(_assert, text)
-        text = self.warn_regex.sub(_warn, text)
+        def _split_anima_args(content):
+            parts = [part.strip() for part in content.split('|')]
+            prompt_text = parts[0] if parts else ""
+            opts = {}
+            for part in parts[1:]:
+                if '=' in part:
+                    key, value = part.split('=', 1)
+                    opts[key.strip().lower()] = value.strip()
+            return prompt_text, opts
+
+        def _anima_content(content):
+            prompt_text, opts = _split_anima_args(str(content or "").strip())
+            profile_prompt, _, warnings = apply_anima_profile(
+                prompt_text,
+                mode=opts.get("mode", "profile"),
+                style_preset=opts.get("style", "none"),
+            )
+            if opts.get("warn", "").lower() in ("1", "true", "yes", "on") and warnings:
+                return profile_prompt + ", " + ", ".join(f"<<WARN:{warning}>>" for warning in warnings)
+            return profile_prompt
+
+        def _anima_order_content(content):
+            prompt_text, opts = _split_anima_args(str(content or "").strip())
+            return order_anima_prompt(
+                prompt_text,
+                style_preset=opts.get("style", "none"),
+                add_prefix=opts.get("prefix", "").lower() in ("1", "true", "yes", "on"),
+            )
+
+        def _anima_lint_content(content):
+            prompt_text, opts = _split_anima_args(str(content or "").strip())
+            warnings = lint_anima_prompt(prompt_text, opts.get("negative", ""))
+            if not warnings:
+                return ""
+            return ", ".join(f"<<WARN:{warning}>>" for warning in warnings)
+
+        text = _replace_parser_functions(text)
         return text
 
     def get_prompt_file_content(self, filename):
@@ -2484,7 +3583,7 @@ class CharacterReplacer:
         
         # Load fresh
         try:
-            with open(profile_path, 'r', encoding='utf-8') as f:
+            with open(profile_path, 'r', encoding='utf-8-sig') as f:
                 data = yaml.safe_load(f)
                 cls._cache[name] = data
                 cls._mtime_cache[name] = mtime

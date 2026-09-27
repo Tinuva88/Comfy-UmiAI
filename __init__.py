@@ -1,1933 +1,2984 @@
-from .nodes import (UmiSaveImage,
-                    # UmiAIWildcardNode,  # Full version - uncomment for debugging
-                    # UmiPoseGenerator, UmiEmotionGenerator,
-                    # UmiEmotionStudio, UmiCharacterCreator as UmiCharacterCreator2,
-                    # UmiSpriteGenerator as UmiSpriteGenerator2, UmiDatasetGenerator as UmiDatasetGenerator2,
-                    # UmiPositionControl as UmiPositionControl2, UmiVisualCameraControl as UmiVisualCameraControl2,
-                    UMI_SETTINGS, umi_debug_print)
-from .nodes_lite import UmiAIWildcardNodeLite, UmiTextBypass  # Lite version (default for users)
-# from .nodes_model_manager import UmiModelManager, UmiModelSelector
-from server import PromptServer
-from aiohttp import web
-import os
-import importlib.util
+import asyncio
+import copy
 import glob
-import yaml
+import hashlib
+import importlib
+import io
 import json
+import logging
+import os
+import re
 import subprocess
 import sys
-import folder_paths 
+import tempfile
+import threading
+import traceback
+import urllib.parse
+from collections import Counter
+from datetime import datetime, time
+from functools import lru_cache
 
-# --- New Imports for Lora Fetcher ---
-from .fetch.fetcher import CivitaiFetcher
+import folder_paths
+import yaml
+from aiohttp import web
+from server import PromptServer
+from .version import CORE_API_VERSION, __version__
 
-# Initialize the fetcher logic
-fetcher = CivitaiFetcher()
 
-# Disabled optional modules
-_umi_utilities = None
-_bgrm = None
+BASE_DIR = os.path.dirname(__file__)
 
-# try:
-#     from . import umi_utilities as _umi_utilities
-# except Exception:
-#     try:
-#         import umi_utilities as _umi_utilities
-#     except Exception:
-#         _umi_utilities = None
-#
-# try:
-#     from . import bgrm as _bgrm
-# except Exception:
-#     try:
-#         import bgrm as _bgrm
-#     except Exception:
-#         _bgrm = None
 
-# 1. Setup the API Route
-def _resolve_umi_asset_path(*parts):
-    base_dir = os.path.dirname(__file__)
-    util_path = os.path.join(base_dir, "umi_utilities", *parts)
-    if os.path.exists(util_path):
-        return util_path
-    return os.path.join(base_dir, *parts)
+def _read_overlay_manifest(module_name):
+    module_path = os.path.join(BASE_DIR, f"{module_name}.py")
+    if not os.path.isfile(module_path):
+        return None, "not installed"
+    manifest_path = os.path.join(BASE_DIR, f"{module_name}.manifest.json")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        minimum_api = int(manifest["minimum_core_api"])
+        maximum_api = int(manifest["maximum_core_api"])
+        bundle_version = str(manifest["bundle_version"])
+    except Exception as exc:
+        return None, f"error: invalid or missing overlay manifest: {exc}"
+    if not minimum_api <= CORE_API_VERSION <= maximum_api:
+        return None, (
+            f"incompatible: bundle {bundle_version} requires core API "
+            f"{minimum_api}..{maximum_api}; installed API is {CORE_API_VERSION}"
+        )
+    return manifest, None
 
-def _get_umi_character_loader():
-    if _umi_utilities is None:
+
+UI_TOOLS_MANIFEST, _UI_TOOLS_ERROR = _read_overlay_manifest("optional_ui_tools")
+UI_TOOLS_ENABLED = UI_TOOLS_MANIFEST is not None
+
+
+class _DisabledRouteRegistry:
+    def get(self, *args, **kwargs):
+        return lambda function: function
+
+    def post(self, *args, **kwargs):
+        return lambda function: function
+
+
+_UI_ROUTES = PromptServer.instance.routes if UI_TOOLS_ENABLED else _DisabledRouteRegistry()
+
+from .nodes_core import (
+    DEFAULT_UMI_SETTINGS,
+    UMI_SETTINGS,
+    UmiSaveImage,
+    load_umi_settings,
+    validate_processing_settings,
+    umi_debug_print,
+)
+from .shared_utils import _atomic_write_json, get_all_wildcard_paths
+if UI_TOOLS_ENABLED:
+    from . import series_importer
+else:
+    series_importer = None
+from .nodes_lite import (
+    TagLoader,
+    FILE_MTIME_CACHE_LITE,
+    GLOBAL_CACHE_LITE,
+    GLOBAL_INDEX_LITE,
+    PROMPT_CACHE_LOCK,
+    UmiAIWildcardNodeLite,
+    UmiBypassModelSwitch,
+    UmiPromptInspector,
+    UmiPromptPreset,
+    UmiPromptProfile,
+    UmiPromptSyntaxLint,
+    UmiTextBypass,
+)
+
+
+WEB_DIRECTORY = "./js"
+CIVITAI_SITE_BASE = "https://civitai.red"
+CIVITAI_LEGACY_BASE = "https://civitai.com"
+DANBOORU_BASE = "https://danbooru.donmai.us"
+DANBOORU_TAG_CACHE = None
+
+# One lock per runtime JSON file that can be written concurrently. Atomic
+# replacement keeps the files parseable; these locks keep read-modify-write
+# flows from losing updates to each other.
+_IMAGE_ANNOTATIONS_LOCK = threading.Lock()
+_IMAGE_SCAN_CACHE_LOCK = threading.Lock()
+_CIVITAI_CACHE_LOCK = threading.Lock()
+_LORA_OVERRIDES_LOCK = threading.Lock()
+
+# Non-blocking guard so only one Civitai batch fetch runs at a time. Never
+# held while parsing requests; acquired for the duration of the batch loop.
+_CIVITAI_BATCH_GUARD = threading.Lock()
+
+
+def _is_path_inside(path, root):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_join(root, *parts):
+    candidate = os.path.abspath(os.path.join(root, *parts))
+    if not _is_path_inside(candidate, root):
+        return None
+    return candidate
+
+
+def _wildcard_root():
+    return os.path.join(BASE_DIR, "wildcards")
+
+
+# The editor handles both. Text files are one candidate per line; YAML files
+# are a mapping of named entries. Everything else in wildcards/ is ignored.
+WILDCARD_EXTENSIONS = ("txt", "yaml", "yml")
+
+
+def _normalize_wildcard_name(name):
+    normalized = str(name or "").replace("\\", "/").strip().strip("/")
+    for ext in WILDCARD_EXTENSIONS:
+        if normalized.lower().endswith("." + ext):
+            normalized = normalized[: -(len(ext) + 1)]
+            break
+    normalized = re.sub(r"[^A-Za-z0-9_./ -]+", "_", normalized).strip(" .")
+    return normalized
+
+
+def _wildcard_ext(value, default="txt"):
+    """Normalise a requested extension, refusing anything unrecognised.
+
+    Defaults to txt so every existing caller keeps working without sending it.
+    """
+    ext = str(value or default).strip().lstrip(".").lower()
+    return ext if ext in WILDCARD_EXTENSIONS else default
+
+
+def _is_yaml_ext(ext):
+    return _wildcard_ext(ext) in ("yaml", "yml")
+
+
+def _wildcard_file_path(name, ext="txt"):
+    existing = _safe_join(_wildcard_root(), f"{str(name or '').replace(chr(92), '/')}.{_wildcard_ext(ext)}")
+    if existing and os.path.isfile(existing):
+        return existing
+    normalized = _normalize_wildcard_name(name)
+    if not normalized:
+        return None
+    return _safe_join(_wildcard_root(), f"{normalized}.{_wildcard_ext(ext)}")
+
+
+def _content_version(text):
+    """Identifies the text an editor started from, so an overwrite can tell
+    whether the file changed underneath it."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _validate_yaml_text(text):
+    """None when the text is a usable wildcard mapping, else why it is not.
+
+    Saving a YAML file that does not parse means it stops matching anything,
+    with nothing said about it until someone notices a prompt has gone quiet.
+    """
+    if not str(text or "").strip():
         return None
     try:
-        from .umi_utilities.nodes_character import CharacterLoader
-        return CharacterLoader
+        data = yaml.safe_load(text)
+    except Exception as exc:
+        return "YAML did not parse: " + str(exc).split("\n")[0]
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        return "A YAML wildcard must be a mapping of entry names, not a list or a bare value."
+    return None
+
+
+def _count_yaml_entries(path):
+    """Candidates in a YAML wildcard, and why it cannot be read if it cannot.
+
+    A YAML file's candidates are its named entries, not its lines, so counting
+    lines the way a text wildcard is counted would report a number that means
+    nothing to the person reading it.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            data = yaml.safe_load(handle)
+    except Exception as exc:
+        return None, str(exc).split("\n")[0]
+    if data is None:
+        return 0, None
+    if not isinstance(data, dict):
+        return None, "the file is not a mapping of entries"
+    return sum(1 for value in data.values() if isinstance(value, dict)), None
+
+
+def _list_wildcard_text_files():
+    root = _wildcard_root()
+    files = []
+    if not os.path.isdir(root):
+        return files
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            if not filename.lower().endswith(".txt"):
+                continue
+            path = os.path.join(dirpath, filename)
+            rel = os.path.relpath(path, root).replace("\\", "/")
+            files.append(rel[:-4])
+    return sorted(files, key=str.lower)
+
+
+def _image_browser_data_path():
+    return os.path.join(BASE_DIR, "image_browser_data.json")
+
+
+def _image_scan_cache_path():
+    return os.path.join(BASE_DIR, "cache", "image_scan_cache.json")
+
+
+def _load_image_annotations():
+    path = _image_browser_data_path()
+    if not os.path.exists(path):
+        return {"items": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"items": {}}
+        items = data.get("items")
+        if not isinstance(items, dict):
+            data["items"] = {}
+        return data
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed loading image browser annotations: {e}")
+        return {"items": {}}
+
+
+def _save_image_annotations(data):
+    _atomic_write_json(_image_browser_data_path(), data, indent=2)
+
+
+def _load_image_scan_cache():
+    path = _image_scan_cache_path()
+    if not os.path.exists(path):
+        return {"items": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"items": {}}
+        if not isinstance(data.get("items"), dict):
+            data["items"] = {}
+        return data
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed loading image scan cache: {e}")
+        return {"items": {}}
+
+
+def _save_image_scan_cache(data):
+    try:
+        with _IMAGE_SCAN_CACHE_LOCK:
+            os.makedirs(os.path.dirname(_image_scan_cache_path()), exist_ok=True)
+            _atomic_write_json(_image_scan_cache_path(), data, indent=2)
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed saving image scan cache: {e}")
+
+
+def _metadata_has_embedded_details(metadata):
+    if not isinstance(metadata, dict):
+        return False
+    return any(key not in ("width", "height") for key in metadata)
+
+
+def _derived_has_details(derived):
+    if not isinstance(derived, dict):
+        return False
+    if derived.get("models") or derived.get("loras"):
+        return True
+    return any(derived.get(key) not in (None, "", []) for key in ("sampler", "steps", "cfg", "seed"))
+
+
+def _cached_image_metadata(cache_items, relative_path, stat, path, quick):
+    cached = cache_items.get(relative_path)
+    valid = (
+        isinstance(cached, dict)
+        and cached.get("size") == stat.st_size
+        and cached.get("mtime") == stat.st_mtime
+    )
+    if valid:
+        metadata = cached.get("metadata") if isinstance(cached.get("metadata"), dict) else {}
+        derived = cached.get("derived") if isinstance(cached.get("derived"), dict) else {}
+        complete = bool(cached.get("metadata_complete"))
+        cache_updated = False
+        if _metadata_has_embedded_details(metadata):
+            if not _derived_has_details(derived):
+                derived = _derive_image_metadata(metadata)
+                cached["derived"] = derived
+                cache_updated = True
+            if not complete:
+                cached["metadata_complete"] = True
+                complete = True
+                cache_updated = True
+        if metadata and (quick or complete):
+            return metadata, derived, cache_updated, complete
+
+    raw_metadata = _metadata_from_image(path, quick=quick)
+    read_ok = raw_metadata is not None
+    metadata = raw_metadata or {}
+    if quick:
+        derived = cached.get("derived", {}) if valid and isinstance(cached, dict) else {}
+        complete = bool(cached.get("metadata_complete")) if valid and isinstance(cached, dict) else False
+    else:
+        derived = _derive_image_metadata(metadata)
+        # A read that failed must not be remembered as complete, or the file
+        # stays blank in the browser until its size or mtime changes again.
+        complete = read_ok
+    cache_items[relative_path] = {
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "metadata": metadata,
+        "derived": derived,
+        "metadata_complete": complete,
+    }
+    return metadata, derived, True, complete
+
+
+def _image_output_root():
+    return os.path.abspath(folder_paths.get_output_directory())
+
+
+def _image_url(relative_path):
+    normalized = relative_path.replace("\\", "/").strip("/")
+    subfolder = os.path.dirname(normalized)
+    filename = os.path.basename(normalized)
+    return "/view?" + urllib.parse.urlencode({
+        "filename": filename,
+        "subfolder": subfolder,
+        "type": "output",
+    })
+
+
+_THUMBNAIL_LOCK = threading.Lock()
+_IMAGE_SCAN_TASKS = {}
+
+
+@lru_cache(maxsize=64)
+def _cached_image_thumbnail(path, mtime_ns, ctime_ns, size):
+    from PIL import Image, ImageOps
+    with Image.open(path) as original:
+        # JPEG draft reduces decoding work where the format supports it.
+        original.draft("RGB", (512, 512))
+        preview = ImageOps.exif_transpose(original)
+        preview.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        if preview.mode not in ("RGB", "RGBA"):
+            preview = preview.convert("RGBA" if "transparency" in preview.info else "RGB")
+        buffer = io.BytesIO()
+        preview.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+def _image_thumbnail_sync(relative_path):
+    root = os.path.realpath(_image_output_root())
+    path = _safe_join(root, relative_path)
+    if path:
+        path = os.path.realpath(path)
+        if not _is_path_inside(path, root):
+            path = None
+    if not path or os.path.splitext(path)[1].lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise ValueError("Invalid image path")
+    # One decoder at a time bounds peak source-image memory and prevents
+    # duplicate generation while another request populates the cache.
+    with _THUMBNAIL_LOCK:
+        stat = os.stat(path)
+        return _cached_image_thumbnail(path, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+
+@_UI_ROUTES.get("/umiapp/images/thumbnail")
+async def image_thumbnail(request):
+    try:
+        data = await asyncio.to_thread(_image_thumbnail_sync, request.query.get("relative_path", ""))
+        etag = '"' + hashlib.sha256(data).hexdigest() + '"'
+        headers = {"ETag": etag, "Cache-Control": "no-cache"}
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers=headers)
+        return web.Response(body=data, content_type="image/png", headers=headers)
+    except ValueError:
+        return web.json_response({"error": "Invalid image path"}, status=400)
+    except FileNotFoundError:
+        return web.json_response({"error": "Image no longer exists"}, status=404)
+    except Exception:
+        logging.exception("[UmiAI] Could not generate image thumbnail")
+        return web.json_response({"error": "Could not generate image thumbnail"}, status=500)
+
+
+def _wildcard_roots():
+    roots = [_wildcard_root()]
+    try:
+        roots.extend(folder_paths.get_folder_paths("wildcards") or [])
+    except Exception:
+        pass
+    try:
+        roots.append(os.path.join(folder_paths.models_dir, "wildcards"))
+    except Exception:
+        pass
+    return [os.path.abspath(root) for root in roots if root and os.path.isdir(root)]
+
+
+def _load_yaml_tags(filepath):
+    tags = set()
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict):
+            for entry in data.values():
+                if isinstance(entry, dict):
+                    for tag in entry.get("Tags", []) or []:
+                        tags.add(str(tag).strip())
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed reading YAML tags from {filepath}: {e}")
+    return tags
+
+
+def _coerce_number(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_date(value, end_of_day=False):
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        clock = time.max if end_of_day else time.min
+        return datetime.combine(parsed, clock).timestamp()
+    except ValueError:
+        return None
+
+
+def _find_values_recursive(value, keys):
+    found = []
+    wanted = {key.lower() for key in keys}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in wanted and item not in (None, ""):
+                found.append(item)
+            found.extend(_find_values_recursive(item, keys))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_find_values_recursive(item, keys))
+    return found
+
+
+def _first_recursive(value, keys):
+    values = _find_values_recursive(value, keys)
+    return values[0] if values else None
+
+
+def _metadata_from_image(path, quick=False):
+    """Read size and text chunks from an image.
+
+    Returns None when the file could not be read, so callers can avoid caching
+    a failed read as a complete one. A file still being written by a running
+    generation is the common case.
+    """
+    metadata = {}
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            width, height = img.size
+            metadata["width"] = width
+            metadata["height"] = height
+            if quick:
+                return metadata
+            # Text chunks placed after IDAT only land in img.info once the
+            # image data has been consumed, so load() before reading it.
+            try:
+                img.load()
+            except Exception as e:
+                umi_debug_print(f"[UmiAI] Partial image data in {path}: {e}")
+                return None
+            for key, value in (img.info or {}).items():
+                if isinstance(value, (str, int, float, bool)):
+                    metadata[key] = value
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed reading image metadata from {path}: {e}")
+        return None
+    return metadata
+
+
+def _json_metadata(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return json.loads(value)
     except Exception:
         return None
 
-UTILITIES_MODEL_CATEGORIES = {
-    "background_removal",
-    "face_detection",
-    "llm_models",
-    "qwen_loras",
-    "sam",
-    "segmentation",
-}
 
-UTILITIES_MODEL_PREFIXES = {
-    "models/loras/qwen/": "qwen_loras",
-    "models/ultralytics/bbox/": "face_detection",
-    "models/segmentation/": "segmentation",
-    "models/sam/": "sam",
-    "models/RMBG/": "background_removal",
-    "models/llm/": "llm_models",
-}
+def _derive_image_metadata(metadata):
+    prompt_text = " ".join(str(metadata.get(key, "")) for key in ("umi_prompt", "umi_input_prompt", "prompt"))
+    prompt_json = _json_metadata(metadata.get("prompt")) or {}
+    workflow_json = _json_metadata(metadata.get("workflow")) or {}
+    search_root = {"prompt": prompt_json, "workflow": workflow_json}
 
-def _infer_model_category(model):
-    category = model.get("category")
-    if category:
-        return category
-    local_path = model.get("local_path") or ""
-    if local_path:
-        norm_path = local_path.replace("\\", "/")
-        for prefix, cat in UTILITIES_MODEL_PREFIXES.items():
-            if norm_path.startswith(prefix):
-                return cat
-    for f in model.get("files") or []:
-        file_path = f.get("local_path") or ""
-        norm_path = file_path.replace("\\", "/")
-        for prefix, cat in UTILITIES_MODEL_PREFIXES.items():
-            if norm_path.startswith(prefix):
-                return cat
+    models = []
+    for value in _find_values_recursive(search_root, ("ckpt_name", "unet_name", "model_name", "model")):
+        if isinstance(value, str) and value not in models:
+            models.append(value)
+
+    loras = []
+    for match in re.finditer(r'<lora:([^:>]+)', prompt_text, flags=re.IGNORECASE):
+        name = match.group(1).strip()
+        if name and name not in loras:
+            loras.append(name)
+    for value in _find_values_recursive(search_root, ("lora_name", "lora")):
+        if isinstance(value, str) and value not in loras:
+            loras.append(value)
+
+    sampler = _first_recursive(search_root, ("sampler_name", "sampler")) or ""
+    steps = _first_recursive(search_root, ("steps",))
+    cfg = _first_recursive(search_root, ("cfg", "cfg_scale"))
+    seed = _first_recursive(search_root, ("seed", "noise_seed"))
+
+    return {
+        "models": models,
+        "loras": loras,
+        "sampler": str(sampler) if sampler not in (None, "") else "",
+        "steps": steps,
+        "cfg": cfg,
+        "seed": seed,
+    }
+
+
+def _image_matches_query(item, query):
+    metadata = item.get("metadata", {})
+    derived = item.get("derived", {})
+    annotations = item.get("annotations", {})
+
+    search = (query.get("search", "") or "").strip().lower()
+    if search:
+        haystack = " ".join([
+            item.get("filename", ""),
+            item.get("relative_path", ""),
+            str(metadata.get("umi_prompt", "")),
+            str(metadata.get("umi_negative", "")),
+            str(metadata.get("prompt", "")),
+            " ".join(derived.get("models", [])),
+            " ".join(derived.get("loras", [])),
+            " ".join(annotations.get("tags", [])),
+        ]).lower()
+        if search not in haystack:
+            return False
+
+    if query.get("favorites") == "1" and not annotations.get("favorite"):
+        return False
+
+    date_from = _parse_date(query.get("date_from"))
+    date_to = _parse_date(query.get("date_to"), end_of_day=True)
+    if date_from and item.get("mtime", 0) < date_from:
+        return False
+    if date_to and item.get("mtime", 0) > date_to:
+        return False
+
+    for field, key in (("steps", "steps"), ("cfg", "cfg"), ("width", "width"), ("height", "height")):
+        value = _coerce_number(derived.get(key) if key in derived else metadata.get(key))
+        min_value = _coerce_number(query.get(f"{field}_min"))
+        max_value = _coerce_number(query.get(f"{field}_max"))
+        if min_value is not None and (value is None or value < min_value):
+            return False
+        if max_value is not None and (value is None or value > max_value):
+            return False
+
+    orientation = (query.get("orientation", "any") or "any").lower()
+    width = _coerce_number(metadata.get("width"))
+    height = _coerce_number(metadata.get("height"))
+    if orientation == "portrait" and width is not None and height is not None and width >= height:
+        return False
+    if orientation == "landscape" and width is not None and height is not None and width <= height:
+        return False
+    if orientation == "square" and width is not None and height is not None and width != height:
+        return False
+
+    folder = query.get("folder")
+    if folder and item.get("folder") != folder:
+        return False
+
+    def _matches_any(param, values):
+        requested = {part.strip() for part in (query.get(param, "") or "").split(",") if part.strip()}
+        return not requested or bool(requested.intersection(set(values)))
+
+    if not _matches_any("models", derived.get("models", [])):
+        return False
+    if not _matches_any("loras", derived.get("loras", [])):
+        return False
+    if not _matches_any("samplers", [derived.get("sampler", "")]):
+        return False
+    if not _matches_any("tags", annotations.get("tags", [])):
+        return False
+
+    return True
+
+
+def _facet_items(counter):
+    return [{"name": name, "count": count} for name, count in counter.most_common() if name]
+
+
+def _split_danbooru_tags(value):
+    return [tag for tag in str(value or "").split() if tag]
+
+
+def _load_danbooru_tag_cache():
+    global DANBOORU_TAG_CACHE
+    if DANBOORU_TAG_CACHE is not None:
+        return DANBOORU_TAG_CACHE
+
+    tags = set()
+    tag_dir = os.path.join(BASE_DIR, "autocomplete-tags")
+    if os.path.isdir(tag_dir):
+        for csv_path in glob.glob(os.path.join(tag_dir, "*.csv")):
+            if "danbooru" not in os.path.basename(csv_path).lower():
+                continue
+            try:
+                with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        tag = line.split(",", 1)[0].strip()
+                        if tag:
+                            tags.add(tag)
+            except Exception as e:
+                umi_debug_print(f"[UmiAI] Failed loading Danbooru tag cache from {csv_path}: {e}")
+    DANBOORU_TAG_CACHE = tags
+    return DANBOORU_TAG_CACHE
+
+
+def _danbooru_tag_exists(tag):
+    clean = str(tag or "").strip()
+    return bool(clean) and clean in _load_danbooru_tag_cache()
+
+
+def _normalize_danbooru_chunk(chunk):
+    clean = str(chunk or "").strip()
+    if not clean:
+        return []
+    if not re.search(r"\s", clean):
+        return [clean]
+
+    candidate = re.sub(r"\s+", "_", clean)
+    if _danbooru_tag_exists(candidate):
+        return [candidate]
+
+    words = [word.strip() for word in clean.split() if word.strip()]
+    tokens = []
+    index = 0
+    while index < len(words):
+        matched = None
+        max_words = min(4, len(words) - index)
+        for size in range(max_words, 1, -1):
+            candidate = "_".join(words[index:index + size])
+            if _danbooru_tag_exists(candidate):
+                matched = candidate
+                index += size
+                break
+        if matched:
+            tokens.append(matched)
+        else:
+            tokens.append(words[index])
+            index += 1
+    return tokens
+
+
+def _normalize_danbooru_search_tags(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    tokens = []
+    chunks = [part.strip() for part in re.split(r"[,;\n\r]+", raw) if part.strip()]
+    for chunk in chunks:
+        tokens.extend(_normalize_danbooru_chunk(chunk))
+
+    normalized = []
+    seen = set()
+    for token in tokens:
+        clean = token.strip().strip(",")
+        if not clean:
+            continue
+        if ":" not in clean:
+            clean = clean.replace(" ", "_")
+        if clean not in seen:
+            normalized.append(clean)
+            seen.add(clean)
+    return " ".join(normalized)
+
+
+def _limit_danbooru_public_query(tags, has_auth):
+    if has_auth:
+        return tags
+
+    content_tags = []
+    meta_tags = []
+    for token in str(tags or "").split():
+        if ":" in token:
+            meta_tags.append(token)
+        else:
+            content_tags.append(token)
+    if len(content_tags) <= 2:
+        return tags
+    return " ".join(content_tags[:2] + meta_tags)
+
+
+def _safe_int(value, default, minimum=None, maximum=None):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    if minimum is not None:
+        number = max(minimum, number)
+    if maximum is not None:
+        number = min(maximum, number)
+    return number
+
+
+def _danbooru_media_variant_url(post, preferred_types):
+    media_asset = post.get("media_asset")
+    variants = media_asset.get("variants") if isinstance(media_asset, dict) else None
+    if not isinstance(variants, list):
+        return None
+    by_type = {
+        str(variant.get("type") or ""): variant.get("url")
+        for variant in variants
+        if isinstance(variant, dict) and variant.get("url")
+    }
+    for variant_type in preferred_types:
+        url = by_type.get(variant_type)
+        if url:
+            return url
+    for url in by_type.values():
+        if url:
+            return url
     return None
 
-def _filter_models_for_core(config):
-    if _umi_utilities is not None:
-        return config
-    filtered = []
-    for model in config.get("models", []):
-        category = _infer_model_category(model)
-        if category in UTILITIES_MODEL_CATEGORIES:
-            continue
-        filtered.append(model)
-    return {**config, "models": filtered}
+
+def _response_text_sample(response):
+    try:
+        return response.text[:1000]
+    except Exception:
+        return ""
+
+
+def _is_cloudflare_challenge(response):
+    text = _response_text_sample(response).lower()
+    return response.status_code in (403, 503) and (
+        "cloudflare" in text
+        or "just a moment" in text
+        or "enable javascript and cookies" in text
+    )
+
+
+def _danbooru_get_posts(params, headers, auth):
+    try:
+        from curl_cffi import requests as curl_requests
+        curl_headers = dict(headers)
+        curl_headers.pop("User-Agent", None)
+        return curl_requests.get(
+            f"{DANBOORU_BASE}/posts.json",
+            params=params,
+            headers=curl_headers,
+            auth=auth,
+            timeout=20,
+            impersonate="chrome",
+        )
+    except ImportError:
+        pass
+
+    import requests
+    return requests.get(
+        f"{DANBOORU_BASE}/posts.json",
+        params=params,
+        headers=headers,
+        auth=auth,
+        timeout=20,
+    )
+
+
+def _is_allowed_danbooru_image_url(url):
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.netloc.lower() in {
+        "cdn.donmai.us",
+        "danbooru.donmai.us",
+    }
+
+
+_PREVIEW_MEDIA_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif",
+    ".mp4", ".webm", ".mov",
+}
+
+
+def _is_allowed_lora_preview_file(path):
+    return (
+        bool(path)
+        and os.path.isfile(path)
+        and os.path.splitext(path)[1].lower() in _PREVIEW_MEDIA_EXTENSIONS
+    )
+
+
+def _danbooru_image_proxy_url(url):
+    if not url:
+        return ""
+    return "/umiapp/danbooru/image?" + urllib.parse.urlencode({"url": url})
+
+
+def _danbooru_get_image(url):
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": f"{DANBOORU_BASE}/",
+    }
+    try:
+        from curl_cffi import requests as curl_requests
+        return curl_requests.get(
+            url,
+            headers=headers,
+            timeout=30,
+            impersonate="chrome",
+        )
+    except ImportError:
+        pass
+
+    import requests
+    headers["User-Agent"] = "Mozilla/5.0"
+    return requests.get(url, headers=headers, timeout=30)
+
+
+def _danbooru_post_payload(post):
+    categories = {
+        "artist": _split_danbooru_tags(post.get("tag_string_artist")),
+        "copyright": _split_danbooru_tags(post.get("tag_string_copyright")),
+        "character": _split_danbooru_tags(post.get("tag_string_character")),
+        "general": _split_danbooru_tags(post.get("tag_string_general")),
+        "meta": _split_danbooru_tags(post.get("tag_string_meta")),
+    }
+    all_tags = []
+    for tags in categories.values():
+        for tag in tags:
+            if tag not in all_tags:
+                all_tags.append(tag)
+    preview_url = post.get("preview_file_url") or _danbooru_media_variant_url(post, ("180x180", "360x360")) or post.get("large_file_url") or post.get("file_url")
+    large_url = post.get("large_file_url") or _danbooru_media_variant_url(post, ("sample", "720x720", "original")) or post.get("file_url") or post.get("preview_file_url")
+    file_url = post.get("file_url") or _danbooru_media_variant_url(post, ("original", "sample")) or post.get("large_file_url") or post.get("preview_file_url")
+    return {
+        "id": post.get("id"),
+        "rating": post.get("rating"),
+        "score": post.get("score"),
+        "source": post.get("source") or "",
+        "post_url": f"{DANBOORU_BASE}/posts/{post.get('id')}",
+        "preview_url": _danbooru_image_proxy_url(preview_url),
+        "large_url": _danbooru_image_proxy_url(large_url),
+        "file_url": _danbooru_image_proxy_url(file_url),
+        "source_preview_url": preview_url or "",
+        "source_large_url": large_url or "",
+        "source_file_url": file_url or "",
+        "width": post.get("image_width"),
+        "height": post.get("image_height"),
+        "tags": categories,
+        "all_tags": all_tags,
+    }
+
+
+def _format_tag_line(tags, separator=", "):
+    seen = []
+    for tag in tags or []:
+        clean = str(tag).strip().replace(" ", "_")
+        if clean and clean not in seen:
+            seen.append(clean)
+    return separator.join(seen)
+
+
+def _wildcard_sources():
+    return {hashlib.sha256(os.path.normcase(os.path.abspath(root)).encode('utf-8')).hexdigest()[:16]: root
+            for root in get_all_wildcard_paths()}
+
 
 def get_wildcard_data():
-    wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
-    txt_files = []      # For __ autocomplete (txt files only)
-    yaml_files = []     # YAML file names
-    tags = set()        # Tags from YAML files for <[ autocomplete
-    basenames = {}      # Maps basename -> full path for quick lookup
-    
-    if os.path.exists(wildcards_path):
-        # 1. Scan TXT files (for __ wildcards)
-        for filepath in glob.glob(os.path.join(wildcards_path, '**', '*.txt'), recursive=True):
-            rel_path = os.path.relpath(filepath, wildcards_path)
-            tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
-            txt_files.append(tag_name)
-            
-            # Add basename mapping (filename without extension)
-            basename = os.path.splitext(os.path.basename(filepath))[0]
-            if basename not in basenames:
-                basenames[basename] = tag_name
-        
-        # 2. Scan YAML files (for tags)
-        for filepath in glob.glob(os.path.join(wildcards_path, '**', '*.yaml'), recursive=True):
-            rel_path = os.path.relpath(filepath, wildcards_path)
-            tag_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
-            yaml_files.append(tag_name)
-            
-            # Add basename mapping
-            basename = os.path.splitext(os.path.basename(filepath))[0]
-            if basename not in basenames:
-                basenames[basename] = tag_name
-            
-            # Parse YAML for Tags
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = yaml.safe_load(f)
-                    if isinstance(data, dict):
-                        for entry in data.values():
-                            if isinstance(entry, dict) and 'Tags' in entry:
-                                for t in entry['Tags']:
-                                    tags.add(str(t).strip())
-            except Exception as e:
-                umi_debug_print(f"[UmiAI] Error parsing YAML {filepath}: {e}")
+    # Use the execution catalog, including external roots, YML and CSV. Legacy
+    # `files` remains TXT-only for older consumers; `wildcards` is the full list.
+    with PROMPT_CACHE_LOCK:
+        loader = TagLoader(get_all_wildcard_paths(), {'verbose': False, 'use_folder_paths': True})
+        sources = {}
+        txt_files = set()
+        yaml_files = set()
+        basenames = {}
+        source_ids = {root: key for key, root in _wildcard_sources().items()}
+        for entry in loader.file_catalog:
+            key, extension = os.path.splitext(entry['relative_path'])
+            if extension == '.txt':
+                txt_files.add(key)
+            elif extension in ('.yaml', '.yml'):
+                yaml_files.add(key)
+            basenames.setdefault(key.rsplit('/', 1)[-1], key)
+            sources.setdefault(key, []).append({
+                'source': source_ids.get(entry['root']), 'root': entry['root'],
+                'relative_path': entry['relative_path'], 'ext': extension[1:],
+            })
+        return {
+            'files': sorted(txt_files), 'wildcards': sorted(sources),
+            'prompt_files': sorted(txt_files), 'yaml_files': sorted(yaml_files),
+            'tags': sorted(loader.umi_tags),
+            'entry_names': sorted(str(info['entry_key']) for info in loader.entry_names.values()),
+            'sources': sources, 'basenames': basenames,
+            'loras': _get_lora_filename_list(),
+            'lint_cleaner_enabled': UMI_SETTINGS.get('lint_cleaner_enabled', False),
+        }
 
-    # Return separated data
-    return {
-        "files": sorted(txt_files),           # Legacy/combined (for backwards compat)
-        "wildcards": sorted(txt_files),       # TXT files only (for __ autocomplete)
-        "yaml_files": sorted(yaml_files),     # YAML file names
-        "tags": sorted(list(tags)),           # Tags from YAML (for <[ autocomplete)
-        "basenames": basenames,               # Basename -> full path mapping
-        "loras": folder_paths.get_filename_list("loras"),
-        "lint_cleaner_enabled": UMI_SETTINGS.get('lint_cleaner_enabled', True),
-    }
 
-def get_optional_dependency_status():
-    dependencies = {
-        "opencv-python": "cv2",
-        "transformers": "transformers",
-        "torchvision": "torchvision",
-        "transparent-background": "transparent_background"
-    }
-    installed = []
-    missing = []
-    for package_name, module_name in dependencies.items():
-        if importlib.util.find_spec(module_name) is None:
-            missing.append(package_name)
-        else:
-            installed.append(package_name)
-    return {"installed": installed, "missing": missing}
+def _all_wildcard_details():
+    data = get_wildcard_data()
+    bundled = {(e['name'], e.get('ext', 'txt')): e for e in _wildcard_text_details()}
+    details = []
+    local = os.path.normcase(os.path.abspath(_wildcard_root()))
+    for name, sources in data['sources'].items():
+        for priority, source in enumerate(sources):
+            is_local = os.path.normcase(os.path.abspath(source['root'])) == local
+            detail = dict(bundled.get((name, source['ext']), {}) if is_local else {})
+            detail.update(name=name, **source, lines=detail.get('lines'),
+                          readonly=not is_local or source['ext'] == 'csv',
+                          alternatives=len(sources), priority=priority)
+            details.append(detail)
+    return details
 
-# ==============================================================================
-# LORA BROWSER ROUTES
-# ==============================================================================
 
-def get_target_file(filename):
-    """Wrapper to find the full path of a lora file."""
+def _target_lora_path(filename):
     return folder_paths.get_full_path("loras", filename)
 
-@PromptServer.instance.routes.get("/umiapp/loras")
-async def get_loras(request):
-    """
-    Scans the Lora directory and returns a list of files 
-    along with their associated metadata (.json, .civitai.info) and preview images.
-    """
-    lora_names = folder_paths.get_filename_list("loras")
+
+def _get_lora_filename_list(force=False):
+    if force:
+        try:
+            folder_paths.filename_list_cache.pop("loras", None)
+        except Exception:
+            pass
+
+    try:
+        names = set(folder_paths.get_filename_list("loras"))
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed loading LoRAs from folder_paths: {e}")
+        names = set()
+
+    if not force and names:
+        return sorted(name.replace("\\", "/") for name in names)
+
+    try:
+        lora_exts = folder_paths.folder_names_and_paths.get("loras", ([], set()))[1]
+        for root in folder_paths.get_folder_paths("loras"):
+            if not os.path.isdir(root):
+                continue
+            for dirpath, _, filenames in os.walk(root):
+                for filename in filenames:
+                    if os.path.splitext(filename)[1].lower() not in lora_exts:
+                        continue
+                    names.add(os.path.relpath(os.path.join(dirpath, filename), root))
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed fallback LoRA scan: {e}")
+
+    return sorted(name.replace("\\", "/") for name in names)
+
+
+def _lora_companion_paths(full_path):
+    base, _ = os.path.splitext(full_path)
+    candidates = [
+        full_path,
+        f"{base}.civitai.info",
+        f"{base}.json",
+    ]
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        candidates.append(f"{base}.preview{ext}")
+        candidates.append(f"{base}{ext}")
+    return candidates
+
+
+def _resolved_lora_roots():
+    """Realpath-resolved LoRA model roots; deletions must stay inside these."""
+    try:
+        candidates = folder_paths.get_folder_paths("loras") or []
+    except Exception:
+        candidates = []
+    roots = []
+    for root in candidates:
+        try:
+            if root and os.path.isdir(root):
+                roots.append(os.path.realpath(root))
+        except OSError:
+            continue
+    return roots
+
+
+def _real_path_inside_any(path, roots):
+    """Return the symlink-resolved path if it lies inside one of the resolved
+    roots, else None. Resolving first means a symlinked directory inside a
+    root cannot redirect operations outside it."""
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return None
+    real_cmp = os.path.normcase(real)
+    for root in roots:
+        root_cmp = os.path.normcase(root)
+        try:
+            if os.path.commonpath([real_cmp, root_cmp]) == root_cmp:
+                return real
+        except ValueError:
+            continue
+    return None
+
+
+def _delete_lora_files_sync(lora_name):
+    """Delete a LoRA file and its companion files. Returns (payload, status)."""
+    full_path = _target_lora_path(lora_name)
+    if not full_path or not os.path.exists(full_path):
+        return {"success": False, "error": "LoRA not found"}, 404
+    roots = _resolved_lora_roots()
+    real_full = _real_path_inside_any(full_path, roots)
+    if real_full is None or not os.path.isfile(real_full):
+        return {"success": False, "error": "LoRA path is not a file inside the allowed LoRA folders"}, 400
+    deleted = []
+    lora_dir = os.path.dirname(full_path)
+    for candidate in _lora_companion_paths(full_path):
+        if not os.path.isfile(candidate):
+            continue
+        if _real_path_inside_any(candidate, roots) is None:
+            continue
+        os.remove(candidate)
+        deleted.append(os.path.relpath(candidate, lora_dir).replace("\\", "/"))
+    target_key = _lora_key(lora_name).lower()
+    with _LORA_OVERRIDES_LOCK:
+        overrides = _load_lora_overrides()
+        next_overrides = {
+            key: value for key, value in overrides.items()
+            if _lora_key(key).lower() != target_key
+        }
+        if len(next_overrides) != len(overrides):
+            _save_lora_overrides(next_overrides)
+    with _CIVITAI_CACHE_LOCK:
+        cache = _load_civitai_cache()
+        next_cache = {
+            key: value for key, value in cache.items()
+            if _lora_key(key).lower() != target_key
+        }
+        if len(next_cache) != len(cache):
+            _save_civitai_cache(next_cache)
+    return {"success": True, "deleted": deleted}, 200
+
+
+def _lora_overrides_path():
+    return os.path.join(BASE_DIR, "lora_overrides.json")
+
+
+def _load_json_file(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, type(default)) else default
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Failed loading {path}: {e}")
+        return default
+
+
+def _save_json_file(path, data):
+    _atomic_write_json(path, data, indent=2)
+
+
+def _load_lora_overrides():
+    return _load_json_file(_lora_overrides_path(), {})
+
+
+def _save_lora_overrides(data):
+    _save_json_file(_lora_overrides_path(), data)
+
+
+def _load_civitai_cache():
+    return _load_json_file(os.path.join(BASE_DIR, "civitai_cache.json"), {})
+
+
+def _save_civitai_cache(data):
+    _save_json_file(os.path.join(BASE_DIR, "civitai_cache.json"), data)
+
+
+def _merge_civitai_cache_entries(entries):
+    """Merge freshly fetched entries into the on-disk Civitai cache under a
+    lock, re-reading the file first so concurrent single/batch fetches cannot
+    clobber each other's results with a stale snapshot."""
+    if not entries:
+        return
+    with _CIVITAI_CACHE_LOCK:
+        cache = _load_civitai_cache()
+        cache.update(entries)
+        _save_civitai_cache(cache)
+
+
+def _to_civitai_red_url(value):
+    if not isinstance(value, str):
+        return value
+    return value.replace(CIVITAI_LEGACY_BASE, CIVITAI_SITE_BASE).replace("http://civitai.com", CIVITAI_SITE_BASE)
+
+
+def _normalize_civitai_entry(entry):
+    if not isinstance(entry, dict):
+        return {}
+    normalized = dict(entry)
+    for key in ("url", "model_url", "creator_url"):
+        if key in normalized:
+            normalized[key] = _to_civitai_red_url(normalized[key])
+    if not normalized.get("url") and normalized.get("id"):
+        normalized["url"] = f"{CIVITAI_SITE_BASE}/models/{normalized.get('id')}"
+    return normalized
+
+
+def _lora_key(name):
+    return os.path.splitext(str(name or "").replace("/", "\\").strip())[0]
+
+
+def _lora_basename(key):
+    """Path-style-independent basename for cache keys from any OS."""
+    return str(key or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _find_lora_cache_entry(cache, name):
+    key = _lora_key(name).lower()
+    base = _lora_basename(key)
+    # A basename fallback is useful for caches created before folders were
+    # recorded, but it must never shadow an exact path match.
+    exact = _find_exact_lora_cache_entry(cache, name)
+    if exact:
+        return exact
+    for cache_key, value in cache.items():
+        normalized = _lora_key(cache_key).lower()
+        if _lora_basename(normalized) == base:
+            return _normalize_civitai_entry(value)
+    return {}
+
+
+def _find_exact_lora_cache_entry(cache, name):
+    key = _lora_key(name).lower()
+    for cache_key, value in cache.items():
+        normalized = _lora_key(cache_key).lower()
+        if normalized == key:
+            return _normalize_civitai_entry(value)
+    return {}
+
+
+def _build_civitai_cache_index(cache):
+    """One-pass index over the Civitai cache so a listing request does not
+    rescan the whole cache per LoRA. Exact relative paths take priority over
+    the first legacy basename match."""
+    exact = {}
+    by_base = {}
+    for position, (cache_key, value) in enumerate(cache.items()):
+        normalized = _lora_key(cache_key).lower()
+        if normalized not in exact:
+            exact[normalized] = (position, value)
+        base = _lora_basename(normalized)
+        if base not in by_base:
+            by_base[base] = (position, value)
+    return exact, by_base
+
+
+def _find_lora_cache_entry_indexed(index, name):
+    exact, by_base = index
+    key = _lora_key(name).lower()
+    base = _lora_basename(key)
+    match = exact.get(key) or by_base.get(base)
+    return _normalize_civitai_entry(match[1]) if match is not None else {}
+
+
+def _sha256_file(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _cached_lora_sha256(cache, lora_name, full_path):
+    """Return (sha256, size, mtime) for a LoRA file, reusing the hash stored
+    in the cache entry for this exact key when the file's size and mtime are
+    unchanged. Avoids re-reading multi-GB files on repeat Civitai fetches."""
+    stat = os.stat(full_path)
+    cached = cache.get(lora_name)
+    if isinstance(cached, dict):
+        sha = cached.get("sha256")
+        if sha and cached.get("hash_size") == stat.st_size and cached.get("hash_mtime") == stat.st_mtime:
+            return sha, stat.st_size, stat.st_mtime
+    return _sha256_file(full_path), stat.st_size, stat.st_mtime
+
+
+def _civitai_tags(model):
+    tags = model.get("tags") if isinstance(model, dict) else []
+    if not isinstance(tags, list):
+        return []
+    clean = []
+    for tag in tags:
+        if isinstance(tag, dict):
+            value = tag.get("name")
+        else:
+            value = tag
+        value = str(value or "").strip()
+        if value and value not in clean:
+            clean.append(value)
+    return clean
+
+
+def _civitai_creator_name(model):
+    if not isinstance(model, dict):
+        return ""
+    creator = model.get("creator")
+    if isinstance(creator, dict):
+        return str(creator.get("username") or creator.get("name") or "").strip()
+    return str(creator or "").strip()
+
+
+def _civitai_preview_url(version):
+    images = version.get("images") if isinstance(version, dict) else []
+    if not isinstance(images, list):
+        return ""
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        url = image.get("url")
+        if url:
+            return str(url)
+    return ""
+
+
+def _preview_prompt_text(meta, *keys):
+    if not isinstance(meta, dict):
+        return ""
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _civitai_preview_prompts_from_images(images):
+    if not isinstance(images, list):
+        return []
+    prompts = []
+    for idx, image in enumerate(images):
+        if not isinstance(image, dict):
+            continue
+        meta = image.get("meta") if isinstance(image.get("meta"), dict) else {}
+        resources = image.get("resources") if isinstance(image.get("resources"), list) else []
+        entry = {
+            "index": idx + 1,
+            "url": str(image.get("url") or ""),
+            "prompt": _preview_prompt_text(meta, "prompt", "Prompt"),
+            "negative_prompt": _preview_prompt_text(meta, "negativePrompt", "negative_prompt", "Negative prompt", "Negative Prompt"),
+            "model": _preview_prompt_text(meta, "Model", "model", "checkpoint"),
+            "sampler": _preview_prompt_text(meta, "sampler", "Sampler"),
+            "scheduler": _preview_prompt_text(meta, "scheduler", "Schedule type", "Schedule Type"),
+            "steps": meta.get("steps") or meta.get("Steps") or "",
+            "cfg_scale": meta.get("cfgScale") or meta.get("cfg_scale") or meta.get("CFG scale") or "",
+            "seed": meta.get("seed") or meta.get("Seed") or "",
+            "size": _preview_prompt_text(meta, "Size", "size"),
+            "resources": [
+                {
+                    "name": str(resource.get("name") or ""),
+                    "type": str(resource.get("type") or ""),
+                    "weight": resource.get("weight", ""),
+                }
+                for resource in resources
+                if isinstance(resource, dict) and (resource.get("name") or resource.get("type"))
+            ],
+        }
+        if any(entry.get(key) for key in ("prompt", "negative_prompt", "model", "sampler", "scheduler", "steps", "cfg_scale", "seed", "size", "resources")):
+            prompts.append(entry)
+    return prompts
+
+
+def _civitai_preview_prompts(version):
+    if not isinstance(version, dict):
+        return []
+    return _civitai_preview_prompts_from_images(version.get("images"))
+
+
+def _civitai_nsfw_label(version, model):
+    value = None
+    if isinstance(model, dict):
+        value = model.get("nsfw")
+    if value is None and isinstance(version, dict):
+        value = version.get("nsfw") or version.get("nsfwLevel")
+    if value in (None, False, 0, "0", ""):
+        return "None"
+    if value is True:
+        return "Yes"
+    return str(value)
+
+
+def _civitai_cache_entry_from_version(version):
+    if not isinstance(version, dict):
+        return {}
+    model = version.get("model") if isinstance(version.get("model"), dict) else {}
+    model_id = version.get("modelId") or model.get("id")
+    version_id = version.get("id")
+    trained_words = version.get("trainedWords") or version.get("triggerWords") or []
+    if not isinstance(trained_words, list):
+        trained_words = []
+    entry = {
+        "id": model_id,
+        "model_version_id": version_id,
+        "name": model.get("name") or version.get("modelName") or version.get("name") or "",
+        "version_name": version.get("name") or "",
+        "description": model.get("description") or version.get("description") or "",
+        "tags": _civitai_tags(model),
+        "creator": _civitai_creator_name(model),
+        "url": f"{CIVITAI_SITE_BASE}/models/{model_id}" if model_id else "",
+        "trigger_words": [str(word).strip() for word in trained_words if str(word).strip()],
+        "base_model": version.get("baseModel") or version.get("base_model") or "",
+        "preview_url": _civitai_preview_url(version),
+        "preview_prompts": _civitai_preview_prompts(version),
+        "nsfw": _civitai_nsfw_label(version, model),
+    }
+    return _normalize_civitai_entry({k: v for k, v in entry.items() if v not in (None, "", [])})
+
+
+def _civitai_info_sidecar_from_entry(entry, version):
+    data = dict(version) if isinstance(version, dict) else {}
+    if entry:
+        data.setdefault("modelId", entry.get("id"))
+        data.setdefault("modelVersionId", entry.get("model_version_id"))
+        data.setdefault("modelName", entry.get("name"))
+        data.setdefault("name", entry.get("version_name") or entry.get("name"))
+        data.setdefault("baseModel", entry.get("base_model"))
+        data.setdefault("trainedWords", entry.get("trigger_words", []))
+        data.setdefault("description", entry.get("description", ""))
+        data.setdefault("preview_url", entry.get("preview_url", ""))
+        data.setdefault("url", entry.get("url", ""))
+    return data
+
+
+def _fetch_civitai_version_by_hash(file_hash, api_token=None):
+    import requests
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "UmiAI-ComfyUI/1.0",
+    }
+    api_token = str(api_token or "").strip() or os.environ.get("CIVITAI_API_TOKEN") or os.environ.get("CIVITAI_API_KEY")
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    errors = []
+    for base_url in (CIVITAI_SITE_BASE, CIVITAI_LEGACY_BASE):
+        url = f"{base_url}/api/v1/model-versions/by-hash/{file_hash}"
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code == 404:
+                errors.append(f"Not found on {base_url}")
+                continue
+            if response.status_code in (401, 403):
+                errors.append(f"{base_url} returned HTTP {response.status_code}; set CIVITAI_API_TOKEN if this model needs account access")
+                continue
+            if response.status_code != 200:
+                errors.append(f"{base_url} returned HTTP {response.status_code}")
+                continue
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("error"):
+                errors.append(f"{base_url}: {payload.get('error')}")
+                continue
+            return payload, base_url
+        except Exception as e:
+            errors.append(f"{base_url}: {e}")
+    raise RuntimeError("; ".join(errors) or "CivitAI lookup failed")
+
+
+def _write_lora_metadata_files(full_path, entry, version, mode):
+    base, _ = os.path.splitext(full_path)
+    if mode == "update_missing":
+        civitai_path = f"{base}.civitai.info"
+        json_path = f"{base}.json"
+        if not os.path.exists(civitai_path):
+            _save_json_file(civitai_path, _civitai_info_sidecar_from_entry(entry, version))
+        if not os.path.exists(json_path):
+            _save_json_file(json_path, entry)
+        return
+    if mode in {"replace_civitai_info", "replace_json_and_civitai", "replace_all"}:
+        _save_json_file(f"{base}.civitai.info", _civitai_info_sidecar_from_entry(entry, version))
+    if mode in {"replace_json_info", "replace_json_and_civitai", "replace_all"}:
+        _save_json_file(f"{base}.json", entry)
+
+
+def _lora_preview_paths(full_path):
+    base, _ = os.path.splitext(full_path)
+    paths = []
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        paths.extend((f"{base}.preview{ext}", f"{base}{ext}"))
+    return paths
+
+
+def _validated_preview_bytes(data):
+    if not data:
+        raise ValueError("Preview image is empty")
+    if len(data) > 25 * 1024 * 1024:
+        raise ValueError("Preview image exceeds the 25 MB limit")
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as image:
+            image_format = str(image.format or "").upper()
+            image.verify()
+    except Exception as e:
+        raise ValueError(f"Invalid preview image: {e}") from e
+    extensions = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+    if image_format not in extensions:
+        raise ValueError("Preview must be a PNG, JPEG, or WebP image")
+    return extensions[image_format]
+
+
+def _write_lora_preview(full_path, data, replace=True):
+    ext = _validated_preview_bytes(data)
+    base, _ = os.path.splitext(full_path)
+    destination = f"{base}.preview{ext}"
+    temp_path = f"{destination}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(temp_path, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, destination)
+        if replace:
+            for candidate in _lora_preview_paths(full_path):
+                if candidate != destination and os.path.isfile(candidate):
+                    os.remove(candidate)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    return destination
+
+
+def _download_lora_preview(full_path, url, replace=True):
+    if not str(url or "").lower().startswith(("https://", "http://")):
+        raise ValueError("CivitAI did not provide a preview URL")
+    import requests
+    response = requests.get(
+        url,
+        headers={"Accept": "image/*", "User-Agent": "UmiAI-ComfyUI/1.0"},
+        stream=True,
+        timeout=30,
+    )
+    response.raise_for_status()
+    content_length = _safe_int(response.headers.get("Content-Length"), 0, minimum=0)
+    if content_length > 25 * 1024 * 1024:
+        raise ValueError("Preview image exceeds the 25 MB limit")
+    data = bytearray()
+    for chunk in response.iter_content(64 * 1024):
+        if not chunk:
+            continue
+        data.extend(chunk)
+        if len(data) > 25 * 1024 * 1024:
+            raise ValueError("Preview image exceeds the 25 MB limit")
+    return _write_lora_preview(full_path, bytes(data), replace=replace)
+
+
+def _update_lora_preview_from_entry(full_path, entry, mode):
+    has_preview = any(os.path.isfile(path) for path in _lora_preview_paths(full_path))
+    should_replace = mode in {"replace_previews", "replace_all"}
+    should_fill = mode == "update_missing" and not has_preview
+    if not should_replace and not should_fill:
+        return False, ""
+    try:
+        _download_lora_preview(full_path, entry.get("preview_url"), replace=should_replace)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _fetch_and_cache_lora_civitai(lora_name, cache, mode="update_missing", api_token=None):
+    full_path = _target_lora_path(lora_name)
+    if not full_path or not os.path.exists(full_path):
+        return {"success": False, "error": "LoRA not found", "lora_name": lora_name}
+    real_full = _real_path_inside_any(full_path, _resolved_lora_roots())
+    if real_full is None or not os.path.isfile(real_full):
+        return {"success": False, "error": "LoRA is outside the allowed LoRA folders", "lora_name": lora_name}
+    full_path = real_full
+
+    # Mutation must never trust an ambiguous legacy basename match: doing so
+    # can write another folder's metadata beside this LoRA.
+    existing = _find_exact_lora_cache_entry(cache, lora_name)
+    if existing and mode == "update_missing":
+        _write_lora_metadata_files(full_path, existing, existing, mode)
+        preview_updated, preview_error = _update_lora_preview_from_entry(full_path, existing, mode)
+        result = {
+            "success": True,
+            "cached": True,
+            "updated": preview_updated,
+            "preview_updated": preview_updated,
+            "entry": existing,
+        }
+        if preview_error:
+            result["warning"] = f"Metadata updated, but preview download failed: {preview_error}"
+        return result
+
+    try:
+        file_hash, file_size, file_mtime = _cached_lora_sha256(cache, lora_name, full_path)
+        version, source = _fetch_civitai_version_by_hash(file_hash, api_token=api_token)
+    except Exception as e:
+        return {"success": False, "error": str(e), "lora_name": lora_name}
+
+    entry = _civitai_cache_entry_from_version(version)
+    if not entry:
+        return {"success": False, "error": "CivitAI response did not include model info", "lora_name": lora_name}
+
+    entry["sha256"] = file_hash
+    entry["hash_size"] = file_size
+    entry["hash_mtime"] = file_mtime
+    cache[lora_name] = entry
+    _write_lora_metadata_files(full_path, entry, version, mode)
+    preview_updated, preview_error = _update_lora_preview_from_entry(full_path, entry, mode)
+    result = {
+        "success": True,
+        "cached": False,
+        "updated": True,
+        "preview_updated": preview_updated,
+        "source": source,
+        "entry": entry,
+    }
+    if preview_error:
+        result["warning"] = f"Metadata updated, but preview download failed: {preview_error}"
+    return result
+
+
+@lru_cache(maxsize=256)
+def _cached_lora_sidecar_json(path, mtime_ns, ctime_ns, size):
+    # Stat fields form the freshness key. Failed parses are never cached.
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _read_lora_sidecar_json(full_path, suffix):
+    base, _ = os.path.splitext(full_path)
+    path = f"{base}{suffix}"
+    try:
+        stat = os.stat(path)
+        # Avoid retaining unusually large metadata files in memory.
+        if stat.st_size > 256 * 1024:
+            return _load_json_file(path, {})
+        value = _cached_lora_sidecar_json(path, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        return copy.deepcopy(value) if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _read_lora_metadata_tags(full_path):
+    tags = []
+    try:
+        from safetensors import safe_open
+        with safe_open(full_path, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+        raw = metadata.get("ss_tag_frequency") or metadata.get("tag_frequency")
+        if raw:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            counts = Counter()
+            if isinstance(data, dict):
+                for value in data.values():
+                    if isinstance(value, dict):
+                        for tag, count in value.items():
+                            try:
+                                counts[str(tag)] += int(count)
+                            except Exception:
+                                counts[str(tag)] += 1
+            tags = [{"tag": tag, "count": count} for tag, count in counts.most_common()]
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Could not read LoRA internal tags: {e}")
+    return tags
+
+
+def _collect_loras_sync(force=False):
+    """Blocking LoRA collection (filename listing, stat, preview probing,
+    sidecar JSON reads, cache/override merging); called via asyncio.to_thread
+    so the listing does not stall the aiohttp event loop."""
     loras = []
     base_models = set()
-    
-    for name in lora_names:
-        full_path = get_target_file(name)
-        if not full_path: continue
-        
-        base, ext = os.path.splitext(full_path)
-        
-        # Define sidecar file paths
-        civitai_info_path = f"{base}.civitai.info"
-        json_path = f"{base}.json"
-        preview_path = f"{base}.preview.png"
-        
-        civitai_data = {}
-        override_data = {}
-        civitai_info_tags = []
-        
-        # Load .civitai.info (Raw CivitAI data) and normalize structure
-        if os.path.exists(civitai_info_path):
-            try:
-                with open(civitai_info_path, 'r', encoding='utf-8') as f:
-                    raw_civitai_data = json.load(f)
-                    
-                    # Normalize the nested structure to match frontend expectations
-                    parent_model = raw_civitai_data.get("parent_model_data", {})
-                    model_id = raw_civitai_data.get("modelId") or raw_civitai_data.get("id") or parent_model.get("id")
-                    
-                    # Extract URL - check multiple possible locations
-                    url = raw_civitai_data.get("url")
-                    if not url and model_id:
-                        url = f"https://civitai.com/models/{model_id}"
-                    elif not url and parent_model.get("id"):
-                        url = f"https://civitai.com/models/{parent_model.get('id')}"
-                    
-                    # Extract preview URL from images array
-                    preview_url = None
-                    if raw_civitai_data.get("images"):
-                        images = raw_civitai_data["images"]
-                        if isinstance(images, list) and len(images) > 0:
-                            preview_url = images[0].get("url") if isinstance(images[0], dict) else None
-                    
-                    # Extract activation text/tags for civitai_info_tags
-                    activation_text = raw_civitai_data.get("activation text", "")
-                    if not activation_text:
-                        # Try to get from trainedWords
-                        trained_words = raw_civitai_data.get("trainedWords", [])
-                        if trained_words:
-                            activation_text = ", ".join(trained_words) if isinstance(trained_words, list) else str(trained_words)
-                    
-                    if activation_text:
-                        civitai_info_tags = [t.strip() for t in str(activation_text).split(",") if t.strip()]
-                    
-                    # Build normalized civitai_data structure
-                    civitai_data = {
-                        "id": model_id,
-                        "name": parent_model.get("name") or raw_civitai_data.get("name", ""),
-                        "description": parent_model.get("description") or raw_civitai_data.get("description", ""),
-                        "tags": parent_model.get("tags", raw_civitai_data.get("tags", [])),
-                        "trigger_words": raw_civitai_data.get("trainedWords", []),
-                        "base_model": raw_civitai_data.get("baseModel", "Unknown"),
-                        "preview_url": preview_url,
-                        "url": url,
-                        "creator": parent_model.get("creator", {}).get("username", raw_civitai_data.get("creator", "Unknown")),
-                        "nsfw": raw_civitai_data.get("nsfw", "None")
-                    }
-            except Exception as e:
-                umi_debug_print(f"[Umi LoRA Browser] Error loading .civitai.info for {name}: {e}")
-                civitai_data = {}
-                civitai_info_tags = []
-            
-        # Load .json (Manual/Override metadata)
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    json_data = json.load(f)
-                    # Map standard JSON fields to the format expected by our JS frontend
-                    activation_text = (
-                        json_data.get("activation text")
-                        or json_data.get("activation_text")
-                        or json_data.get("trainedWords")
-                        or json_data.get("trained_words")
-                        or json_data.get("triggerWords")
-                        or json_data.get("trigger_words")
-                        or ""
-                    )
-                    tags = json_data.get("tags", [])
-                    activation_tags = [t.strip() for t in str(activation_text).split(",") if t.strip()] if activation_text else []
-                    override_data = {
-                        "description": json_data.get("description", ""),
-                        "tags": tags,
-                        "activation_tags": activation_tags,
-                        "activation_text": activation_text,
-                        "nickname": json_data.get("name", ""),
-                        "preview_url": json_data.get("preview_url", "")
-                    }
-            except: pass
+    if force:
+        _cached_lora_sidecar_json.cache_clear()
+    overrides = _load_lora_overrides()
+    civitai_index = _build_civitai_cache_index(_load_civitai_cache())
+    for name in _get_lora_filename_list(force=force):
+        full_path = _target_lora_path(name)
+        if not full_path:
+            continue
+        base, _ = os.path.splitext(full_path)
+        rel_folder = os.path.dirname(name).replace("\\", "/") or "(root)"
+        try:
+            stat = os.stat(full_path)
+            file_size = stat.st_size
+            file_mtime = stat.st_mtime
+        except Exception:
+            file_size = 0
+            file_mtime = 0
 
-        # Check for local preview image (support multiple extensions)
         local_preview = None
-        preview_exts = [
-            ".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp",
-            ".png", ".jpg", ".jpeg", ".webp"
-        ]
-        for ext in preview_exts:
+        preview_mtime = 0
+        for ext in [".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".png", ".jpg", ".jpeg", ".webp"]:
             preview_candidate = f"{base}{ext}"
             if os.path.exists(preview_candidate):
-                # Pass the relative filename so we can fetch it via /umiapp/preview
-                local_preview = name.rsplit('.', 1)[0] + ext
+                local_preview = name.rsplit(".", 1)[0] + ext
+                try:
+                    preview_mtime = os.path.getmtime(preview_candidate)
+                except OSError:
+                    preview_mtime = 0
                 break
 
-        base_model = civitai_data.get("base_model") or ""
+        override = overrides.get(name) or overrides.get(_lora_key(name)) or {}
+        civitai = _find_lora_cache_entry_indexed(civitai_index, name)
+        info = _read_lora_sidecar_json(full_path, ".civitai.info")
+        local_json = _read_lora_sidecar_json(full_path, ".json")
+        civitai_info_tags = []
+        for source in (info, civitai):
+            words = source.get("trainedWords") or source.get("trigger_words") or source.get("triggerWords") or []
+            if isinstance(words, list):
+                civitai_info_tags.extend(str(word) for word in words if str(word).strip())
+        base_model = override.get("base_model") or civitai.get("base_model") or info.get("baseModel") or info.get("base_model") or ""
+        preview_prompts = civitai.get("preview_prompts")
+        if not isinstance(preview_prompts, list):
+            preview_prompts = _civitai_preview_prompts_from_images(info.get("images"))
         if base_model:
             base_models.add(str(base_model))
 
         loras.append({
             "name": name,
             "filename": name,
-            "civitai": civitai_data,
-            "override": override_data,
+            "folder": rel_folder,
+            "size": file_size,
+            "mtime": file_mtime,
+            "civitai": civitai,
+            "override": override,
+            "local": local_json,
             "local_preview": local_preview,
-            "civitai_info_tags": civitai_info_tags,
-            "base_model": base_model
+            "preview_mtime": preview_mtime,
+            "civitai_info_tags": sorted(set(civitai_info_tags)),
+            "preview_prompts": preview_prompts,
+            "base_model": str(base_model),
+            "tags": civitai.get("tags", []) if isinstance(civitai.get("tags", []), list) else [],
         })
+    return {"loras": loras, "base_models": sorted(base_models)}
 
-    return web.json_response({"loras": loras, "base_models": sorted(base_models)})
 
-# Note: /umiapp/loras/civitai/single endpoint is handled in nodes.py
-# This endpoint was removed to avoid conflicts - nodes.py has more complete implementation
-# with hash-based lookup, name search fallback, and proper sidecar file handling
+@_UI_ROUTES.get("/umiapp/loras")
+async def get_loras(request):
+    force = str(request.query.get("force", "")).lower() in {"1", "true", "yes"}
+    try:
+        payload = await asyncio.to_thread(_collect_loras_sync, force)
+    except Exception as e:
+        print(f"[UmiAI] /umiapp/loras failed: {e}")
+        traceback.print_exc()
+        return web.json_response({
+            "success": False,
+            "error": f"LoRA listing failed on the server ({type(e).__name__}). Check the ComfyUI log for details.",
+            "loras": [],
+            "base_models": [],
+        }, status=500)
+    return web.json_response(payload)
 
-@PromptServer.instance.routes.post("/umiapp/loras/civitai/batch")
-async def fetch_all_civitai(request):
-    """Trigger the fetcher.py logic for all files with a specific mode."""
-    data = await request.json()
-    mode = data.get("mode", "update_missing") # Default to update_missing
-    lora_names = folder_paths.get_filename_list("loras")
-    
-    processed_count = 0
-    results = []
-    
-    for lora_name in lora_names:
-        full_path = get_target_file(lora_name)
-        if full_path:
-            # Determine flags based on mode
-            force_fetch = False
-            fetch_preview = False
-            fetch_info = False
-            fetch_json = False
-            
-            if mode == "update_missing":
-                # Default behavior: fill gaps
-                force_fetch = False
-                fetch_preview = True
-                fetch_info = True
-                fetch_json = True
-            elif mode == "replace_previews":
-                force_fetch = False
-                fetch_preview = True
-                fetch_info = False
-                fetch_json = False
-            elif mode == "replace_civitai_info":
-                force_fetch = True # We want to replace this specific file
-                fetch_preview = False
-                fetch_info = True
-                fetch_json = False
-            elif mode == "replace_json_info":
-                force_fetch = True
-                fetch_preview = False
-                fetch_info = False
-                fetch_json = True
-            elif mode == "replace_json_and_civitai":
-                force_fetch = True
-                fetch_preview = False
-                fetch_info = True
-                fetch_json = True
-            elif mode == "replace_all":
-                force_fetch = True
-                fetch_preview = True
-                fetch_info = True
-                fetch_json = True
-            
-            actions = fetcher.process_file(full_path, 
-                                            force_fetch=force_fetch, 
-                                            fetch_preview=fetch_preview, 
-                                            fetch_info=fetch_info, 
-                                            fetch_json=fetch_json)
-            if actions:
-                processed_count += 1
-                results.append({"name": lora_name, "actions": actions})
-                
-    return web.json_response({"success": True, "count": processed_count, "results": results})
 
-@PromptServer.instance.routes.post("/umiapp/loras/overrides/save")
-async def save_overrides(request):
-    """Saves edits from the UI (tags, description, name) to the .json file."""
-    data = await request.json()
-    lora_name = data.get("lora_name")
-    override = data.get("override", {})
-    full_path = get_target_file(lora_name)
-    
-    if full_path:
-        base, _ = os.path.splitext(full_path)
-        json_path = f"{base}.json"
-        
-        existing = {}
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    existing = json.load(f)
-            except: pass
-            
-        # Update existing JSON with new values
-        existing["description"] = override.get("description", existing.get("description", ""))
-        if "tags" in override and override.get("tags") is not None:
-            existing["tags"] = override.get("tags", existing.get("tags", []))
-        if "activation_text" in override:
-            existing["activation text"] = override.get("activation_text", existing.get("activation text", ""))
-        existing["name"] = override.get("nickname", existing.get("name", ""))
-        existing["preview_url"] = override.get("preview_url", existing.get("preview_url", ""))
-        
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(existing, f, indent=4, ensure_ascii=False)
-            
-        return web.json_response({"success": True})
+@_UI_ROUTES.post("/umiapp/loras/internal_tags")
+async def get_lora_internal_tags(request):
+    try:
+        data = await request.json()
+        lora_name = data.get("lora_name") or data.get("filename")
+        full_path = _target_lora_path(lora_name)
+        if not full_path or not os.path.exists(full_path):
+            return web.json_response({"success": False, "error": "LoRA not found", "tag_pairs": []}, status=404)
+        return web.json_response({"success": True, "tag_pairs": _read_lora_metadata_tags(full_path)})
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e), "tag_pairs": []}, status=500)
 
-    return web.json_response({"success": False})
 
-@PromptServer.instance.routes.post("/umiapp/loras/manage/open")
-async def open_location(request):
-    """Opens the file location in the OS file explorer."""
-    data = await request.json()
-    lora_name = data.get("lora_name")
-    full_path = get_target_file(lora_name)
-    
-    if full_path and os.path.exists(full_path):
-        folder = os.path.dirname(full_path)
-        if sys.platform == 'win32':
-            subprocess.Popen(['explorer', '/select,', full_path])
-        elif sys.platform == 'darwin':
-            subprocess.Popen(['open', '-R', full_path])
-        else:
-            subprocess.Popen(['xdg-open', folder])
-        return web.json_response({"success": True})
-        
-    return web.json_response({"success": False})
-
-@PromptServer.instance.routes.post("/umiapp/loras/manage/delete")
-async def delete_lora(request):
-    """Deletes the Lora and its associated files."""
-    data = await request.json()
-    lora_name = data.get("lora_name")
-    full_path = get_target_file(lora_name)
-    
-    if full_path:
-        success, msg = fetcher.delete_lora_files(full_path)
-        return web.json_response({"success": success, "message": msg})
-        
-    return web.json_response({"success": False})
-
-@PromptServer.instance.routes.post("/umiapp/loras/upload_preview")
-async def upload_preview(request):
-    """Handles manual image upload for previews."""
-    reader = await request.multipart()
-    image_field = await reader.next()
-    lora_name_field = await reader.next()
-    
-    if not image_field or not lora_name_field:
-        return web.json_response({"success": False})
-        
-    lora_name = await lora_name_field.text()
-    full_path = get_target_file(lora_name)
-    
-    if full_path:
-        base, _ = os.path.splitext(full_path)
-        preview_path = f"{base}.preview.png"
-        
-        with open(preview_path, 'wb') as f:
-            while True:
-                chunk = await image_field.read_chunk()
-                if not chunk: break
-                f.write(chunk)
-                
-        return web.json_response({"success": True})
-
-    return web.json_response({"success": False})
-
-@PromptServer.instance.routes.post("/umiapp/loras/preview/replace_url")
-async def replace_preview_from_url(request):
-    """Download a preview image from URL and save alongside the LoRA."""
+@_UI_ROUTES.post("/umiapp/loras/overrides/save")
+async def save_lora_override(request):
     try:
         data = await request.json()
         lora_name = data.get("lora_name")
-        url = data.get("url")
-        if not lora_name or not url:
-            return web.json_response({"success": False, "error": "lora_name and url required"}, status=400)
+        override = data.get("override") or {}
+        if not lora_name or not isinstance(override, dict):
+            return web.json_response({"success": False, "error": "Invalid override"}, status=400)
+        if "activation_text" in override and "activation_tags" not in override:
+            override["activation_tags"] = [part.strip() for part in str(override.get("activation_text") or "").split(",") if part.strip()]
+        with _LORA_OVERRIDES_LOCK:
+            overrides = _load_lora_overrides()
+            overrides[lora_name] = override
+            _save_lora_overrides(overrides)
+        return web.json_response({"success": True, "override": override})
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
 
-        full_path = get_target_file(lora_name)
-        if not full_path:
-            full_path = get_target_file(f"{lora_name}.safetensors")
-        if not full_path:
-            return web.json_response({"success": False, "error": "File not found"}, status=404)
 
+@_UI_ROUTES.post("/umiapp/loras/upload_preview")
+async def upload_lora_preview(request):
+    try:
+        reader = await request.multipart()
+        lora_name = ""
+        image_bytes = bytearray()
+        too_large = False
+        async for part in reader:
+            if part.name == "lora_name":
+                lora_name = (await part.text()).strip()
+            elif part.name == "image":
+                while True:
+                    chunk = await part.read_chunk()
+                    if not chunk:
+                        break
+                    image_bytes.extend(chunk)
+                    if len(image_bytes) > 25 * 1024 * 1024:
+                        too_large = True
+                        break
+        if too_large:
+            return web.json_response({"success": False, "error": "Preview image exceeds the 25 MB limit"}, status=413)
+        full_path = _target_lora_path(lora_name)
+        if not full_path or not os.path.exists(full_path) or not image_bytes:
+            return web.json_response({"success": False, "error": "Missing LoRA or image"}, status=400)
+        real_full = _real_path_inside_any(full_path, _resolved_lora_roots())
+        if real_full is None or not os.path.isfile(real_full):
+            return web.json_response({"success": False, "error": "LoRA is outside the allowed LoRA folders"}, status=400)
+        full_path = real_full
         try:
-            resp = requests.get(url, timeout=20)
-            if resp.status_code != 200:
-                return web.json_response({"success": False, "error": "Failed to download image"}, status=400)
-        except Exception as e:
-            return web.json_response({"success": False, "error": str(e)}, status=500)
-
-        content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-        ext_map = {
-            "image/png": ".preview.png",
-            "image/jpeg": ".preview.jpg",
-            "image/jpg": ".preview.jpg",
-            "image/webp": ".preview.webp",
-        }
-        preview_ext = ext_map.get(content_type, ".preview.png")
-
-        base, _ = os.path.splitext(full_path)
-        # Remove existing preview sidecars (keep non-preview images)
-        for ext in [".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp"]:
-            path = f"{base}{ext}"
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
-        preview_path = f"{base}{preview_ext}"
-        with open(preview_path, "wb") as f:
-            f.write(resp.content)
-
-        rel_base = os.path.splitext(lora_name)[0]
-        return web.json_response({"success": True, "path": f"{rel_base}{preview_ext}"})
+            preview_path = await asyncio.to_thread(_write_lora_preview, full_path, bytes(image_bytes), True)
+        except ValueError as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+        with _LORA_OVERRIDES_LOCK:
+            overrides = _load_lora_overrides()
+            override = overrides.get(lora_name, {})
+            if isinstance(override, dict) and override.pop("preview_url", None) is not None:
+                overrides[lora_name] = override
+                _save_lora_overrides(overrides)
+        return web.json_response({"success": True, "preview": os.path.basename(preview_path)})
     except Exception as e:
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
-@PromptServer.instance.routes.post("/umiapp/loras/internal_tags")
-async def get_internal_tags(request):
-    """Extract internal training tags from LoRA safetensors metadata."""
+
+@_UI_ROUTES.post("/umiapp/loras/preview/replace_url")
+async def replace_lora_preview_url(request):
     try:
         data = await request.json()
         lora_name = data.get("lora_name")
-        if not lora_name:
-            return web.json_response({"success": False, "error": "lora_name required"}, status=400)
-
-        lora_path = get_target_file(lora_name)
-        if not lora_path:
-            lora_path = get_target_file(f"{lora_name}.safetensors")
-        if not lora_path:
-            return web.json_response({"success": False, "error": "LoRA file not found"}, status=404)
-
-        if not lora_path.endswith(".safetensors"):
-            return web.json_response({"success": True, "tags": []})
-
-        # Reuse blacklist similar to LoRAHandler
-        blacklist = {
-            "1girl", "1boy", "solo", "monochrome", "greyscale", "comic", "scenery",
-            "translated", "commentary_request", "highres", "absurdres", "masterpiece",
-            "best quality", "simple background", "white background", "transparent background"
-        }
-
-        from safetensors import safe_open
-        tags = []
-        tag_pairs = []
-        with safe_open(lora_path, framework="pt", device="cpu") as f:
-            metadata = f.metadata() or {}
-            tags_str = metadata.get("ss_tag_frequency", "{}")
-            try:
-                tag_freq = json.loads(tags_str)
-                if isinstance(tag_freq, dict):
-                    all_tags = {}
-                    for sub_dict in tag_freq.values():
-                        if isinstance(sub_dict, dict):
-                            all_tags.update(sub_dict)
-                    sorted_tags = sorted(all_tags.items(), key=lambda x: x[1], reverse=True)
-                    tag_pairs = [{"tag": t, "count": int(c)} for t, c in sorted_tags if t.lower() not in blacklist]
-                    tags = [p["tag"] for p in tag_pairs]
-            except Exception:
-                tags = []
-
-        return web.json_response({"success": True, "tags": tags, "tag_pairs": tag_pairs})
+        url = _to_civitai_red_url(str(data.get("url") or "").strip())
+        if not lora_name or not re.match(r'^https?://', url, flags=re.IGNORECASE):
+            return web.json_response({"success": False, "error": "Invalid LoRA or URL"}, status=400)
+        with _LORA_OVERRIDES_LOCK:
+            overrides = _load_lora_overrides()
+            override = overrides.get(lora_name, {})
+            if not isinstance(override, dict):
+                override = {}
+            override["preview_url"] = url
+            overrides[lora_name] = override
+            _save_lora_overrides(overrides)
+        return web.json_response({"success": True, "override": override})
     except Exception as e:
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 
-# ==============================================================================
-# EXISTING ROUTES (WILDCARDS, UTILITIES, MODELS)
-# ==============================================================================
+@_UI_ROUTES.post("/umiapp/loras/manage/open")
+async def open_lora_folder(request):
+    try:
+        data = await request.json()
+        lora_name = data.get("filename") or data.get("lora_name")
+        full_path = _target_lora_path(lora_name)
+        if not full_path or not os.path.exists(full_path):
+            return web.json_response({"success": False, "error": "LoRA not found"}, status=404)
+        folder = os.path.dirname(full_path)
+        if os.name == "nt":
+            os.startfile(folder)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+        return web.json_response({"success": True})
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
 
-# Register the routes (aligned with nodes.py endpoints)
+
+@_UI_ROUTES.post("/umiapp/loras/manage/delete")
+async def delete_lora_files(request):
+    try:
+        data = await request.json()
+        lora_name = data.get("filename") or data.get("lora_name")
+        payload, status = await asyncio.to_thread(_delete_lora_files_sync, lora_name)
+        return web.json_response(payload, status=status)
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+@_UI_ROUTES.post("/umiapp/loras/civitai/single")
+async def fetch_lora_civitai_single(request):
+    try:
+        data = await request.json()
+        lora_name = data.get("lora_name")
+        mode = data.get("mode") or "replace_civitai_info"
+        api_token = data.get("api_token")
+        if not lora_name:
+            return web.json_response({"success": False, "error": "Missing LoRA name"}, status=400)
+        cache = _load_civitai_cache()
+        # Hashing the LoRA file and the network fetch are blocking; keep them
+        # off the aiohttp event loop so the ComfyUI UI stays responsive.
+        result = await asyncio.to_thread(
+            _fetch_and_cache_lora_civitai, lora_name, cache, mode=mode, api_token=api_token
+        )
+        if result.get("success") and result.get("updated") and result.get("entry"):
+            await asyncio.to_thread(_merge_civitai_cache_entries, {lora_name: result.get("entry")})
+        status = 200 if result.get("success") else 502
+        return web.json_response(result, status=status)
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+@_UI_ROUTES.post("/umiapp/loras/civitai/batch")
+async def fetch_lora_civitai_batch(request):
+    try:
+        data = await request.json()
+        mode = data.get("mode") or "update_missing"
+        requested_loras = data.get("loras")
+        api_token = data.get("api_token")
+        cache = _load_civitai_cache()
+        names = requested_loras if isinstance(requested_loras, list) and requested_loras else _get_lora_filename_list()
+        if not _CIVITAI_BATCH_GUARD.acquire(blocking=False):
+            return web.json_response({
+                "success": False,
+                "error": "A Civitai batch fetch is already running.",
+                "count": 0,
+            }, status=409)
+        try:
+            count = 0
+            cached = 0
+            errors = []
+            updated_entries = {}
+            for name in names:
+                # Per-file hashing + fetch is blocking; run off the event loop.
+                result = await asyncio.to_thread(
+                    _fetch_and_cache_lora_civitai, str(name), cache, mode=mode, api_token=api_token
+                )
+                if result.get("success"):
+                    count += 1
+                    if result.get("cached"):
+                        cached += 1
+                    elif result.get("entry"):
+                        updated_entries[str(name)] = result.get("entry")
+                else:
+                    errors.append({
+                        "lora_name": name,
+                        "error": result.get("error") or "Unknown error",
+                    })
+            if updated_entries:
+                await asyncio.to_thread(_merge_civitai_cache_entries, updated_entries)
+        finally:
+            _CIVITAI_BATCH_GUARD.release()
+        return web.json_response({
+            "success": True,
+            "count": count,
+            "cached": cached,
+            "updated": max(0, count - cached),
+            "errors": errors[:100],
+            "error_count": len(errors),
+        })
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e), "count": 0}, status=500)
+
+
+@PromptServer.instance.routes.get("/umiapp/run_inspector/latest")
+async def get_latest_run_inspector(request):
+    if not UMI_SETTINGS.get("persist_run_inspector", False):
+        return web.json_response(
+            {
+                "success": False,
+                "disabled": True,
+                "error": "Run Inspector persistence is disabled in Umi settings.",
+            },
+            status=404,
+        )
+    cache_path = os.path.join(BASE_DIR, "cache", "run_inspector_latest.json")
+    if not os.path.exists(cache_path):
+        return web.json_response({"success": False, "error": "No Umi run has been cached yet."}, status=404)
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return web.json_response({"success": True, **data})
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
 @PromptServer.instance.routes.get("/umiapp/wildcards")
 async def fetch_wildcards(request):
-    data = get_wildcard_data()
-    return web.json_response(data)
+    return web.json_response(await asyncio.to_thread(get_wildcard_data))
+
 
 @PromptServer.instance.routes.get("/umiapp/globals")
 async def fetch_globals(request):
-    """Fetch global variables from globals.yaml for autocomplete."""
-    wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
-    globals_path = os.path.join(wildcards_path, "globals.yaml")
     variables = {}
-    
-    if os.path.exists(globals_path):
+    for root in _wildcard_roots():
+        globals_path = os.path.join(root, "globals.yaml")
+        if not os.path.exists(globals_path):
+            continue
         try:
-            with open(globals_path, 'r', encoding='utf-8') as f:
+            with open(globals_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
-                if isinstance(data, dict):
-                    for key, value in data.items():
-                        # Store variable name (with $ prefix) and its value
-                        var_name = key if key.startswith('$') else f'${key}'
-                        variables[var_name] = str(value)
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    var_name = key if str(key).startswith("$") else f"${key}"
+                    variables.setdefault(var_name, str(value))
         except Exception as e:
             umi_debug_print(f"[UmiAI] Error loading globals.yaml: {e}")
-    
-    # Also check models/wildcards for globals
-    models_wildcards = os.path.join(folder_paths.models_dir, "wildcards")
-    models_globals = os.path.join(models_wildcards, "globals.yaml")
-    
-    if os.path.exists(models_globals):
-        try:
-            with open(models_globals, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f)
-                if isinstance(data, dict):
-                    for key, value in data.items():
-                        var_name = key if key.startswith('$') else f'${key}'
-                        if var_name not in variables:  # Don't override
-                            variables[var_name] = str(value)
-        except Exception as e:
-            umi_debug_print(f"[UmiAI] Error loading models globals.yaml: {e}")
-    
-    return web.json_response({
-        "variables": variables,
-        "count": len(variables)
-    })
-
-@PromptServer.instance.routes.get("/umiapp/deps")
-async def get_dependency_status(request):
-    return web.json_response(get_optional_dependency_status())
-
-@PromptServer.instance.routes.get("/umiapp/utilities/status")
-async def get_utilities_status(request):
-    return web.json_response({"installed": _umi_utilities is not None})
-
-@PromptServer.instance.routes.get("/umiapp/characters")
-async def fetch_characters(request):
-    """Fetch available characters and their profiles for autocomplete and external tools."""
-    character_loader = _get_umi_character_loader()
-    if character_loader is None:
-        return web.json_response({
-            "characters": [],
-            "profiles": {},
-            "count": 0
-        })
-    
-    characters = character_loader.list_characters()
-    character_data = {}
-    
-    for char_name in characters:
-        if char_name == "none":
-            continue
-        data = character_loader.load_character(char_name)
-        if data:
-            character_data[char_name] = {
-                "name": data.get('name', char_name),
-                "description": data.get('description', ''),
-                "lora": data.get('lora', ''),
-                "outfits": list(data.get('outfits', {}).keys()),
-                "emotions": list(data.get('emotions', {}).keys()),
-                "poses": list(data.get('poses', {}).keys()),
-            }
-    
-    return web.json_response({
-        "characters": list(character_data.keys()),
-        "profiles": character_data,
-        "count": len(character_data)
-    })
-
-# VNCCS-style costume API
-@PromptServer.instance.routes.get("/umiapp/character/costumes")
-async def get_character_costumes(request):
-    """List costumes for a character (VNCCS-compatible)."""
-    character = request.query.get("character", "")
-    if not character:
-        return web.json_response([])
-    
-    chars_path = _resolve_umi_asset_path("characters", character)
-    sheets_path = os.path.join(chars_path, "Sheets")
-    
-    costumes = []
-    if os.path.exists(sheets_path):
-        for item in os.listdir(sheets_path):
-            if os.path.isdir(os.path.join(sheets_path, item)):
-                costumes.append(item)
-    
-    return web.json_response(costumes)
-
-# VNCCS-style character sheet preview
-@PromptServer.instance.routes.get("/umiapp/character/preview")
-async def get_character_preview(request):
-    """Get cropped preview from character sheet (VNCCS-compatible)."""
-    import io
-    import re
-    from PIL import Image
-    
-    character = request.query.get("character", "")
-    if not character:
-        return web.Response(status=404, text="No character specified")
-    
-    chars_path = _resolve_umi_asset_path("characters", character)
-    
-    # Try to find a sheet image
-    sheet_dir = os.path.join(chars_path, "Sheets", "Naked", "neutral")
-    if not os.path.exists(sheet_dir):
-        # Try any costume
-        sheets_base = os.path.join(chars_path, "Sheets")
-        if os.path.exists(sheets_base):
-            for costume in sorted(os.listdir(sheets_base)):
-                path = os.path.join(sheets_base, costume, "neutral")
-                if os.path.isdir(path):
-                    sheet_dir = path
-                    break
-    
-    if not os.path.exists(sheet_dir):
-        return web.Response(status=404, text="Sheet not found")
-    
-    # Find the best sheet file (highest index)
-    pattern = os.path.join(sheet_dir, "sheet_neutral_*.png")
-    files = glob.glob(pattern)
-    if not files:
-        # Try any PNG
-        files = glob.glob(os.path.join(sheet_dir, "*.png"))
-    
-    if not files:
-        return web.Response(status=404, text="No sheet images found")
-    
-    def get_index(f):
-        m = re.search(r'(\d+)', os.path.basename(f))
-        return int(m.group(1)) if m else 0
-    
-    files.sort(key=get_index)
-    best_file = files[-1]
-    
-    # Crop: Sheet is 6x2 grid, get last cell (row 1, col 5)
-    try:
-        img = Image.open(best_file)
-        w, h = img.size
-        item_w = w // 6
-        item_h = h // 2
-        
-        row, col = 1, 5
-        left = col * item_w
-        upper = row * item_h
-        right = left + item_w
-        lower = upper + item_h
-        
-        crop = img.crop((left, upper, right, lower))
-        
-        img_byte_arr = io.BytesIO()
-        crop.save(img_byte_arr, format='PNG')
-        return web.Response(body=img_byte_arr.getvalue(), content_type='image/png')
-    except Exception as e:
-        return web.Response(status=500, text=str(e))
-
-# VNCCS-style emotions API
-@PromptServer.instance.routes.get("/umiapp/emotions")
-async def get_emotions(request):
-    """Get emotions config data (VNCCS-compatible)."""
-    config_path = _resolve_umi_asset_path("emotions-config", "emotions.json")
-    
-    if not os.path.exists(config_path):
-        return web.json_response({"error": "emotions.json not found"}, status=404)
-    
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return web.json_response(data)
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-# Emotion image server
-@PromptServer.instance.routes.get("/umiapp/emotion/image")
-async def get_emotion_image(request):
-    """Serve emotion image by safe_name."""
-    from urllib.parse import unquote
-    
-    name = request.query.get("name", "")
-    if not name or ".." in name or "/" in name or "\\" in name:
-        return web.Response(status=400)
-    
-    name = unquote(name).strip()
-    image_path = _resolve_umi_asset_path("emotions-config", "images", f"{name}.png")
-    
-    if not os.path.exists(image_path):
-        return web.Response(status=404)
-    
-    return web.FileResponse(image_path)
+    return web.json_response({"variables": variables, "count": len(variables)})
 
 
 @PromptServer.instance.routes.get("/umiapp/preview")
 async def preview_content(request):
-    """Unified preview route: Handles Lora Image Previews (path) and Wildcard File Previews (file)."""
-    
-    # 1. Handle Lora Image Preview (path param)
-    path = request.query.get("path", "")
+    path = request.query.get("path")
     if path:
-        lora_roots = folder_paths.get_folder_paths("loras")
-        # Absolute path: allow only if inside lora roots
-        if os.path.isabs(path):
-            abs_path = os.path.abspath(path)
-            for root in lora_roots:
-                if os.path.commonpath([abs_path, os.path.abspath(root)]) == os.path.abspath(root):
-                    if os.path.exists(abs_path):
-                        return web.FileResponse(abs_path)
-            return web.Response(status=403, text="Access denied")
-        # Relative path: resolve under lora roots
-        for root in lora_roots:
-            candidate = os.path.join(root, path)
-            if os.path.exists(candidate):
-                return web.FileResponse(candidate)
+        if not UI_TOOLS_ENABLED:
+            return web.Response(status=404, text="Preview not found")
+        for root in folder_paths.get_folder_paths("loras"):
+            full_path = _safe_join(root, path)
+            if _is_allowed_lora_preview_file(full_path):
+                return web.FileResponse(full_path)
+        return web.Response(status=404, text="Preview not found")
 
-    # 2. Handle Wildcard Preview (file param) - Legacy logic
     filename = request.query.get("file", "")
-    if not filename:
-        return web.json_response({"error": "No file or path specified"}, status=400)
-    
-    wildcards_path = os.path.join(os.path.dirname(__file__), "wildcards")
-    entries = []
-    
-    # Search for the file
-    for ext in ['txt', 'yaml', 'yml', 'csv']:
-        # Try direct path
-        file_path = os.path.join(wildcards_path, f"{filename}.{ext}")
-        if os.path.exists(file_path):
+    normalized = filename.replace("\\", "/").strip("/")
+    if not normalized:
+        return web.json_response({"error": "No file specified"}, status=400)
+
+    wildcard_root = _wildcard_root()
+    for ext in ("txt", "yaml", "yml", "csv"):
+        file_path = _safe_join(wildcard_root, f"{normalized}.{ext}")
+        if file_path and os.path.exists(file_path):
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    if ext == 'txt':
-                        # Read first 15 lines
-                        lines = []
-                        for i, line in enumerate(f):
-                            if i >= 15:
-                                lines.append("... (more entries)")
-                                break
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                # Strip tags (:: separator) for preview
-                                if '::' in line:
-                                    line = line.split('::')[0]
-                                lines.append(line)
-                        entries = lines
-                    elif ext in ['yaml', 'yml']:
-                        data = yaml.safe_load(f)
-                        if isinstance(data, dict):
-                            entries = list(data.keys())[:15]
-                            if len(data) > 15:
-                                entries.append(f"... (+{len(data) - 15} more)")
-                    elif ext == 'csv':
-                        import csv as csv_module
-                        reader = csv_module.reader(f)
-                        for i, row in enumerate(reader):
-                            if i >= 15:
-                                entries.append("... (more entries)")
-                                break
-                            if row:
-                                entries.append(row[0])
-                return web.json_response({
-                    "file": filename,
-                    "type": ext,
-                    "entries": entries,
-                    "count": len(entries)
-                })
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                return web.json_response({"filename": filename, "type": ext, "content": content, "count": len(content.splitlines())})
             except Exception as e:
                 return web.json_response({"error": str(e)}, status=500)
-        
-        # Try recursive search
-        for root, dirs, files in os.walk(wildcards_path):
-            for f in files:
-                name_without_ext = os.path.splitext(f)[0]
-                rel_path = os.path.relpath(os.path.join(root, f), wildcards_path)
-                rel_name = os.path.splitext(rel_path)[0].replace(os.sep, '/')
-                if rel_name.lower() == filename.lower() or name_without_ext.lower() == filename.lower():
-                    return await preview_wildcard_file(os.path.join(root, f), filename)
-    
-    return web.json_response({"file": filename, "entries": [], "error": "File not found"})
 
-async def preview_wildcard_file(file_path, filename):
-    """Helper to preview a specific wildcard file."""
-    entries = []
-    ext = os.path.splitext(file_path)[1].lower()[1:]
-    
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            if ext == 'txt':
-                lines = []
-                for i, line in enumerate(f):
-                    if i >= 15:
-                        lines.append("... (more entries)")
-                        break
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        # Strip tags (:: separator) for preview
-                        if '::' in line:
-                            line = line.split('::')[0]
-                        lines.append(line)
-                entries = lines
-            elif ext in ['yaml', 'yml']:
-                data = yaml.safe_load(f)
-                if isinstance(data, dict):
-                    entries = list(data.keys())[:15]
-                    if len(data) > 15:
-                        entries.append(f"... (+{len(data) - 15} more)")
-        return web.json_response({
-            "file": filename,
-            "type": ext,
-            "entries": entries,
-            "count": len(entries)
-        })
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response({"error": "File not found"}, status=404)
+
 
 @PromptServer.instance.routes.post("/umiapp/refresh")
 async def refresh_wildcards(request):
-    # Trigger a cache clear for BOTH full and lite nodes
-    from .nodes import GLOBAL_CACHE, GLOBAL_INDEX, FILE_MTIME_CACHE
-    from .nodes_lite import GLOBAL_CACHE_LITE, GLOBAL_INDEX_LITE, FILE_MTIME_CACHE_LITE
+    data = await asyncio.to_thread(_refresh_wildcards_sync)
+    return web.json_response({"status": "success", "count": len(data.get("files", [])) + len(data.get("tags", [])), **data})
 
-    # Clear full node cache (including mtime cache)
-    GLOBAL_CACHE.clear()
-    GLOBAL_INDEX['built'] = False
-    GLOBAL_INDEX['files'] = set()
-    GLOBAL_INDEX['entries'] = {}
-    GLOBAL_INDEX['tags'] = set()
-    FILE_MTIME_CACHE.clear()  # Fix 12: Clear modification time cache on refresh
 
-    # Clear lite node cache (including mtime cache)
-    GLOBAL_CACHE_LITE.clear()
-    GLOBAL_INDEX_LITE['built'] = False
-    GLOBAL_INDEX_LITE['files'] = set()
-    GLOBAL_INDEX_LITE['entries'] = {}
-    GLOBAL_INDEX_LITE['tags'] = set()
-    FILE_MTIME_CACHE_LITE.clear()  # Fix 12: Clear modification time cache on refresh
+def _refresh_wildcards_sync():
+    with PROMPT_CACHE_LOCK:
+        GLOBAL_CACHE_LITE.clear()
+        GLOBAL_INDEX_LITE["built"] = False
+        GLOBAL_INDEX_LITE["files"] = set()
+        GLOBAL_INDEX_LITE["entries"] = {}
+        GLOBAL_INDEX_LITE["tags"] = set()
+        GLOBAL_INDEX_LITE["entry_names"] = {}
+        FILE_MTIME_CACHE_LITE.clear()
+        data = get_wildcard_data()
+        return data
 
-    # Return fresh data
-    data = get_wildcard_data()
-    return web.json_response({
-        "status": "success",
-        "count": len(data.get("files", [])) + len(data.get("tags", [])),
-        **data
-    })
-
-# ==============================================================================
-# SETTINGS MANAGEMENT API
-# ==============================================================================
 
 @PromptServer.instance.routes.get("/umiapp/settings")
 async def get_settings(request):
-    """Get current UmiAI settings."""
     return web.json_response({"settings": UMI_SETTINGS})
+
 
 @PromptServer.instance.routes.post("/umiapp/settings/update")
 async def update_settings(request):
-    """Update UmiAI settings and reload nodes."""
     try:
         data = await request.json()
-        new_settings = data.get("settings", {})
-
-        # Read current settings file
-        settings_path = os.path.join(os.path.dirname(__file__), "umi_settings.json")
-
-        # Load existing settings (preserving comments)
-        existing_content = ""
-        if os.path.exists(settings_path):
-            with open(settings_path, 'r', encoding='utf-8') as f:
-                existing_content = f.read()
-
-        # Parse existing JSON to update values
+        allowed = set(load_umi_settings().keys())
+        current_settings = dict(UMI_SETTINGS)
+        current_settings.update({k: v for k, v in data.get("settings", {}).items() if k in allowed})
         try:
-            # Load without comments for parsing
-            import re
-            json_without_comments = re.sub(r'//.*?$', '', existing_content, flags=re.MULTILINE)
-            current_settings = json.loads(json_without_comments)
-        except:
-            current_settings = {}
+            validate_processing_settings(current_settings)
+        except ValueError as exc:
+            return web.json_response({"status": "error", "message": str(exc)}, status=400)
 
-        # Update with new values
-        current_settings.update(new_settings)
+        settings_path = os.path.join(BASE_DIR, "umi_settings.json")
+        _atomic_write_json(settings_path, current_settings, indent=4)
 
-        # Write back to file with pretty formatting
-        with open(settings_path, 'w', encoding='utf-8') as f:
-            json.dump(current_settings, f, indent=4)
-
-        # Reload settings in memory
-        from .nodes import load_umi_settings
-
-        # Load fresh settings from file
-        fresh_settings = load_umi_settings()
-
-        # Update all references to UMI_SETTINGS dictionary
-        global UMI_SETTINGS
         UMI_SETTINGS.clear()
-        UMI_SETTINGS.update(fresh_settings)
-
-        # Also update in nodes module (same dictionary object)
-        from . import nodes
-        nodes.UMI_SETTINGS.clear()
-        nodes.UMI_SETTINGS.update(fresh_settings)
-
-        # nodes_lite imports UMI_SETTINGS from nodes, so it references the same dict
-        # The .clear() and .update() above should propagate to nodes_lite automatically
-
-        umi_debug_print(f"[UmiAI] Settings reloaded: auto_clean={fresh_settings.get('auto_clean')}, error_lint={fresh_settings.get('error_lint')}")
-
-        return web.json_response({
-            "status": "success",
-            "message": "Settings updated successfully. Changes will take effect immediately.",
-            "settings": UMI_SETTINGS
-        })
-
+        UMI_SETTINGS.update(load_umi_settings())
+        return web.json_response({"status": "success", "settings": UMI_SETTINGS})
     except Exception as e:
-        return web.json_response({
-            "status": "error",
-            "message": str(e)
-        }, status=500)
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
+def _preview_roll_sync(payload):
+    """Expand a prompt the way the node would, without touching the graph.
+
+    dry_run short-circuits LoRA loading, so no model or clip is needed and
+    nothing is cached or mutated. The node's own process() is used rather than a
+    reimplementation, so a preview cannot drift from a real run.
+    """
+    text = str(payload.get("text") or "")
+    if not text.strip():
+        return {"success": False, "error": "Nothing to preview: the prompt is empty."}, 400
+
+    kwargs = {
+        "text": text,
+        "seed": _safe_int(payload.get("seed"), 0, minimum=0),
+        "dry_run": True,
+        "model": None,
+        "clip": None,
+    }
+    # Pass through the node settings that change the expansion, when supplied.
+    for key in ("prompt_profile", "prompt_preset", "preset_placement",
+                "section_order", "input_negative", "anima_prompt_mode",
+                "anima_artist_mode", "bypass_phrases", "lora_tags_behavior",
+                "lora_cache_limit", "width", "height"):
+        if payload.get(key) is not None:
+            kwargs[key] = payload[key]
+
+    try:
+        result = UmiAIWildcardNodeLite().process(**kwargs)
+    except Exception as exc:
+        umi_debug_print(f"[UmiAI] Roll preview failed: {exc}")
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}, 500
+
+    # RETURN_NAMES: model, clip, text, negative_text, width, height, lora_info,
+    #               input_text, input_negative, bypass_matches, explain_json, ...
+    try:
+        explain = json.loads(result[10]) if result[10] else {}
+    except Exception:
+        explain = {}
+
+    trace = explain.get("wildcard_trace") or []
+    return {
+        "success": True,
+        "prompt": result[2],
+        # This is the resolved prompt immediately before LoRA extraction.  It
+        # intentionally still contains <lora:...> so the Pin button can reuse
+        # the roll without silently dropping model patches.
+        "frozen_prompt": explain.get("processed_prompt_before_lora") or result[2],
+        "negative": result[3],
+        "width": result[4],
+        "height": result[5],
+        "picks": len(trace),
+        "reused": sum(1 for item in trace if item.get("mode") == "cached"),
+        "warnings": explain.get("warnings") or [],
+        "trace": trace,
+    }, 200
+
+
+@PromptServer.instance.routes.post("/umiapp/preview-roll")
+async def preview_roll(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"success": False, "error": "Malformed request body."}, status=400)
+
+    body, status = await asyncio.to_thread(_preview_roll_sync, payload)
+    return web.json_response(body, status=status)
+
+
+def _prompt_history_path():
+    return os.path.join(BASE_DIR, "prompt_history.json")
+
+
+@PromptServer.instance.routes.get("/umiapp/prompt-history")
+async def get_prompt_history(request):
+    """Stored prompt history, newest first.
+
+    Persistence is opt-in (persist_prompt_history). When it is off this still
+    returns 200 with an empty list and persist=False, so the panel can show its
+    in-session history and offer the toggle instead of reporting an error.
+    """
+    persist = bool(UMI_SETTINGS.get("persist_prompt_history", False))
+    entries = []
+    if persist:
+        try:
+            path = _prompt_history_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    entries = list(reversed(data))
+        except Exception as e:
+            return web.json_response(
+                {"success": False, "persist": persist, "entries": [], "error": str(e)},
+                status=500,
+            )
+    return web.json_response({"success": True, "persist": persist, "entries": entries})
+
+
+@PromptServer.instance.routes.post("/umiapp/prompt-history/clear")
+async def clear_prompt_history(request):
+    try:
+        path = _prompt_history_path()
+        if os.path.exists(path):
+            _atomic_write_json(path, [], indent=2)
+        return web.json_response({"success": True, "entries": []})
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
 
 @PromptServer.instance.routes.post("/umiapp/settings/reset")
 async def reset_settings(request):
-    """Reset settings to defaults."""
+    defaults = dict(DEFAULT_UMI_SETTINGS)
     try:
-        # Get default settings
-        from .nodes import load_umi_settings
-
-        defaults = {
-            'use_folder_paths': False,
-            'csv_namespace': True,
-            'yaml_namespace': True,
-            'rng_streams': False,
-            'auto_clean': True,
-            'error_lint': False,
-            'lint_cleaner_enabled': True,
-            'enable_llm_features': False,
-            'enable_danbooru_features': False,
-            'enable_tag_autocomplete': True,
-            'enable_debug_output': False,
-        }
-
-        # Write defaults to file
-        settings_path = os.path.join(os.path.dirname(__file__), "umi_settings.json")
-        with open(settings_path, 'w', encoding='utf-8') as f:
-            json.dump(defaults, f, indent=4)
-
-        # Reload settings
-        global UMI_SETTINGS
+        settings_path = os.path.join(BASE_DIR, "umi_settings.json")
+        _atomic_write_json(settings_path, defaults, indent=4)
         UMI_SETTINGS.clear()
         UMI_SETTINGS.update(load_umi_settings())
+        return web.json_response({"status": "success", "settings": UMI_SETTINGS})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-        from . import nodes
-        nodes.UMI_SETTINGS.clear()
-        nodes.UMI_SETTINGS.update(load_umi_settings())
 
+def _collect_autocomplete_tags(query, limit):
+    """Blocking CSV scan for autocomplete; called via asyncio.to_thread."""
+    tags = []
+    tag_dir = os.path.join(BASE_DIR, "autocomplete-tags")
+    if not query or not os.path.isdir(tag_dir):
+        return tags
+    pattern = re.compile(re.escape(query).replace("\\ ", "[_ ]"), re.IGNORECASE)
+    for csv_path in glob.glob(os.path.join(tag_dir, "*.csv")):
+        try:
+            with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.split(",", 3)
+                    tag = parts[0].strip()
+                    if tag and pattern.search(tag):
+                        count = _safe_int(parts[2].strip() if len(parts) > 2 else 0, 0, minimum=0)
+                        category = _safe_int(parts[1].strip() if len(parts) > 1 else 0, 0, minimum=0)
+                        tags.append({
+                            "tag": tag,
+                            "value": tag.replace("_", " "),
+                            "count": count,
+                            "category": category,
+                        })
+                        if len(tags) >= limit:
+                            return tags
+        except Exception:
+            continue
+    return tags
+
+
+@PromptServer.instance.routes.get("/umiapp/autocomplete/tags")
+async def get_autocomplete_tags(request):
+    if not UMI_SETTINGS.get("enable_tag_autocomplete", True):
+        return web.json_response({"tags": [], "count": 0, "total": 0, "disabled": True})
+
+    query = (request.query.get("query", "") or "").strip().lower()
+    limit = _safe_int(request.query.get("limit"), 50, minimum=1, maximum=200)
+    tags = await asyncio.to_thread(_collect_autocomplete_tags, query, limit)
+    return web.json_response({"tags": tags, "count": len(tags), "total": len(tags)})
+
+
+@_UI_ROUTES.get("/umiapp/danbooru/search")
+async def danbooru_search(request):
+    query = _normalize_danbooru_search_tags(request.query.get("tags", ""))
+    rating = (request.query.get("rating", "") or "").strip()
+    page = _safe_int(request.query.get("page", 1), 1, minimum=1)
+    limit = _safe_int(request.query.get("limit", 24), 24, minimum=1, maximum=100)
+
+    tags = query
+    rating_map = {
+        "general": "g",
+        "sensitive": "s",
+        "questionable": "q",
+        "explicit": "e",
+    }
+    rating_value = rating_map.get(rating, rating)
+    if rating_value and rating_value != "any" and f"rating:{rating_value}" not in tags:
+        tags = f"{tags} rating:{rating_value}".strip()
+
+    try:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "UmiAI-ComfyUI/1.0",
+        }
+        auth = None
+        danbooru_login = os.environ.get("DANBOORU_LOGIN")
+        danbooru_api_key = os.environ.get("DANBOORU_API_KEY")
+        if danbooru_login and danbooru_api_key:
+            auth = (danbooru_login, danbooru_api_key)
+        tags = _limit_danbooru_public_query(tags, bool(auth))
+        # Synchronous HTTP client; run off the event loop.
+        response = await asyncio.to_thread(
+            _danbooru_get_posts, {"tags": tags, "limit": limit, "page": page}, headers, auth
+        )
+        if response.status_code != 200:
+            error = f"Danbooru returned HTTP {response.status_code}"
+            if _is_cloudflare_challenge(response):
+                error += "; Cloudflare blocked the backend request. Install curl_cffi or try again later."
+            return web.json_response({
+                "success": False,
+                "error": error,
+                "posts": [],
+            }, status=502)
+        try:
+            posts = response.json()
+        except Exception:
+            return web.json_response({
+                "success": False,
+                "error": "Danbooru returned a non-JSON response",
+                "posts": [],
+            }, status=502)
+        if not isinstance(posts, list):
+            posts = []
+        payload_posts = [_danbooru_post_payload(post) for post in posts if isinstance(post, dict)]
+        umi_debug_print(f"[UmiAI] Danbooru search query='{tags}' status={response.status_code} posts={len(payload_posts)}")
         return web.json_response({
-            "status": "success",
-            "message": "Settings reset to defaults",
-            "settings": UMI_SETTINGS
+            "success": True,
+            "query": tags,
+            "page": page,
+            "limit": limit,
+            "count": len(payload_posts),
+            "posts": payload_posts,
         })
-
     except Exception as e:
-        return web.json_response({
-            "status": "error",
-            "message": str(e)
-        }, status=500)
-
-# ==============================================================================
-# MODEL DOWNLOADER API (VNCCS-STYLE REPO SUPPORT)
-# ==============================================================================
-
-import asyncio
-import threading
-import traceback
-import requests
-import queue
-import urllib.parse
-
-try:
-    from huggingface_hub import hf_hub_download, hf_hub_url
-    HF_HUB_AVAILABLE = True
-except Exception:
-    HF_HUB_AVAILABLE = False
-
-# Universal download queue to avoid contention
-download_queue = queue.Queue()
-download_status = {}
-
-def resolve_path(relative_path):
-    base = getattr(folder_paths, "base_path", os.getcwd())
-    return os.path.abspath(os.path.join(base, relative_path))
-
-def get_installed_version_info():
-    registry_path = resolve_path("umi_installed_models.json")
-    if os.path.exists(registry_path):
-        try:
-            with open(registry_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def update_installed_version(model_name, version):
-    registry_path = resolve_path("umi_installed_models.json")
-    data = get_installed_version_info()
-    data[model_name] = version
-    with open(registry_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-
-def get_umi_config():
-    config_path = resolve_path("umi_user_config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_umi_config(new_data):
-    config_path = resolve_path("umi_user_config.json")
-    data = get_umi_config()
-    data.update(new_data)
-    with open(config_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-
-def _convert_manifest_to_config(manifest):
-    version = str(manifest.get("version", "1.0"))
-    models = []
-    for category_key, category in manifest.get("categories", {}).items():
-        target_dir = category.get("target_dir", "")
-        for model in category.get("models", []):
-            filename = model.get("filename", "")
-            local_path = os.path.join("models", target_dir, filename).replace("\\", "/")
-            files = []
-            if model.get("files"):
-                for f in model.get("files", []):
-                    file_name = f.get("filename") or f.get("name") or ""
-                    file_local = f.get("local_path")
-                    if not file_local and file_name:
-                        file_local = os.path.join("models", target_dir, file_name).replace("\\", "/")
-                    files.append({
-                        "filename": file_name,
-                        "local_path": file_local or "",
-                        "url": f.get("url", ""),
-                        "hf_repo": f.get("hf_repo", model.get("hf_repo", "")),
-                        "hf_path": f.get("hf_path", ""),
-                    })
-            models.append({
-                "name": model.get("name", filename),
-                "version": version,
-                "local_path": local_path,
-                "description": model.get("description", ""),
-                "url": model.get("url", ""),
-                "hf_repo": model.get("hf_repo", ""),
-                "hf_path": model.get("hf_path", ""),
-                "category": category_key,
-                "files": files
-            })
-    return {"models": models}
+        return web.json_response({"success": False, "error": str(e), "posts": []}, status=500)
 
 
-def _fetch_model_config(repo_id):
-    if not HF_HUB_AVAILABLE:
-        raise RuntimeError("huggingface_hub is not installed.")
-
+@_UI_ROUTES.get("/umiapp/danbooru/image")
+async def danbooru_image(request):
+    url = request.query.get("url", "")
+    if not _is_allowed_danbooru_image_url(url):
+        return web.Response(status=400, text="Invalid Danbooru image URL")
     try:
-        path = hf_hub_download(repo_id=repo_id, filename="model_updater.json", local_files_only=False)
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        path = hf_hub_download(repo_id=repo_id, filename="models_manifest.json", local_files_only=False)
-        with open(path, 'r', encoding='utf-8') as f:
-            manifest = json.load(f)
-        return _convert_manifest_to_config(manifest)
+        # Synchronous HTTP client; run off the event loop.
+        response = await asyncio.to_thread(_danbooru_get_image, url)
+        if response.status_code != 200:
+            return web.Response(status=502, text=f"Danbooru image returned HTTP {response.status_code}")
+        content_type = response.headers.get("content-type") or "application/octet-stream"
+        return web.Response(
+            body=response.content,
+            content_type=content_type.split(";", 1)[0],
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+    except Exception as e:
+        return web.Response(status=502, text=str(e))
 
 
-def worker_loop():
-    while True:
-        task = download_queue.get()
-        if task is None:
-            break
+def _series_import_manifest_root():
+    return os.path.join(BASE_DIR, "cache", "series_imports")
 
-        repo_id, model_name, target_model = task
 
-        try:
-            file_entries = target_model.get("files") or []
-            if not file_entries:
-                file_entries = [{
-                    "filename": os.path.basename(target_model.get("local_path", "")),
-                    "local_path": target_model.get("local_path", ""),
-                    "url": target_model.get("url", ""),
-                    "hf_repo": target_model.get("hf_repo", ""),
-                    "hf_path": target_model.get("hf_path", "")
-                }]
+@_UI_ROUTES.get("/umiapp/series-import/search")
+async def series_import_search(request):
+    query = (request.query.get("query", "") or "").strip()
+    media_type = (request.query.get("type", "ANIME") or "ANIME").upper()
+    page = _safe_int(request.query.get("page"), 1, minimum=1, maximum=1000)
+    if not query:
+        return web.json_response({"success": True, "items": [], "page_info": {"current_page": 1, "has_next_page": False}})
+    try:
+        result = await asyncio.to_thread(series_importer.search_anilist_media, query, media_type, page)
+        return web.json_response({"success": True, **result})
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] AniList series search failed: {e}")
+        return web.json_response({"success": False, "error": str(e), "items": []}, status=502)
 
-            for index, file_entry in enumerate(file_entries):
-                file_name = file_entry.get("filename") or os.path.basename(file_entry.get("local_path", "")) or "file"
-                download_status[model_name] = {
-                    "status": "downloading",
-                    "message": f"Downloading {file_name}...",
-                    "progress": 0,
-                    "file": file_name,
-                    "file_index": index + 1,
-                    "file_count": len(file_entries)
-                }
 
-                url = ""
-                headers = {}
+@_UI_ROUTES.get("/umiapp/series-import/characters")
+async def series_import_characters(request):
+    media_id = _safe_int(request.query.get("media_id"), 0, minimum=0)
+    character_limit = _safe_int(request.query.get("limit"), 250, minimum=0, maximum=2000)
+    if not media_id:
+        return web.json_response({"success": False, "error": "A valid AniList media ID is required"}, status=400)
+    try:
+        media, characters = await asyncio.to_thread(
+            series_importer.fetch_anilist_characters, media_id, character_limit
+        )
+        result = await asyncio.to_thread(
+            series_importer.enrich_characters,
+            media,
+            characters,
+            os.path.join(BASE_DIR, "autocomplete-tags"),
+        )
+        return web.json_response({"success": True, **result})
+    except Exception as e:
+        umi_debug_print(f"[UmiAI] Series character import failed for AniList {media_id}: {e}")
+        return web.json_response({"success": False, "error": str(e), "characters": []}, status=502)
 
-                file_repo_id = file_entry.get("hf_repo") or target_model.get("hf_repo") or repo_id
-                if file_entry.get("url") or target_model.get("url"):
-                    url = file_entry.get("url") or target_model.get("url", "")
 
-                    if "civitai.com/models/" in url and "api/download" not in url:
-                        parsed = urllib.parse.urlparse(url)
-                        qs = urllib.parse.parse_qs(parsed.query)
-                        if "modelVersionId" in qs:
-                            ver_id = qs["modelVersionId"][0]
-                            url = f"https://civitai.com/api/download/models/{ver_id}"
-                            print(f"[UmiAI] Auto-converted Civitai Web Link to API: {url}")
-
-                    if "civitai.com" in url:
-                        user_config = get_umi_config()
-                        civitai_token = user_config.get("civitai_token", "")
-                        if civitai_token:
-                            headers = {"Authorization": f"Bearer {civitai_token}"}
-                else:
-                    if not HF_HUB_AVAILABLE:
-                        raise RuntimeError("huggingface_hub is not installed.")
-
-                    filename = file_entry.get("hf_path") or target_model.get("hf_path", "")
-                    if filename.startswith(f"{file_repo_id}/"):
-                        filename = filename[len(file_repo_id) + 1:]
-                    url = hf_hub_url(file_repo_id, filename)
-                    token = os.environ.get("HF_TOKEN")
-                    if token:
-                        headers = {"Authorization": f"Bearer {token}"}
-
-                response = requests.get(url, headers=headers, stream=True, allow_redirects=True)
-                response.raise_for_status()
-
-                total_size = int(response.headers.get('content-length', 0))
-                downloaded = 0
-
-                temp_dir = os.path.join(folder_paths.base_path, "temp")
-                os.makedirs(temp_dir, exist_ok=True)
-                sanitized_name = "".join(x for x in model_name if x.isalnum())
-                temp_filename = f"umi_{sanitized_name}_{index + 1}.tmp"
-                temp_path = os.path.join(temp_dir, temp_filename)
-
-                with open(temp_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size > 0:
-                                percent = (downloaded / total_size) * 100
-                                mb_done = downloaded / (1024 * 1024)
-                                mb_total = total_size / (1024 * 1024)
-                                msg = f"{file_name}: {mb_done:.1f}/{mb_total:.1f} MB"
-                                download_status[model_name] = {
-                                    "status": "downloading",
-                                    "message": msg,
-                                    "progress": percent,
-                                    "file": file_name,
-                                    "file_index": index + 1,
-                                    "file_count": len(file_entries)
-                                }
-                            else:
-                                mb_done = downloaded / (1024 * 1024)
-                                download_status[model_name] = {
-                                    "status": "downloading",
-                                    "message": f"{file_name}: {mb_done:.1f} MB",
-                                    "progress": 0,
-                                    "file": file_name,
-                                    "file_index": index + 1,
-                                    "file_count": len(file_entries)
-                                }
-
-                download_status[model_name]["message"] = f"Installing {file_name}..."
-                target_rel_path = file_entry.get("local_path") or target_model.get("local_path", "")
-                if not target_rel_path:
-                    raise RuntimeError(f"Missing local_path for {model_name}")
-
-                target_abs_path = resolve_path(target_rel_path)
-                target_dir = os.path.dirname(target_abs_path)
-                os.makedirs(target_dir, exist_ok=True)
-
-                import shutil
-                shutil.move(temp_path, target_abs_path)
-                umi_debug_print(f"[UmiAI] Installed {model_name} -> {target_abs_path}")
-
-            update_installed_version(model_name, target_model.get("version", ""))
-            download_status[model_name] = {"status": "success", "message": "Installed"}
-
-        except Exception as e:
-            is_auth_error = False
-            if isinstance(e, requests.exceptions.HTTPError):
-                if e.response.status_code == 401:
-                    is_auth_error = True
-
-            err_msg = str(e)
-            status_code = "error"
-
-            if is_auth_error:
-                status_code = "auth_required"
-                err_msg = "API Key Required"
-            elif "404" in err_msg or "EntryNotFoundError" in err_msg:
-                err_msg = "File not found (404)"
-
-            download_status[model_name] = {"status": status_code, "message": err_msg}
-            umi_debug_print(f"[UmiAI] Download failed for {model_name}: {err_msg}")
-        finally:
-            download_queue.task_done()
-
-threading.Thread(target=worker_loop, daemon=True).start()
-
-@PromptServer.instance.routes.get("/umiapp/models/status")
-async def get_download_status(request):
-    return web.json_response(download_status)
-
-@PromptServer.instance.routes.post("/umiapp/models/save_token")
-async def save_api_token(request):
+@_UI_ROUTES.post("/umiapp/series-import/variants")
+async def series_import_variants(request):
     try:
         data = await request.json()
-        token = data.get("token", "")
-        save_umi_config({"civitai_token": token})
-        return web.json_response({"status": "saved"})
+        tags = data.get("tags") if isinstance(data, dict) else []
+        if not isinstance(tags, list):
+            return web.json_response({"success": False, "error": "tags must be a list"}, status=400)
+        tags = list(dict.fromkeys(str(tag or "").strip() for tag in tags if str(tag or "").strip()))[:100]
+        index = await asyncio.to_thread(series_importer.load_tag_index, os.path.join(BASE_DIR, "autocomplete-tags"))
+        results = {}
+        errors = {}
+        online_disabled_error = None
+        for position, tag in enumerate(tags):
+            local = series_importer.discover_local_variants(tag, index)
+            if online_disabled_error:
+                online = []
+                errors[tag] = online_disabled_error
+            else:
+                try:
+                    online = await asyncio.to_thread(
+                        series_importer.discover_online_variants,
+                        tag,
+                        index,
+                        100,
+                        0.10 if position else 0.0,
+                    )
+                except Exception as e:
+                    online = []
+                    errors[tag] = str(e)
+                    if "403" in str(e) or "cloudflare" in str(e).lower():
+                        online_disabled_error = str(e)
+            merged = {}
+            for variant in [*local, *online]:
+                current = merged.get(variant["tag"])
+                if current is None or variant.get("verified"):
+                    merged[variant["tag"]] = variant
+            results[tag] = sorted(merged.values(), key=lambda item: (-item.get("post_count", 0), item["tag"]))
+        return web.json_response({"success": True, "variants": results, "errors": errors})
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"success": False, "error": str(e), "variants": {}}, status=500)
 
-@PromptServer.instance.routes.post("/umiapp/models/set_active")
-async def set_active_version(request):
+
+@_UI_ROUTES.post("/umiapp/series-import/write")
+async def series_import_write(request):
     try:
         data = await request.json()
-        model_name = data.get("model_name")
-        version = data.get("version")
-
-        if not model_name or not version:
-            return web.json_response({"error": "Missing parameters"}, status=400)
-
-        update_installed_version(model_name, version)
-        return web.json_response({"status": "updated", "message": f"Set active version for {model_name} to {version}"})
-
+        if not isinstance(data, dict):
+            return web.json_response({"success": False, "error": "Invalid request body"}, status=400)
+        characters = data.get("characters")
+        if not isinstance(characters, list) or len(characters) > 1000:
+            return web.json_response({"success": False, "error": "characters must be a list of at most 1000 entries"}, status=400)
+        result = await asyncio.to_thread(
+            series_importer.write_wildcard_import,
+            data,
+            _wildcard_root(),
+            _series_import_manifest_root(),
+        )
+        return web.json_response(result)
+    except ValueError as e:
+        return web.json_response({"success": False, "error": str(e)}, status=400)
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+        umi_debug_print(f"[UmiAI] Series wildcard write failed: {e}")
+        return web.json_response({"success": False, "error": str(e)}, status=500)
 
-@PromptServer.instance.routes.get("/umiapp/models/check")
-async def check_models(request):
-    repo_id = request.rel_url.query.get("repo_id", "")
-    if not repo_id:
-        return web.json_response({"error": "No repo_id provided"}, status=400)
 
-    if " " in repo_id or repo_id.strip() == "":
-        return web.json_response({"error": f"Invalid Repo ID format: '{repo_id}'"}, status=400)
-
-    if not HF_HUB_AVAILABLE:
-        return web.json_response({"error": "huggingface_hub is not installed"}, status=500)
-
+@_UI_ROUTES.get("/umiapp/series-import/manifests")
+async def series_import_manifests(request):
+    manifest_id = (request.query.get("id", "") or "").strip()
     try:
-        def fetch_config():
-            return _fetch_model_config(repo_id)
+        if manifest_id:
+            manifest = await asyncio.to_thread(series_importer.read_manifest, _series_import_manifest_root(), manifest_id)
+            if manifest is None:
+                return web.json_response({"success": False, "error": "Import manifest not found"}, status=404)
+            return web.json_response({"success": True, "manifest": manifest})
+        items = await asyncio.to_thread(series_importer.list_manifests, _series_import_manifest_root())
+        return web.json_response({"success": True, "items": items})
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e), "items": []}, status=500)
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
 
-        config = await loop.run_in_executor(None, fetch_config)
-        config = _filter_models_for_core(config)
+def _wildcard_text_details():
+    """Per-file metadata for the wildcard browser and health report.
 
-        active_registry = get_installed_version_info()
-
-        grouped_models = {}
-        for model in config.get("models", []):
-            name = model["name"]
-            grouped_models.setdefault(name, []).append(model)
-
-        models_status = []
-        for name, variants in grouped_models.items():
+    Blank lines and comments are excluded from the count, because what matters
+    is how many candidates a wildcard actually offers -- a file of 40 lines that
+    are all comments offers none.
+    """
+    root = _wildcard_root()
+    details = []
+    if not os.path.isdir(root):
+        return details
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            lowered = filename.lower()
+            ext = next((e for e in WILDCARD_EXTENSIONS if lowered.endswith("." + e)), None)
+            if ext is None:
+                continue
+            path = os.path.join(dirpath, filename)
+            rel = os.path.relpath(path, root).replace("\\", "/")
+            entry = {
+                "name": rel[: -(len(ext) + 1)],
+                "ext": ext,
+                "lines": 0,
+                "blank": 0,
+                "comments": 0,
+                "bytes": 0,
+            }
             try:
-                from packaging import version
-                variants.sort(key=lambda x: version.parse(x["version"]), reverse=True)
-            except Exception:
-                variants.sort(key=lambda x: str(x["version"]), reverse=True)
-
-            latest = variants[0]
-            active_ver = active_registry.get(name, None)
-
-            installed_versions = []
-            for v in variants:
-                files = v.get("files") or []
-                if files:
-                    all_found = True
-                    for f in files:
-                        file_path = f.get("local_path") or ""
-                        if not file_path:
-                            all_found = False
-                            break
-                        if not os.path.exists(resolve_path(file_path)):
-                            all_found = False
-                            break
-                    if all_found:
-                        installed_versions.append(v["version"])
+                stat = os.stat(path)
+                entry["bytes"] = stat.st_size
+                entry["mtime"] = stat.st_mtime
+                if ext == "txt":
+                    with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+                        for raw in handle:
+                            line = raw.strip()
+                            if not line:
+                                entry["blank"] += 1
+                            elif line.startswith("#"):
+                                entry["comments"] += 1
+                            else:
+                                entry["lines"] += 1
                 else:
-                    full_path = resolve_path(v.get("local_path", ""))
-                    if os.path.exists(full_path):
-                        installed_versions.append(v["version"])
+                    # For YAML the candidates are the named entries.
+                    count, problem = _count_yaml_entries(path)
+                    if problem:
+                        entry["error"] = problem
+                        entry["lines"] = None
+                    else:
+                        entry["lines"] = count
+            except Exception as exc:
+                entry["error"] = str(exc)
+            details.append(entry)
+    return sorted(details, key=lambda item: (item["name"].lower(), item.get("ext", "")))
 
-            if active_ver and active_ver not in installed_versions:
-                active_ver = None
 
-            if not active_ver and installed_versions:
-                for v in variants:
-                    if v["version"] in installed_versions:
-                        active_ver = v["version"]
-                        break
+def _wildcard_health_sync():
+    """Structural problems across the wildcard collection.
 
-            status = "missing"
-            if active_ver:
-                status = "installed" if active_ver == latest["version"] else "outdated"
-            elif installed_versions:
-                status = "outdated"
+    Only things that can be determined from the files themselves are reported.
+    "Unused file" is deliberately absent: knowing it would mean scanning every
+    workflow and saved prompt, and a wrong answer there invites deleting
+    something that is used.
+    """
+    details = _wildcard_text_details()
+    findings = []
 
-            models_status.append({
+    empty, single, unreadable, big = [], [], [], []
+    dupes_within = []
+    line_owners = {}
+
+    root = _wildcard_root()
+    for entry in details:
+        name = entry["name"]
+        ext = entry.get("ext", "txt")
+        label = name if ext == "txt" else f"{name}.{ext}"
+        if entry.get("error"):
+            unreadable.append({"name": label, "note": entry["error"]})
+            continue
+        if entry["lines"] == 0:
+            empty.append({"name": label, "note": "no candidate lines"})
+            continue
+        if entry["lines"] == 1:
+            single.append({"name": label, "note": "one candidate, so it always resolves the same"})
+        if entry["lines"] > 5000:
+            big.append({"name": label, "note": f"{entry['lines']} candidates"})
+
+        # The duplicate checks below compare candidate lines. A YAML file's
+        # candidates are entries spread across many lines, so running them
+        # over one would report noise rather than duplicates.
+        if ext != "txt":
+            continue
+
+        path = _safe_join(root, f"{name}.txt")
+        if not path or not os.path.exists(path):
+            continue
+        seen = {}
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+                for number, raw in enumerate(handle, 1):
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    key = line.lower()
+                    if key in seen:
+                        seen[key] += 1
+                    else:
+                        seen[key] = 1
+                    line_owners.setdefault(key, set()).add(name)
+        except Exception:
+            continue
+
+        repeated = sorted((text, count) for text, count in seen.items() if count > 1)
+        if repeated:
+            shown = ", ".join(f"{text!r} x{count}" for text, count in repeated[:3])
+            more = "" if len(repeated) <= 3 else f" (+{len(repeated) - 3} more)"
+            dupes_within.append({
                 "name": name,
-                "status": status,
-                "active_version": active_ver,
-                "installed_versions": installed_versions,
-                "version": latest["version"],
-                "versions": variants,
-                "description": latest.get("description", "")
+                "note": f"{len(repeated)} repeated line(s): {shown}{more}",
             })
 
-        return web.json_response({"models": models_status})
+    shared = [
+        {"name": ", ".join(sorted(owners)), "note": f"{text!r} appears in {len(owners)} files"}
+        for text, owners in line_owners.items() if len(owners) > 2
+    ]
+    shared.sort(key=lambda item: item["note"])
 
+    def group(key, title, severity, items, why):
+        if items:
+            findings.append({
+                "key": key, "title": title, "severity": severity,
+                "why": why, "items": items[:60], "total": len(items),
+            })
+
+    group("unreadable", "Files that could not be read", "error", unreadable,
+          "These never resolve; a prompt referencing one gets [WILDCARD_NOT_FOUND].")
+    group("empty", "Files with no candidates", "error", empty,
+          "Only blank lines or comments, so referencing one produces nothing.")
+    group("single", "Files with one candidate", "warn", single,
+          "A wildcard with one line always resolves the same and could be plain text.")
+    group("dupes-within", "Repeated lines inside a file", "warn", dupes_within,
+          "Duplicates weight the roll toward that value, usually unintentionally.")
+    group("shared", "Lines shared across three or more files", "info", shared,
+          "Often fine, but can mean a file was copied rather than referenced.")
+    group("large", "Very large files", "info", big,
+          "Large files are read on every expansion; worth knowing about.")
+
+    counts = {"error": 0, "warn": 0, "info": 0}
+    for finding in findings:
+        counts[finding["severity"]] += finding["total"]
+
+    return {
+        "success": True,
+        "files": len(details),
+        "candidates": sum(entry["lines"] for entry in details),
+        "counts": counts,
+        "findings": findings,
+    }
+
+
+@PromptServer.instance.routes.get("/umiapp/wildcards/health")
+async def wildcard_health(request):
+    try:
+        return web.json_response(await asyncio.to_thread(_wildcard_health_sync))
+    except Exception as exc:
+        return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+
+@PromptServer.instance.routes.get("/umiapp/wildcards/text/list")
+async def list_text_wildcards(request):
+    # `files` keeps its original flat shape: the Danbooru and LoRA browsers
+    # both read it. `details` is additive.
+    payload = {"success": True, "files": _list_wildcard_text_files()}
+    if request.query.get("details") == "1":
+        payload["details"] = await asyncio.to_thread(
+            _all_wildcard_details if request.query.get("all") == "1" else _wildcard_text_details)
+        payload["root"] = _wildcard_root()
+    return web.json_response(payload)
+
+
+@PromptServer.instance.routes.get("/umiapp/wildcards/text/read")
+async def read_text_wildcard(request):
+    name = request.query.get("name", "")
+    ext = _wildcard_ext(request.query.get("ext"))
+    source = request.query.get("source")
+    if source:
+        root = _wildcard_sources().get(source)
+        ext = request.query.get("ext", "txt")
+        if root is None or ext not in ('txt', 'yaml', 'yml', 'csv'):
+            return web.json_response({"success": False, "error": "Unknown wildcard source or format"}, status=400)
+        path = _safe_join(root, f"{name}.{ext}")
+    else:
+        path = _wildcard_file_path(name, ext)
+    if not path:
+        return web.json_response({"success": False, "error": "Invalid wildcard name"}, status=400)
+    if not os.path.exists(path):
+        return web.json_response({"success": True, "name": _normalize_wildcard_name(name), "ext": ext, "content": "", "exists": False, "version": None})
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return web.json_response({"success": True, "name": _normalize_wildcard_name(name), "ext": ext, "content": content, "exists": True,
+                                  "version": _content_version(content)})
     except Exception as e:
-        err_msg = str(e)
-        if "HFValidationError" in err_msg or "Repo id" in err_msg:
-            return web.json_response({"error": f"Invalid Repo ID: {repo_id}"}, status=400)
-        if "404" in err_msg or "NotFound" in err_msg:
-            return web.json_response({"error": "Repository or config not found"}, status=404)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
 
-        traceback.print_exc()
-        return web.json_response({"error": f"{str(e)}"}, status=500)
 
-@PromptServer.instance.routes.post("/umiapp/models/download")
-async def download_model(request):
+@PromptServer.instance.routes.post("/umiapp/wildcards/text/write")
+async def write_text_wildcard(request):
     try:
         data = await request.json()
-    except Exception:
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-
-    repo_id = data.get("repo_id")
-    model_name = data.get("model_name")
-    target_version = data.get("version")
-
-    if not repo_id or " " in repo_id:
-        return web.json_response({"error": "Invalid Repo ID"}, status=400)
-
-    if not HF_HUB_AVAILABLE:
-        return web.json_response({"error": "huggingface_hub is not installed"}, status=500)
-
-    try:
-        def fetch_config_sync():
-            return _fetch_model_config(repo_id)
-
+        name = data.get("name", "")
+        if data.get('source'):
+            return web.json_response({"success": False, "error": "Source browsing is read-only; edit external files in their source folder."}, status=400)
+        mode = data.get("mode", "append")
+        ext = _wildcard_ext(data.get("ext"))
+        content = str(data.get("content", "") or "")
+        tags = data.get("tags")
+        if tags is not None:
+            content = _format_tag_line(tags)
+        path = _wildcard_file_path(name, ext)
+        if not path:
+            return web.json_response({"success": False, "error": "Invalid wildcard name"}, status=400)
+        if _is_yaml_ext(ext):
+            # A YAML file is a mapping, so appending a line to it produces a
+            # file that no longer parses and silently stops matching anything.
+            if mode != "overwrite":
+                return web.json_response(
+                    {"success": False,
+                     "error": "A YAML wildcard can only be saved whole, not appended to."},
+                    status=400)
+            problem = _validate_yaml_text(content)
+            if problem:
+                return web.json_response(
+                    {"success": False, "error": problem, "invalid_yaml": True}, status=400)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        existing = ""
+        exists = os.path.exists(path)
+        if exists:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        # expected_version is the version the editor read (null: the file must
+        # not exist yet). Without it an overwrite replaces whatever is there.
+        # No await runs between this check and the replace below.
+        if mode == "overwrite" and "expected_version" in data:
+            current_version = _content_version(existing) if exists else None
+            if data["expected_version"] != current_version:
+                if data["expected_version"] is None:
+                    error = "A file with this name already exists."
+                elif exists:
+                    error = "This file changed on disk since it was opened."
+                else:
+                    error = "This file was deleted since it was opened."
+                return web.json_response({
+                    "success": False, "conflict": True, "exists": exists,
+                    "version": current_version, "error": error,
+                }, status=409)
+        if mode == "overwrite":
+            next_content = content.rstrip() + ("\n" if content.strip() else "")
+        elif mode == "append":
+            line = content.strip()
+            next_content = existing
+            if line:
+                if next_content and not next_content.endswith("\n"):
+                    next_content += "\n"
+                if line not in {entry.strip() for entry in next_content.splitlines()}:
+                    next_content += line + "\n"
+        else:
+            return web.json_response({"success": False, "error": "Unsupported write mode"}, status=400)
+        # Stage beside the destination so a failed write cannot truncate a
+        # working wildcard, and readers see either complete version.
+        temp_path = None
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-
-        config = await loop.run_in_executor(None, fetch_config_sync)
-
-        target_model = next((m for m in config["models"]
-                             if m["name"] == model_name and m["version"] == target_version), None)
-
-        if not target_model:
-            target_model = next((m for m in config["models"] if m["name"] == model_name), None)
-
-        if not target_model:
-            return web.json_response({"error": f"Model '{model_name}' (v{target_version}) not found in config"}, status=404)
-
-        download_status[model_name] = {"status": "queued", "message": "Queued in backend..."}
-        download_queue.put((repo_id, model_name, target_model))
-
-        return web.json_response({"status": "queued", "message": f"Download queued for {model_name}"})
-
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                    dir=os.path.dirname(path), prefix=".umi-wildcard-",
+                    suffix=".tmp", delete=False) as f:
+                temp_path = f.name
+                f.write(next_content)
+            os.replace(temp_path, path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+        return web.json_response({
+            "success": True,
+            "name": _normalize_wildcard_name(name),
+            "content": next_content,
+            "version": _content_version(next_content),
+            "path": os.path.relpath(path, _wildcard_root()).replace("\\", "/"),
+        })
     except Exception as e:
-        if "HFValidationError" in str(e):
-            return web.json_response({"error": "Invalid Repo ID"}, status=400)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+def _scan_images_sync(query):
+    """Blocking image scan body; called via asyncio.to_thread."""
+    output_root = _image_output_root()
+    recursive = query.get("recursive", "1") != "0"
+    quick = query.get("quick", "0") == "1"
+    limit = _safe_int(query.get("limit"), 30, minimum=1, maximum=200)
+    offset = _safe_int(query.get("offset"), 0, minimum=0)
+    sort_mode = query.get("sort", "newest")
+    annotations = _load_image_annotations().get("items", {})
+    scan_cache = _load_image_scan_cache()
+    cache_items = scan_cache.setdefault("items", {})
+    cache_changed = False
+    seen_paths = set()
+    image_exts = {".png", ".jpg", ".jpeg", ".webp"}
+
+    all_items = []
+    walker = os.walk(output_root) if recursive else [(output_root, [], os.listdir(output_root) if os.path.isdir(output_root) else [])]
+    for root, _, files in walker:
+        for filename in files:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in image_exts:
+                continue
+            path = os.path.join(root, filename)
+            if not _is_path_inside(path, output_root):
+                continue
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            relative_path = os.path.relpath(path, output_root).replace("\\", "/")
+            seen_paths.add(relative_path)
+            metadata, derived, changed, metadata_complete = _cached_image_metadata(cache_items, relative_path, stat, path, quick)
+            cache_changed = cache_changed or changed
+            item_annotations = annotations.get(relative_path) or annotations.get(filename) or {}
+            if not isinstance(item_annotations, dict):
+                item_annotations = {}
+            item_annotations.setdefault("tags", [])
+            item_annotations.setdefault("favorite", False)
+            folder = os.path.dirname(relative_path).replace("\\", "/") or "(root)"
+            item = {
+                "filename": filename,
+                "relative_path": relative_path,
+                "folder": folder,
+                "url": _image_url(relative_path),
+                "thumbnail_url": "/umiapp/images/thumbnail?" + urllib.parse.urlencode({
+                    "relative_path": relative_path, "v": f"{stat.st_mtime_ns}-{stat.st_ctime_ns}-{stat.st_size}"}),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "metadata": metadata,
+                "derived": derived,
+                "metadata_complete": metadata_complete,
+                "annotations": item_annotations,
+            }
+            all_items.append(item)
+
+    stale_paths = [path for path in cache_items if path not in seen_paths
+                   and (recursive or "/" not in path)]
+    for path in stale_paths:
+        cache_items.pop(path, None)
+        cache_changed = True
+    if cache_changed:
+        _save_image_scan_cache(scan_cache)
+
+    items = [item for item in all_items if _image_matches_query(item, query)]
+
+    def _sort_number(item, key, *, metadata=False):
+        source = item.get("metadata", {}) if metadata else item.get("derived", {})
+        value = _coerce_number(source.get(key))
+        # Unknown values belong at the end of descending numeric sorts.
+        return float("-inf") if value is None else value
+
+    def _resolution_pixels(item):
+        metadata = item.get("metadata", {})
+        width = _coerce_number(metadata.get("width"))
+        height = _coerce_number(metadata.get("height"))
+        if width is None or height is None:
+            return float("-inf")
+        return width * height
+
+    if sort_mode == "oldest":
+        items.sort(key=lambda item: item.get("mtime", 0))
+    elif sort_mode == "name":
+        items.sort(key=lambda item: item.get("relative_path", "").lower())
+    elif sort_mode == "size":
+        items.sort(key=lambda item: item.get("size", 0), reverse=True)
+    elif sort_mode == "resolution":
+        items.sort(key=_resolution_pixels, reverse=True)
+    elif sort_mode in {"steps", "cfg", "seed"}:
+        items.sort(key=lambda item: _sort_number(item, sort_mode), reverse=True)
+    else:
+        items.sort(key=lambda item: item.get("mtime", 0), reverse=True)
+
+    # Facets are disjunctive: when Model A is selected, keep Model B visible so
+    # the user can add it as an OR filter.  Counting only the already-filtered
+    # result made every disjoint option disappear after the first click.
+    def _facet_source(*excluded_params):
+        facet_query = dict(query)
+        for param in excluded_params:
+            facet_query.pop(param, None)
+        return [item for item in all_items if _image_matches_query(item, facet_query)]
+
+    folder_counts = Counter(item.get("folder", "") for item in _facet_source("folder"))
+    model_counts = Counter(model for item in _facet_source("models") for model in item.get("derived", {}).get("models", []))
+    lora_counts = Counter(lora for item in _facet_source("loras") for lora in item.get("derived", {}).get("loras", []))
+    sampler_counts = Counter(item.get("derived", {}).get("sampler", "") for item in _facet_source("samplers"))
+    tag_counts = Counter(tag for item in _facet_source("tags") for tag in item.get("annotations", {}).get("tags", []))
+
+    return {
+        "images": items[offset:offset + limit],
+        "total": len(items),
+        "limit": limit,
+        "offset": offset,
+        "cache": {"items": len(cache_items), "updated": cache_changed},
+        "facets": {
+            "folders": _facet_items(folder_counts),
+            "models": _facet_items(model_counts),
+            "loras": _facet_items(lora_counts),
+            "samplers": _facet_items(sampler_counts),
+            "tags": _facet_items(tag_counts),
+        },
+    }
+
+
+@_UI_ROUTES.get("/umiapp/images/scan")
+async def scan_images(request):
+    # The scan walks the output folder and reads image metadata; keep that
+    # blocking work off the aiohttp event loop.
+    query = dict(request.query)
+    try:
+        # Only share identical requests that are currently running. Completed
+        # results are not retained, so Refresh and later requests stay fresh.
+        key = (asyncio.get_running_loop(), tuple(sorted(query.items())))
+        task = _IMAGE_SCAN_TASKS.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(asyncio.to_thread(_scan_images_sync, query))
+            _IMAGE_SCAN_TASKS[key] = task
+            def finished(done):
+                if _IMAGE_SCAN_TASKS.get(key) is done:
+                    _IMAGE_SCAN_TASKS.pop(key, None)
+                if not done.cancelled():
+                    done.exception()  # Retrieve failures even if all callers left.
+            task.add_done_callback(finished)
+        payload = await asyncio.shield(task)
+    except Exception as e:
+        # Full details (which may include local paths) go to the server log;
+        # the response carries only a concise, path-free summary.
+        print(f"[UmiAI] /umiapp/images/scan failed: {e}")
         traceback.print_exc()
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({
+            "success": False,
+            "error": f"Image scan failed on the server ({type(e).__name__}). Check the ComfyUI log for details.",
+            "images": [],
+            "total": 0,
+            "facets": {},
+            "limit": _safe_int(query.get("limit"), 30, minimum=1, maximum=200),
+            "offset": _safe_int(query.get("offset"), 0, minimum=0),
+        }, status=500)
+    return web.json_response(payload)
 
-@PromptServer.instance.routes.get("/umiapp/models/progress")
-async def get_download_progress(request):
-    download_id = request.query.get("id", "")
-    if download_id and download_id in download_status:
-        return web.json_response(download_status[download_id])
-    return web.json_response(download_status)
 
-# 2. Mappings
+@_UI_ROUTES.post("/umiapp/images/annotations/update")
+async def update_image_annotations(request):
+    try:
+        data = await request.json()
+        relative_path = str(data.get("relative_path", "")).replace("\\", "/").strip("/")
+        if not relative_path:
+            return web.json_response({"success": False, "error": "Missing relative_path"}, status=400)
+
+        output_root = _image_output_root()
+        target = _safe_join(output_root, relative_path)
+        if not target:
+            return web.json_response({"success": False, "error": "Invalid image path"}, status=400)
+
+        with _IMAGE_ANNOTATIONS_LOCK:
+            annotations = _load_image_annotations()
+            items = annotations.setdefault("items", {})
+            item = items.get(relative_path, {})
+            if not isinstance(item, dict):
+                item = {}
+
+            if "favorite" in data:
+                item["favorite"] = bool(data.get("favorite"))
+            if "tags" in data:
+                tags = data.get("tags") or []
+                if not isinstance(tags, list):
+                    tags = []
+                item["tags"] = sorted({str(tag).strip() for tag in tags if str(tag).strip()})
+
+            item.setdefault("tags", [])
+            item.setdefault("favorite", False)
+            items[relative_path] = item
+            _save_image_annotations(annotations)
+        return web.json_response({"success": True, "item": item})
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+
+@PromptServer.instance.routes.get("/umiapp/modules")
+async def umi_module_status(request):
+    """Report the core and optional overlay state for support/debugging."""
+    return web.json_response(
+        {
+            "core": "loaded",
+            "version": __version__,
+            "core_api_version": CORE_API_VERSION,
+            "optional": dict(OPTIONAL_MODULE_STATUS),
+            "ui_tools_enabled": UI_TOOLS_ENABLED,
+            "node_count": len(NODE_CLASS_MAPPINGS),
+            "nodes": sorted(NODE_CLASS_MAPPINGS),
+        }
+    )
+
+
+class _UmiAIWildcardNodeLiteCompat(UmiAIWildcardNodeLite):
+    """Alias so workflows saved with the old 'UmiAIWildcardNodeLite' class name
+    keep loading. DEPRECATED hides it from the node menu on newer frontends."""
+    DEPRECATED = True
+
+
 CORE_NODE_CLASS_MAPPINGS = {
-    "UmiAIWildcardNode": UmiAIWildcardNodeLite,  # Unified node (Lite version for users)
-    # Full version available in nodes.py for debugging - uncomment to use instead of Lite:
-    # "UmiAIWildcardNode": UmiAIWildcardNode,
+    "UmiAIWildcardNode": UmiAIWildcardNodeLite,
+    "UmiAIWildcardNodeLite": _UmiAIWildcardNodeLiteCompat,
     "UmiSaveImage": UmiSaveImage,
     "UmiTextBypass": UmiTextBypass,
-    # Disabled nodes - uncomment to re-enable
-    # "UmiPoseGenerator": UmiPoseGenerator,
-    # "UmiEmotionGenerator": UmiEmotionGenerator,
-    # "UmiEmotionStudio": UmiEmotionStudio,
-    # "UmiCharacterDesigner": UmiCharacterCreator2,
-    # "UmiModelManager": UmiModelManager,
-    # "UmiModelSelector": UmiModelSelector,
+    "UmiPromptPreset": UmiPromptPreset,
+    "UmiPromptProfile": UmiPromptProfile,
+    "UmiPromptInspector": UmiPromptInspector,
+    "UmiPromptSyntaxLint": UmiPromptSyntaxLint,
+    "UmiBypassModelSwitch": UmiBypassModelSwitch,
 }
 
 CORE_NODE_DISPLAY_NAME_MAPPINGS = {
     "UmiAIWildcardNode": "UmiAI Wildcard Processor",
+    "UmiAIWildcardNodeLite": "UmiAI Wildcard Processor",
     "UmiSaveImage": "Umi Save Image (with metadata)",
     "UmiTextBypass": "Umi Bypass",
-    # Disabled nodes - uncomment to re-enable
-    # "UmiPoseGenerator": "Umi Pose Generator",
-    # "UmiEmotionGenerator": "Umi Emotion Generator",
-    # "UmiEmotionStudio": "Umi Emotion Studio",
-    # "UmiCharacterDesigner": "Umi Character Designer",
-    # "UmiModelManager": "Umi Model Manager",
-    # "UmiModelSelector": "Umi Model Selector",
+    "UmiPromptPreset": "Umi Prompt Preset",
+    "UmiPromptProfile": "Umi Prompt Profile",
+    "UmiPromptInspector": "Umi Prompt Inspector",
+    "UmiPromptSyntaxLint": "Umi Prompt Syntax Lint",
+    "UmiBypassModelSwitch": "Umi Bypass Model Switch",
 }
 
-NODE_CLASS_MAPPINGS = {}
-NODE_CLASS_MAPPINGS.update(CORE_NODE_CLASS_MAPPINGS)
-if _umi_utilities is not None:
-    NODE_CLASS_MAPPINGS.update(_umi_utilities.NODE_CLASS_MAPPINGS)
-if _bgrm is not None:
-    NODE_CLASS_MAPPINGS.update(_bgrm.NODE_CLASS_MAPPINGS)
+NODE_CLASS_MAPPINGS = dict(CORE_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS = dict(CORE_NODE_DISPLAY_NAME_MAPPINGS)
 
-NODE_DISPLAY_NAME_MAPPINGS = {}
-NODE_DISPLAY_NAME_MAPPINGS.update(CORE_NODE_DISPLAY_NAME_MAPPINGS)
-if _umi_utilities is not None:
-    NODE_DISPLAY_NAME_MAPPINGS.update(_umi_utilities.NODE_DISPLAY_NAME_MAPPINGS)
-if _bgrm is not None:
-    NODE_DISPLAY_NAME_MAPPINGS.update(_bgrm.NODE_DISPLAY_NAME_MAPPINGS)
+# Optional features are overlay modules. A core-only installation simply does
+# not contain these files; dropping one of the optional archives over the core
+# folder makes its nodes available after the next ComfyUI restart.
+OPTIONAL_NODE_MODULES = (
+    "optional_krea",
+    "optional_anima_edit",
+    "optional_klein_edit",
+    "optional_memory",
+    "optional_ui_tools",
+)
+OPTIONAL_MODULE_STATUS = {}
 
-# 3. Expose the web directory
-WEB_DIRECTORY = "./js"
 
-# ==============================================================================
-# EXECUTION INTERCEPTOR FOR TEXT BYPASS
-# ==============================================================================
-# Hook into prompt execution to dynamically bypass nodes based on runtime conditions
+def _load_optional_node_module(module_name):
+    overlay_manifest, manifest_error = _read_overlay_manifest(module_name)
+    if manifest_error:
+        OPTIONAL_MODULE_STATUS[module_name] = manifest_error
+        if manifest_error != "not installed":
+            logging.warning("[UmiAI] Optional module %s: %s", module_name, manifest_error)
+        return
+    bundle_version = str(overlay_manifest["bundle_version"])
 
-# Don't install execution hook - it's too fragile across ComfyUI versions
-# Instead, rely on the frontend JS to set bypass mode before queue submission
-print("[UmiTextBypass] Using frontend-based bypass control (see js/umi_text_bypass.js)")
-
-def _umi_coerce_value(value, default, value_type):
-    if value is None:
-        return default
     try:
-        if value_type == int:
-            return int(float(value))
-        if value_type == float:
-            return float(value)
-        if value_type == str:
-            if isinstance(value, (int, float)):
-                return str(value)
-            return str(value)
-    except Exception:
-        return default
-    return value
+        module = importlib.import_module(f".{module_name}", __package__)
+    except ModuleNotFoundError as exc:
+        # Absence of the overlay itself is normal. A missing dependency inside
+        # an installed overlay is different and should be visible to the user.
+        if str(exc.name or "").rsplit(".", 1)[-1] == module_name:
+            OPTIONAL_MODULE_STATUS[module_name] = "not installed"
+            return
+        OPTIONAL_MODULE_STATUS[module_name] = f"error: {exc}"
+        logging.warning("[UmiAI] Optional module %s could not load: %s", module_name, exc)
+        return
+    except Exception as exc:
+        OPTIONAL_MODULE_STATUS[module_name] = f"error: {exc}"
+        logging.warning("[UmiAI] Optional module %s could not load: %s", module_name, exc)
+        return
 
-def _umi_is_link_value(value):
-    return isinstance(value, (list, tuple)) and len(value) >= 2
-
-_UMI_BYPASS_OUTPUT_INDEX = {
-    "IMAGE": 0,
-    "LATENT": 1,
-    "CONDITIONING": 2,
-    "MODEL": 3,
-    "CLIP": 4,
-    "STRING": 5,
-}
-
-def _umi_get_prompt_graph(prompt_payload):
-    if isinstance(prompt_payload, (list, tuple)) and prompt_payload:
-        prompt_payload = prompt_payload[0]
-    if isinstance(prompt_payload, dict) and "prompt" in prompt_payload:
-        return prompt_payload["prompt"]
-    if isinstance(prompt_payload, dict):
-        return prompt_payload
-    return None
-
-def _umi_collect_downstream_nodes(prompt_graph):
-    downstream = {}
-    for node_id, node_data in prompt_graph.items():
-        inputs = node_data.get("inputs", {})
-        for input_val in inputs.values():
-            if _umi_is_link_value(input_val):
-                src_id = str(input_val[0])
-                downstream.setdefault(src_id, set()).add(str(node_id))
-    return downstream
-
-def _umi_collect_downstream_links(prompt_graph):
-    downstream = {}
-    for node_id, node_data in prompt_graph.items():
-        inputs = node_data.get("inputs", {})
-        for input_name, input_val in inputs.items():
-            if _umi_is_link_value(input_val):
-                src_id = str(input_val[0])
-                src_output = int(input_val[1]) if len(input_val) > 1 else 0
-                downstream.setdefault(src_id, []).append((str(node_id), input_name, src_output))
-    return downstream
-
-def _umi_collect_output_indices(downstream, node_id):
-    output_indices = set()
-    for _, _, src_output in downstream.get(str(node_id), []):
-        output_indices.add(int(src_output))
-    return output_indices
-
-def _umi_get_bypass_output_index(node_inputs):
-    passthrough_type = node_inputs.get("passthrough_type", "IMAGE")
-    if _umi_is_link_value(passthrough_type):
-        return None
-    return _UMI_BYPASS_OUTPUT_INDEX.get(str(passthrough_type))
-
-def _umi_parse_matched_list(value):
-    if value is None or _umi_is_link_value(value):
-        return None
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            return None
-    return None
-
-def _umi_parse_match_index(value):
-    if _umi_is_link_value(value):
-        return None
-    return _umi_coerce_value(value, 0, int)
-
-def _umi_replace_output_nodes(prompt_payload, old_id, new_id):
-    if not isinstance(prompt_payload, dict):
-        return 0
-    replaced = 0
-    for key in ("output", "outputs"):
-        output_list = prompt_payload.get(key)
-        if not isinstance(output_list, list):
-            continue
-        for idx, val in enumerate(output_list):
-            if str(val) == str(old_id):
-                output_list[idx] = str(new_id)
-                replaced += 1
-    return replaced
-
-def _umi_compute_bypass_for_node(node_inputs):
-    text_val = node_inputs.get("text", "")
-    seed_val = node_inputs.get("seed", 0)
-    bypass_phrase_val = node_inputs.get("bypass_phrase", "")
-    bypass_phrases_val = node_inputs.get("bypass_phrases", "")
-    input_negative_val = node_inputs.get("input_negative", "")
-
-    # Skip if required inputs are linked
-    if (_umi_is_link_value(text_val) or _umi_is_link_value(seed_val)
-            or _umi_is_link_value(bypass_phrase_val) or _umi_is_link_value(bypass_phrases_val)):
-        umi_debug_print("[UmiTextBypass] Preview bypass skipped: linked inputs detected")
-        return None, None
-
-    text = _umi_coerce_value(text_val, "", str)
-    seed = _umi_coerce_value(seed_val, 0, int)
-    bypass_phrase = _umi_coerce_value(bypass_phrase_val, "", str)
-    bypass_phrases = _umi_coerce_value(bypass_phrases_val, "", str)
-    input_negative = _umi_coerce_value(input_negative_val, "", str)
-
-    # LLM/Vision optional inputs (only use if not linked)
-    image_input = None
-    if UMI_SETTINGS.get('enable_llm_features', False):
-        image_val = node_inputs.get("image", None)
-        if _umi_is_link_value(image_val):
-            umi_debug_print("[UmiTextBypass] Preview bypass skipped: linked image input detected")
-            return None
-        image_input = image_val
-
-    vision_model = _umi_coerce_value(node_inputs.get("vision_model", "None"), "None", str)
-    refiner_model = _umi_coerce_value(node_inputs.get("refiner_model", "None"), "None", str)
-    vision_temperature = _umi_coerce_value(node_inputs.get("vision_temperature", 0.6), 0.6, float)
-    refiner_temperature = _umi_coerce_value(node_inputs.get("refiner_temperature", 0.7), 0.7, float)
-    max_tokens = _umi_coerce_value(node_inputs.get("max_tokens", 800), 800, int)
-    custom_system_prompt = _umi_coerce_value(node_inputs.get("custom_system_prompt", ""), "", str)
-
-    danbooru_threshold = _umi_coerce_value(node_inputs.get("danbooru_threshold", 0.70), 0.70, float)
-    danbooru_max_tags = _umi_coerce_value(node_inputs.get("danbooru_max_tags", 15), 15, int)
-
-    wildcard_node = UmiAIWildcardNodeLite()
-    matched, _, matched_list = wildcard_node.preview_bypass_matched(
-        text=text,
-        seed=seed,
-        bypass_phrase=bypass_phrase,
-        bypass_phrases=bypass_phrases,
-        input_negative=input_negative,
-        image_input=image_input,
-        vision_model=vision_model,
-        refiner_model=refiner_model,
-        vision_temperature=vision_temperature,
-        refiner_temperature=refiner_temperature,
-        max_tokens=max_tokens,
-        custom_system_prompt=custom_system_prompt,
-        danbooru_threshold=danbooru_threshold,
-        danbooru_max_tags=danbooru_max_tags,
+    class_mappings = getattr(module, "NODE_CLASS_MAPPINGS", {})
+    display_mappings = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
+    duplicates = sorted(set(NODE_CLASS_MAPPINGS).intersection(class_mappings))
+    if duplicates:
+        OPTIONAL_MODULE_STATUS[module_name] = f"error: duplicate nodes {', '.join(duplicates)}"
+        logging.warning(
+            "[UmiAI] Optional module %s was skipped because it duplicates: %s",
+            module_name,
+            ", ".join(duplicates),
+        )
+        return
+    NODE_CLASS_MAPPINGS.update(class_mappings)
+    NODE_DISPLAY_NAME_MAPPINGS.update(display_mappings)
+    OPTIONAL_MODULE_STATUS[module_name] = (
+        f"loaded bundle {bundle_version} ({len(class_mappings)} nodes)"
     )
-    return matched, matched_list
 
-def _umi_bypass_prompt_handler(prompt_payload):
-    try:
-        prompt_graph = _umi_get_prompt_graph(prompt_payload)
-        if not isinstance(prompt_graph, dict):
-            print("[UmiTextBypass DEBUG] prompt_graph is not a dict!")
-            return prompt_payload
 
-        print(f"\n[UmiTextBypass DEBUG] ===== ANALYZING PROMPT GRAPH =====")
-        print(f"[UmiTextBypass DEBUG] Total nodes in graph: {len(prompt_graph)}")
-        print(f"[UmiTextBypass DEBUG] Node types:")
-        for nid, ndata in prompt_graph.items():
-            if isinstance(ndata, dict):
-                print(f"  Node {nid}: {ndata.get('class_type', 'UNKNOWN')}")
+for _optional_module_name in OPTIONAL_NODE_MODULES:
+    _load_optional_node_module(_optional_module_name)
 
-        wildcard_cache = {}
-        backend_controls = _umi_has_execution_blocker()
-        bypass_nodes = 0
-        umi_debug_print("[UmiTextBypass] Prompt handler invoked")
-
-        for node_id, node_data in prompt_graph.items():
-            if node_data.get("class_type") != "UmiTextBypass":
-                continue
-            print(f"[UmiTextBypass DEBUG] FOUND UmiTextBypass node: {node_id}")
-            bypass_nodes += 1
-
-            inputs = node_data.get("inputs", {})
-            matched_input = inputs.get("matched", None)
-            matched_list_input = inputs.get("matched_list", None)
-            match_index_input = inputs.get("match_index", 0)
-            matched_value = None
-            matched_list = None
-
-            downstream = _umi_collect_downstream_links(prompt_graph)
-            targets = downstream.get(str(node_id), [])
-            if backend_controls:
-                for target_id, _, _ in targets:
-                    target_node = prompt_graph.get(target_id)
-                    if not isinstance(target_node, dict):
-                        continue
-                    target_node["mode"] = 0
-                continue
-
-            if matched_list_input is not None:
-                if _umi_is_link_value(matched_list_input):
-                    src_id = str(matched_list_input[0])
-                    cached = wildcard_cache.get(src_id)
-                    if cached is None:
-                        src_node = prompt_graph.get(src_id, {})
-                        if src_node.get("class_type") in ("UmiAIWildcardNodeLite", "UmiAIWildcardNode"):
-                            single, match_list = _umi_compute_bypass_for_node(src_node.get("inputs", {}))
-                            cached = {"single": single, "list": match_list}
-                            wildcard_cache[src_id] = cached
-                    if cached:
-                        matched_list = cached.get("list")
-                else:
-                    matched_list = _umi_parse_matched_list(matched_list_input)
-
-            if matched_list is not None:
-                match_index = _umi_parse_match_index(match_index_input)
-                if match_index is not None and 0 <= match_index < len(matched_list):
-                    matched_value = bool(matched_list[match_index])
-                else:
-                    matched_value = False
-
-            if matched_value is None:
-                if _umi_is_link_value(matched_input):
-                    src_id = str(matched_input[0])
-                    cached = wildcard_cache.get(src_id)
-                    if cached is None:
-                        src_node = prompt_graph.get(src_id, {})
-                        if src_node.get("class_type") in ("UmiAIWildcardNodeLite", "UmiAIWildcardNode"):
-                            single, match_list = _umi_compute_bypass_for_node(src_node.get("inputs", {}))
-                            cached = {"single": single, "list": match_list}
-                            wildcard_cache[src_id] = cached
-                    if cached:
-                        matched_value = cached.get("single")
-                elif matched_input is not None:
-                    matched_value = bool(matched_input)
-
-            if matched_value is None:
-                umi_debug_print(f"[UmiTextBypass] Skipping node {node_id}: unable to compute matched")
-                continue
-
-            bypass_output_idx = _umi_get_bypass_output_index(inputs)
-            if bypass_output_idx is None:
-                umi_debug_print(f"[UmiTextBypass] Skipping node {node_id}: passthrough_type is linked or unknown")
-                continue
-
-            target_ids = {target_id for target_id, _, _ in targets}
-            if matched_value:
-                continue
-
-            for target_id in target_ids:
-                output_indices = _umi_collect_output_indices(downstream, target_id)
-                if len(output_indices) > 1:
-                    print(f"[UmiTextBypass] Skipping target {target_id}: multiple output indices {sorted(output_indices)}")
-                    continue
-                if output_indices and bypass_output_idx not in output_indices:
-                    print(f"[UmiTextBypass] Skipping target {target_id}: passthrough output {bypass_output_idx} does not match target output {list(output_indices)[0]}")
-                    continue
-
-                rewired = 0
-                for dst_id, input_name, _ in downstream.get(str(target_id), []):
-                    dst_node = prompt_graph.get(dst_id)
-                    if not isinstance(dst_node, dict):
-                        continue
-                    dst_inputs = dst_node.get("inputs", {})
-                    if input_name in dst_inputs and _umi_is_link_value(dst_inputs[input_name]):
-                        link_src = str(dst_inputs[input_name][0])
-                        if link_src == str(target_id):
-                            dst_inputs[input_name] = [str(node_id), int(bypass_output_idx)]
-                            rewired += 1
-
-                outputs_replaced = _umi_replace_output_nodes(prompt_payload, target_id, node_id)
-                print(f"[UmiTextBypass] Rewired target {target_id} -> bypass {node_id}: links={rewired}, outputs={outputs_replaced}")
-
-        umi_debug_print(f"[UmiTextBypass] Prompt handler complete: {bypass_nodes} bypass nodes")
-        return prompt_payload
-    except Exception as e:
-        print(f"[UmiTextBypass] Prompt handler failed: {e}")
-        return prompt_payload
-
-def _umi_has_execution_blocker():
-    try:
-        from comfy.execution import ExecutionBlocker
-        return ExecutionBlocker is not None
-    except Exception:
-        pass
-    try:
-        from comfy.utils import ExecutionBlocker
-        return ExecutionBlocker is not None
-    except Exception:
-        return False
-
-def _umi_prompt_handler_wrapper(*args, **kwargs):
-    if args:
-        prompt_payload = args[0]
-        updated = _umi_bypass_prompt_handler(prompt_payload)
-        if len(args) == 1:
-            return updated
-        if len(args) == 2:
-            return (updated, args[1])
-        return (updated,) + args[1:]
-    if "prompt" in kwargs:
-        kwargs["prompt"] = _umi_bypass_prompt_handler(kwargs["prompt"])
-    return kwargs
-
-def _umi_install_prompt_handler():
-    try:
-        ps = PromptServer.instance
-        print("[UmiTextBypass] Attempting to install backend prompt handler")
-        print("[UmiTextBypass] PromptServer attrs:", [a for a in dir(ps) if "prompt" in a.lower()])
-        if hasattr(ps, "add_on_prompt_handler"):
-            ps.add_on_prompt_handler(_umi_prompt_handler_wrapper)
-            print("[UmiTextBypass] Installed backend prompt handler via PromptServer.add_on_prompt_handler")
-            return
-        if hasattr(ps, "add_on_prompt"):
-            ps.add_on_prompt(_umi_prompt_handler_wrapper)
-            print("[UmiTextBypass] Installed backend prompt handler via PromptServer.add_on_prompt")
-            return
-
-        pq = getattr(ps, "prompt_queue", None)
-        if pq is not None:
-            print("[UmiTextBypass] prompt_queue attrs:", [a for a in dir(pq) if "prompt" in a.lower()])
-            if hasattr(pq, "add_on_prompt_handler"):
-                pq.add_on_prompt_handler(_umi_prompt_handler_wrapper)
-                print("[UmiTextBypass] Installed backend prompt handler via prompt_queue.add_on_prompt_handler")
-                return
-            if hasattr(pq, "add_on_prompt"):
-                pq.add_on_prompt(_umi_prompt_handler_wrapper)
-                print("[UmiTextBypass] Installed backend prompt handler via prompt_queue.add_on_prompt")
-                return
-            handlers = getattr(pq, "on_prompt_handlers", None)
-            if isinstance(handlers, list):
-                handlers.append(_umi_prompt_handler_wrapper)
-                print("[UmiTextBypass] Installed backend prompt handler via prompt_queue.on_prompt_handlers")
-                return
-
-        print("[UmiTextBypass] Backend prompt handler not supported; using frontend bypass")
-    except Exception as e:
-        print(f"[UmiTextBypass] Failed to install prompt handler: {e}")
-
-_umi_install_prompt_handler()
-
-@PromptServer.instance.routes.post("/umi/bypass_preview")
-async def _umi_bypass_preview(request):
-    import sys
-    try:
-        data = await request.json()
-    except Exception as e:
-        print(f"[UmiTextBypass DEBUG] JSON parse error: {e}", flush=True)
-        return web.json_response({"error": "invalid json"}, status=400)
-
-    prompt_payload = data.get("prompt")
-    if prompt_payload is None:
-        print("[UmiTextBypass DEBUG] /umi/bypass_preview: prompt_payload is None", flush=True)
-        return web.json_response({"prompt": None})
-
-    print(f"[UmiTextBypass DEBUG] /umi/bypass_preview called", flush=True)
-    print(f"[UmiTextBypass DEBUG] prompt_payload type: {type(prompt_payload)}", flush=True)
-    print(f"[UmiTextBypass DEBUG] prompt_payload keys: {list(prompt_payload.keys()) if isinstance(prompt_payload, dict) else 'not a dict'}", flush=True)
-    sys.stdout.flush()
-
-    try:
-        updated = _umi_bypass_prompt_handler(prompt_payload)
-    except Exception as e:
-        print(f"[UmiTextBypass DEBUG] Handler exception: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return web.json_response({"prompt": prompt_payload})
-    if isinstance(updated, dict) and "prompt" in updated:
-        prompt_payload = updated.get("prompt")
-    else:
-        prompt_payload = updated
-    return web.json_response({"prompt": prompt_payload})
-
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
+__all__ = [
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+    "OPTIONAL_MODULE_STATUS",
+    "CORE_API_VERSION",
+    "__version__",
+    "WEB_DIRECTORY",
+]

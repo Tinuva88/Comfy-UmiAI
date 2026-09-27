@@ -1,0 +1,14 @@
+anime portrait base:
+  prompt: "1girl, solo, upper body, looking at viewer, detailed eyes"
+  negative: "worst quality, low quality, bad anatomy"
+  description: "Simple character portrait scaffold."
+
+studio lighting:
+  prompt: "soft studio lighting, clean background, balanced composition"
+  negative: ""
+  description: "Quiet controlled lighting for character work."
+
+background detail:
+  prompt: "detailed background, environmental storytelling, coherent perspective"
+  negative: "empty background, inconsistent perspective"
+  description: "Adds scene richness without choosing a location."

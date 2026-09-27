@@ -1,0 +1,34 @@
+None:
+  positive: []
+  negative: []
+  min_words: 3
+  style: "generic"
+  description: "No model-specific defaults."
+
+Illustrious:
+  positive: ["masterpiece", "best quality", "very aesthetic", "absurdres"]
+  negative: ["worst quality", "low quality", "bad anatomy", "bad hands", "text", "watermark"]
+  min_words: 10
+  style: "anime_tags"
+  description: "Anime tag model profile with quality and artifact defaults."
+
+Pony:
+  positive: ["score_9", "score_8_up", "score_7_up", "source_anime"]
+  negative: ["score_4", "score_3", "score_2", "score_1", "bad anatomy", "bad hands"]
+  min_words: 10
+  style: "anime_tags"
+  description: "Pony-style score/source tag defaults."
+
+SDXL:
+  positive: ["high quality", "detailed", "sharp focus"]
+  negative: ["low quality", "blurry", "jpeg artifacts", "distorted", "bad anatomy"]
+  min_words: 16
+  style: "prose_or_tags"
+  description: "General SDXL-friendly quality and clarity defaults."
+
+Flux:
+  positive: []
+  negative: []
+  min_words: 24
+  style: "prose"
+  description: "Flux-style descriptive prose without forced quality tags."

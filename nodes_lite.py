@@ -1,13 +1,13 @@
-import os
-import random
+﻿import os
 import re
 import yaml
-import glob
+import hashlib
 import json
+import logging
 import csv
-import fnmatch
 import gc
-from collections import Counter, OrderedDict
+import threading
+from collections import OrderedDict
 import folder_paths
 import comfy.sd
 import comfy.utils
@@ -17,43 +17,75 @@ from datetime import datetime
 
 # Import shared utilities
 from .shared_utils import (
-    escape_unweighted_colons, parse_wildcard_weight, log_prompt_to_history, expand_prompt_files,
+    _atomic_write_json, _dedupe_keep_order, _split_prompt_tags,
+    parse_wildcard_weight, log_prompt_to_history, expand_prompt_files,
+    get_all_wildcard_paths, scan_wildcard_files,
     LogicEvaluator, DynamicPromptReplacer, VariableReplacer, NegativePromptGenerator,
     ConditionalReplacer, TagLoaderBase, TagSelectorBase, LoRAHandlerBase, TagReplacerBase,
-    CharacterReplacer, resolve_lora_alias, strip_prompt_comments
+    CharacterReplacer, resolve_lora_alias, strip_prompt_comments,
+    apply_prompt_sections, build_prompt_diff, apply_prompt_preset, expand_prompt_presets,
+    list_prompt_presets, lint_prompt_profile, list_prompt_profiles, apply_named_prompt_profile,
+    lint_prompt_join_boundaries, lint_prompt_syntax
 )
+from .prompt_parser import find_lora_spans, find_settings_spans, find_wildcard_spans, parse_angle_yaml_specs, parse_key_value_csv, parse_lora_specs, parse_wildcard_specs, remove_spans
 
-# Import UMI_SETTINGS from main nodes for syncing toggle
-from .nodes import UMI_SETTINGS, umi_debug_print
+# Import lean shared settings/debug helpers.
+from .nodes_core import UMI_SETTINGS, umi_debug_print
+from .prompt_extensions import get_anima_extension
 
 # ==============================================================================
-# GLOBAL TEXT CACHE FOR BYPASS NODE
-# Stores the last generated text from each wildcard processor node
-WILDCARD_TEXT_CACHE = {}
+def _write_run_inspector_cache(payload):
+    try:
+        cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, "run_inspector_latest.json")
+        _atomic_write_json(cache_path, payload, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        umi_debug_print(f"[UmiAI Lite] Failed to write run inspector cache: {e}")
 
 # ==============================================================================
 # GLOBAL CACHE & SETUP (LITE VERSION - ISOLATED FROM FULL NODE)
 # ==============================================================================
 GLOBAL_CACHE_LITE = {}
-GLOBAL_INDEX_LITE = {'built': False, 'files': set(), 'entries': {}, 'tags': set(), 'entry_names': {}}
+GLOBAL_INDEX_LITE = {'built': False, 'files': set(), 'entries': {}, 'tags': set(), 'entry_names': {}, 'signature': None}
 
 # Fix 12: File modification time cache to skip rescanning unchanged files
 FILE_MTIME_CACHE_LITE = {}
 
 # LRU CACHE (ISOLATED FROM FULL NODE)
 LORA_MEMORY_CACHE_LITE = OrderedDict()
+PROMPT_CACHE_LOCK = threading.RLock()
+# Iteration limits alone cannot stop a wildcard that doubles on each pass.
+MAX_EXPANDED_PROMPT_CHARS = 1_000_000
+
+
+def _check_prompt_size(text):
+    limit = _processing_limit('max_expanded_prompt_chars', MAX_EXPANDED_PROMPT_CHARS, 1000, 10_000_000)
+    if len(text) > limit:
+        raise ValueError(
+            f"Wildcard expansion exceeded {limit:,} characters. Check for recursive "
+            "wildcard files or reduce repeated sampling counts."
+        )
+
+
+def _processing_limit(name, default, minimum, maximum):
+    try:
+        value = int(UMI_SETTINGS.get(name, default))
+    except (TypeError, ValueError, OverflowError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
-def get_all_wildcard_paths():
-    """Get all wildcard paths - same as Full node for consistency"""
-    # Import the shared function
-    from .shared_utils import get_all_wildcard_paths as shared_get_paths
-    return shared_get_paths()
-
 def _get_execution_blocker_class():
     """Try to resolve ComfyUI's ExecutionBlocker without hard dependency."""
+    try:
+        # Current ComfyUI location.
+        from comfy_execution.graph import ExecutionBlocker
+        return ExecutionBlocker
+    except Exception:
+        pass
     try:
         from comfy.execution import ExecutionBlocker
         return ExecutionBlocker
@@ -65,12 +97,52 @@ def _get_execution_blocker_class():
     except Exception:
         return None
 
-# Note: escape_unweighted_colons and log_prompt_to_history are imported from shared_utils
-# Keeping lite-specific get_all_wildcard_paths() since it only searches internal wildcards
-
 # ==============================================================================
 # TAG LOADER (Lite Version - No Danbooru)
 # ==============================================================================
+def yaml_field(entry_data, name, default=None):
+    """Look a YAML entry field up without regard to key case.
+
+    YAML itself is case-sensitive, so an entry written with "tags:" and
+    "prompts:" used to match nothing at all and say nothing about why. The
+    documented spelling is still Tags/Prompts; this only stops a reasonable
+    variation from failing silently.
+    """
+    if not isinstance(entry_data, dict):
+        return default
+    if name in entry_data:
+        return entry_data[name]
+    target = str(name).strip().lower()
+    for key, value in entry_data.items():
+        if str(key).strip().lower() == target:
+            return value
+    return default
+
+
+def yaml_text_list(entry_data, name):
+    """A YAML entry field as a list of non-empty strings.
+
+    Accepts a scalar or a list. Two of the three code paths that read Prefix
+    and Suffix required a list and dropped a plain string on the floor, so the
+    same file behaved differently depending on how it was selected.
+    """
+    value = yaml_field(entry_data, name)
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    out = []
+    for item in items:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def yaml_joined(entry_data, name):
+    """Every item of a field, joined. Only the first used to be read."""
+    return ", ".join(yaml_text_list(entry_data, name))
+
+
 class TagLoader(TagLoaderBase):
     def __init__(self, wildcard_paths, options):
         super().__init__(wildcard_paths, options)
@@ -80,70 +152,76 @@ class TagLoader(TagLoaderBase):
     def build_index(self):
         # Check if cache was built with a different use_folder_paths setting
         cached_setting = GLOBAL_INDEX_LITE.get('use_folder_paths', None)
-        full_rebuild = False
+        current_signature = scan_wildcard_files(self.wildcard_paths)
+        cached_signature = GLOBAL_INDEX_LITE.get('signature')
+        self.file_catalog = []
+        self.catalog_keys = {}
+        for item in current_signature:
+            if len(item) != 4:
+                continue
+            root, relative, mtime_ns, size = item
+            record = dict(root=root, relative_path=relative,
+                          path=os.path.join(root, relative), mtime_ns=mtime_ns, size=size)
+            self.file_catalog.append(record)
+            key = os.path.splitext(relative)[0].lower()
+            for alias in {key, key.rsplit('/', 1)[-1]}:
+                self.catalog_keys.setdefault(alias, []).append(record)
 
-        if GLOBAL_INDEX_LITE['built'] and cached_setting == self.use_folder_paths:
-            # Cache exists and setting matches, but we still need to scan YAML files
-            # for potential modifications (scan_yaml_for_tags handles mtime checking)
+        if GLOBAL_INDEX_LITE['built'] and cached_setting == self.use_folder_paths and cached_signature == current_signature:
+            # Reuse the index only when every supported file is unchanged.
             self.files_index = GLOBAL_INDEX_LITE['files']
             self.umi_tags = GLOBAL_INDEX_LITE['tags']
             self.entry_names = GLOBAL_INDEX_LITE.get('entry_names', {})
-            # Rescan YAML files to check for modifications
-            for wildcard_path in self.wildcard_paths:
-                if not os.path.exists(wildcard_path):
-                    continue
-                for root, dirs, files in os.walk(wildcard_path):
-                    for file in files:
-                        if file.endswith(('.yaml', '.yml')):
-                            full_path = os.path.join(root, file)
-                            self.scan_yaml_for_tags(full_path)
+            # The signature already includes every supported file's size and
+            # nanosecond mtime. A second tree walk cannot add freshness here.
             return
 
         # Rebuild if setting changed or first build
-        if GLOBAL_INDEX_LITE['built'] and cached_setting != self.use_folder_paths:
-            umi_debug_print(f"[UmiAI Lite] Rebuilding index: use_folder_paths changed from {cached_setting} to {self.use_folder_paths}")
+        if GLOBAL_INDEX_LITE['built'] and (cached_setting != self.use_folder_paths or cached_signature != current_signature):
+            if cached_setting != self.use_folder_paths:
+                umi_debug_print(f"[UmiAI Lite] Rebuilding index: use_folder_paths changed from {cached_setting} to {self.use_folder_paths}")
+            else:
+                umi_debug_print("[UmiAI Lite] Rebuilding index: wildcard files changed")
             GLOBAL_INDEX_LITE['built'] = False  # Force rebuild
-            full_rebuild = True
 
         # Reset for fresh build
         self.files_index = set()
         self.umi_tags = set()
         self.entry_names = {}
-        if full_rebuild:
-            GLOBAL_INDEX_LITE['entries'] = {}
-            GLOBAL_INDEX_LITE['entry_names'] = {}
-            # Clear YAML mtime cache on full rebuild
-            yaml_keys = [k for k in FILE_MTIME_CACHE_LITE.keys() if k.startswith('yaml_tags_')]
-            for k in yaml_keys:
-                del FILE_MTIME_CACHE_LITE[k]
+        GLOBAL_INDEX_LITE['entries'] = {}
+        GLOBAL_INDEX_LITE['entry_names'] = {}
+        # Rebuild lookup metadata but retain parsed files with unchanged stats.
+        live_paths = {entry['path'] for entry in self.file_catalog}
+        for key, info in list(FILE_MTIME_CACHE_LITE.items()):
+            if key.startswith('yaml_tags_') or info.get('path') not in live_paths:
+                FILE_MTIME_CACHE_LITE.pop(key, None)
+                GLOBAL_CACHE_LITE.pop(key, None)
 
-        for wildcard_path in self.wildcard_paths:
-            if not os.path.exists(wildcard_path):
-                continue
-
-            for root, dirs, files in os.walk(wildcard_path):
-                for file in files:
-                    if file.endswith(('.txt', '.yaml', '.yml', '.csv')):
-                        # Toggle between filename-only and full path modes
-                        full_path = os.path.join(root, file)
-                        if self.use_folder_paths:
-                            # Full path mode: __Series/A Centaur's Life__
-                            rel_path = os.path.relpath(full_path, wildcard_path)
-                            key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
-                        else:
-                            # Filename only mode: __A Centaur's Life__
-                            key = os.path.splitext(file)[0]
-
-                        self.files_index.add(key)
-
-                        if file.endswith(('.yaml', '.yml')):
-                            self.scan_yaml_for_tags(full_path)
+        for entry in self.file_catalog:
+            relative = entry['relative_path']
+            key = os.path.splitext(relative if self.use_folder_paths else relative.rsplit('/', 1)[-1])[0]
+            self.files_index.add(key)
+            if relative.endswith(('.yaml', '.yml')):
+                self.scan_yaml_for_tags(entry['path'])
 
         GLOBAL_INDEX_LITE['built'] = True
         GLOBAL_INDEX_LITE['files'] = self.files_index
         GLOBAL_INDEX_LITE['tags'] = self.umi_tags
         GLOBAL_INDEX_LITE['entry_names'] = self.entry_names
         GLOBAL_INDEX_LITE['use_folder_paths'] = self.use_folder_paths
+        GLOBAL_INDEX_LITE['signature'] = current_signature
+
+    def _read_yaml(self, file_path):
+        stat = os.stat(file_path)
+        key = f"yaml_data_{file_path}"
+        signature = (stat.st_mtime_ns, stat.st_size)
+        cached = FILE_MTIME_CACHE_LITE.get(key)
+        if cached and cached.get('stat') == signature:
+            return cached['data']
+        with open(file_path, 'r', encoding='utf-8-sig') as handle:
+            data = yaml.safe_load(handle)
+        FILE_MTIME_CACHE_LITE[key] = {'path': file_path, 'stat': signature, 'data': data}
+        return data
 
     def scan_yaml_for_tags(self, file_path):
         try:
@@ -165,8 +243,7 @@ class TagLoader(TagLoaderBase):
                     for tag_list in GLOBAL_INDEX_LITE['entries'].values():
                         tag_list[:] = [e for e in tag_list if e['file'] != file_path]
 
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f)
+            data = self._read_yaml(file_path)
 
             if not data or not isinstance(data, dict):
                 umi_debug_print(f"[UmiAI Lite DEBUG] Skipping {os.path.basename(file_path)}: not a dict")
@@ -194,9 +271,7 @@ class TagLoader(TagLoaderBase):
                     }
                     entry_names_found.append(entry_key_str)
 
-                entry_tags = entry_data.get('Tags', [])
-                if not isinstance(entry_tags, list):
-                    entry_tags = [str(entry_tags)]
+                entry_tags = yaml_text_list(entry_data, 'Tags')
 
                 for tag in entry_tags:
                     tag = str(tag).strip()
@@ -218,101 +293,62 @@ class TagLoader(TagLoaderBase):
             if tags_found:
                 umi_debug_print(f"[UmiAI Lite DEBUG] Scanned {os.path.basename(file_path)}: found tags {tags_found[:10]}")
         except yaml.YAMLError as e:
-            print(f"[UmiAI Lite] ERROR: Malformed YAML file '{os.path.basename(file_path)}': {e}")
-            print(f"[UmiAI Lite] Skipping file. Please fix YAML syntax and refresh wildcards.")
+            logging.error(f"[UmiAI Lite] Malformed YAML file '{os.path.basename(file_path)}', skipped. Fix the syntax and refresh wildcards: {e}")
         except UnicodeDecodeError as e:
-            print(f"[UmiAI Lite] ERROR: Encoding issue in '{os.path.basename(file_path)}': {e}")
-            print(f"[UmiAI Lite] File must be UTF-8 encoded. Skipping file.")
+            logging.error(f"[UmiAI Lite] '{os.path.basename(file_path)}' is not UTF-8, skipped: {e}")
         except Exception as e:
-            print(f"[UmiAI Lite] WARNING: Error scanning YAML '{os.path.basename(file_path)}': {e}")
-            print(f"[UmiAI Lite] Skipping file and continuing...")
+            logging.warning(f"[UmiAI Lite] Could not scan YAML '{os.path.basename(file_path)}', skipped: {e}")
 
-    def load_globals(self):
-        globals_dict = {}
-        for wildcard_path in self.wildcard_paths:
-            globals_file = os.path.join(wildcard_path, "globals.yaml")
-            if os.path.exists(globals_file):
-                try:
-                    with open(globals_file, 'r', encoding='utf-8') as f:
-                        data = yaml.safe_load(f)
-
-                    if isinstance(data, dict):
-                        for k, v in data.items():
-                            if k.startswith('$'):
-                                globals_dict[k] = v
-                except yaml.YAMLError as e:
-                    print(f"[UmiAI Lite] ERROR: Malformed globals.yaml: {e}")
-                    print(f"[UmiAI Lite] Global variables will not be loaded. Please fix YAML syntax.")
-                except UnicodeDecodeError as e:
-                    print(f"[UmiAI Lite] ERROR: Encoding issue in globals.yaml: {e}")
-                except Exception as e:
-                    print(f"[UmiAI Lite] WARNING: Error loading globals.yaml: {e}")
-        return globals_dict
+    # load_globals is inherited from TagLoaderBase.
 
     def load_from_file(self, file_key):
+        file_key = file_key.replace("\\", "/")
         cache_key = f"file_{file_key}"
+        self.last_loaded_file_info = None
+        candidates = self.catalog_keys.get(file_key.lower(), [])
+        signature = tuple((e['path'], e['mtime_ns'], e['size']) for e in candidates)
+        cached_info = FILE_MTIME_CACHE_LITE.get(cache_key, {})
+        if cache_key in GLOBAL_CACHE_LITE and cached_info.get('candidates') == signature:
+            self.last_loaded_file_info = dict(cached_info, cache_hit=True)
+            return GLOBAL_CACHE_LITE[cache_key]
 
-        # Fix 12: Check modification time before using cached data
-        if cache_key in GLOBAL_CACHE_LITE:
-            cached_path = FILE_MTIME_CACHE_LITE.get(cache_key, {}).get('path')
-            if cached_path and os.path.exists(cached_path):
-                current_mtime = os.path.getmtime(cached_path)
-                cached_mtime = FILE_MTIME_CACHE_LITE.get(cache_key, {}).get('mtime', 0)
-                if current_mtime == cached_mtime:
-                    return GLOBAL_CACHE_LITE[cache_key]
-                else:
-                    # File has been modified, invalidate cache
-                    if self.verbose:
-                        print(f"[UmiAI Lite] File '{file_key}' modified, reloading...")
+        empty_info = None
+        for entry in candidates:
+            self.last_load_error = None
+            result = self.load_file(entry['path'])
+            info = dict(entry, mtime=entry['mtime_ns'] / 1e9, candidates=signature)
+            if not result:
+                info['empty_match'] = True
+                if self.last_load_error:
+                    info['error'] = self.last_load_error
+                if empty_info is None:
+                    empty_info = info
+                continue
+            GLOBAL_CACHE_LITE[cache_key] = result
+            FILE_MTIME_CACHE_LITE[cache_key] = info
+            self.last_loaded_file_info = dict(info, cache_hit=False)
+            return result
 
-        file_key_lower = file_key.lower()
-        
-        for wildcard_path in self.wildcard_paths:
-            for root, dirs, files in os.walk(wildcard_path):
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    
-                    # Support both path-based and filename-only matching
-                    name_without_ext = os.path.splitext(file)[0]
-                    
-                    # Path-based match: relative path from wildcard folder
-                    rel_path = os.path.relpath(full_path, wildcard_path)
-                    path_key = os.path.splitext(rel_path)[0].replace(os.sep, '/')
-                    
-                    # Match against either filename-only or full path
-                    if name_without_ext.lower() == file_key_lower or path_key.lower() == file_key_lower:
-                        result = self.load_file(full_path)
-                        GLOBAL_CACHE_LITE[cache_key] = result
-                        # Cache modification time
-                        FILE_MTIME_CACHE_LITE[cache_key] = {
-                            'path': full_path,
-                            'mtime': os.path.getmtime(full_path)
-                        }
-                        return result
-
+        info = empty_info or {'missing': True, 'candidates': signature}
         GLOBAL_CACHE_LITE[cache_key] = []
+        FILE_MTIME_CACHE_LITE[cache_key] = info
+        self.last_loaded_file_info = dict(info, cache_hit=False)
         return []
 
     def load_prompt_file(self, file_key):
-        """Phase 6: Load entire .txt file content as a prompt (no parsing)"""
-        key = self.resolve_wildcard_alias(file_key.strip())
+        key = self.resolve_wildcard_alias(file_key.strip()).replace("\\", "/")
         if key.lower().endswith('.txt'):
             key = key[:-4]
-        file_key_lower = key.lower()
-        for wildcard_path in self.wildcard_paths:
-            for root, dirs, files in os.walk(wildcard_path):
-                for file in files:
-                    name_without_ext = os.path.splitext(file)[0]
-                    if name_without_ext.lower() == file_key_lower and file.endswith('.txt'):
-                        full_path = os.path.join(root, file)
-                        try:
-                            with open(full_path, 'r', encoding='utf-8') as f:
-                                content = f.read().strip()
-                            return strip_prompt_comments(content)
-                        except Exception as e:
-                            if self.verbose:
-                                print(f"[UmiAI Lite] Error reading prompt file {full_path}: {e}")
-                            return None
+        if os.path.isabs(key) or '..' in key.split('/'):
+            return None
+        for entry in self.catalog_keys.get(key.lower(), []):
+            if not entry['relative_path'].endswith('.txt'):
+                continue
+            try:
+                with open(entry['path'], 'r', encoding='utf-8-sig') as handle:
+                    return strip_prompt_comments(handle.read().strip())
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(f'Prompt file "{key}" could not be read: {exc}') from exc
         return None
 
     def load_file(self, file_path):
@@ -324,12 +360,12 @@ class TagLoader(TagLoaderBase):
             elif file_path.endswith('.csv'):
                 return self.load_csv_file(file_path)
         except Exception as e:
-            if self.verbose:
-                print(f"[UmiAI Lite] Error loading file {file_path}: {e}")
+            self.last_load_error = str(e)
+            logging.warning(f"[UmiAI Lite] Wildcard file '{file_path}' could not be read: {e}")
         return []
 
     def load_txt_file(self, file_path):
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             raw_lines = f.read().splitlines()
         lines = []
         def strip_double_slash_comments(line):
@@ -358,8 +394,10 @@ class TagLoader(TagLoaderBase):
                 line = strip_double_slash_comments(line)
                 if not line:
                     continue
-            if '#' in line:
-                line = line.split('#')[0].strip()
+            # Inline comments need a space before '#' so entries containing a
+            # bare '#' (e.g. "deep#blue") survive. Matches strip_prompt_comments.
+            if ' #' in line:
+                line = line.split(' #')[0].strip()
             if line:
                 lines.append(line)
 
@@ -373,43 +411,49 @@ class TagLoader(TagLoaderBase):
 
     def load_yaml_file(self, file_path):
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f)
+            data = self._read_yaml(file_path)
 
             if not isinstance(data, dict):
-                print(f"[UmiAI Lite] WARNING: YAML file '{os.path.basename(file_path)}' does not contain a dictionary. Skipping.")
+                logging.warning(f"[UmiAI Lite] YAML file '{os.path.basename(file_path)}' does not contain a dictionary. Skipping.")
                 return []
 
             entries = []
             for entry_key, entry_data in data.items():
                 if isinstance(entry_data, dict):
-                    prompts = entry_data.get('Prompts', [])
-                    if isinstance(prompts, str):
-                        prompts = [prompts]
+                    prompts = yaml_text_list(entry_data, 'Prompts')
+                    # Tags were dropped here, so __file[tag]__ filtered against
+                    # an empty tag list and could never match -- a documented
+                    # form that always reported no matches.
+                    entry_tags = yaml_text_list(entry_data, 'Tags')
 
                     for prompt in prompts:
                         entries.append({
                             'value': prompt,
-                            'prefix': entry_data.get('Prefix', [''])[0] if isinstance(entry_data.get('Prefix'), list) else '',
-                            'suffix': entry_data.get('Suffix', [''])[0] if isinstance(entry_data.get('Suffix'), list) else '',
-                            'neg_prefix': entry_data.get('Neg_Prefix', [''])[0] if isinstance(entry_data.get('Neg_Prefix'), list) else '',
-                            'neg_suffix': entry_data.get('Neg_Suffix', [''])[0] if isinstance(entry_data.get('Neg_Suffix'), list) else '',
+                            'tags': entry_tags,
+                            'entry_key': entry_key,
+                            'description': yaml_joined(entry_data, 'Description'),
+                            'prefix': yaml_joined(entry_data, 'Prefix'),
+                            'suffix': yaml_joined(entry_data, 'Suffix'),
+                            'neg_prefix': yaml_joined(entry_data, 'Neg_Prefix'),
+                            'neg_suffix': yaml_joined(entry_data, 'Neg_Suffix'),
                         })
 
             return entries
         except yaml.YAMLError as e:
-            print(f"[UmiAI Lite] ERROR: Malformed YAML file '{os.path.basename(file_path)}': {e}")
-            print(f"[UmiAI Lite] Returning empty list. Please fix YAML syntax.")
+            self.last_load_error = str(e)
+            logging.error(f"[UmiAI Lite] Malformed YAML file '{os.path.basename(file_path)}'; fix the syntax: {e}")
             return []
         except UnicodeDecodeError as e:
-            print(f"[UmiAI Lite] ERROR: Encoding issue in '{os.path.basename(file_path)}': {e}")
+            self.last_load_error = str(e)
+            logging.error(f"[UmiAI Lite] Encoding issue in '{os.path.basename(file_path)}': {e}")
             return []
         except Exception as e:
-            print(f"[UmiAI Lite] WARNING: Error loading YAML '{os.path.basename(file_path)}': {e}")
+            self.last_load_error = str(e)
+            logging.warning(f"[UmiAI Lite] Error loading YAML '{os.path.basename(file_path)}': {e}")
             return []
 
     def load_csv_file(self, file_path):
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             rows = list(reader)
 
@@ -433,9 +477,14 @@ class TagSelector(TagSelectorBase):
         self.suffixes = []
         self.neg_prefixes = []
         self.neg_suffixes = []
+        self.wildcard_trace = []
+        self.diagnostics = []
 
     def clear_seeded_values(self):
         self.seeded_values.clear()
+        self.scoped_negatives = []
+        self.wildcard_trace = []
+        self.diagnostics = []
 
     def update_variables(self, variables):
         self.variables = variables
@@ -473,6 +522,31 @@ class TagSelector(TagSelectorBase):
 
         return selected
 
+    def _entry_index(self, entries, entry):
+        try:
+            return entries.index(entry)
+        except ValueError:
+            return None
+
+    def _trace_file_info(self):
+        info = getattr(self.tag_loader, "last_loaded_file_info", None) or {}
+        return {
+            "path": info.get("path"),
+            "root": info.get("root"),
+            "relative_path": info.get("relative_path"),
+            "cache_hit": bool(info.get("cache_hit")),
+        }
+
+    def _record_wildcard_trace(self, **kwargs):
+        record = {
+            "seed": self.seed,
+            "rng_streams": self.rng_streams_enabled,
+            **self._trace_file_info(),
+            "type": "wildcard",
+            **kwargs,
+        }
+        self.wildcard_trace.append(record)
+
     def select(self, tag_key, count=1, logic_filter=None, sequential=False):
         self.init_debug_context()
         self.init_trace_context()
@@ -481,40 +555,55 @@ class TagSelector(TagSelectorBase):
             scope_override, tag_key = tag_key[1:].split(':', 1)
             scope_override = scope_override.strip()
             tag_key = tag_key.strip()
+        if scope_override is None:
+            scope_override = getattr(self, 'assignment_scope', None)
         rng = self.get_rng(scope_override or tag_key)
         tag_key = self.tag_loader.resolve_wildcard_alias(tag_key)
+        # Cache identity must include the scope and the requested count, or
+        # sibling variables collide and __x__/__2$$x__ swap values.
+        if scope_override is None and count == 1:
+            cache_key = tag_key
+        else:
+            cache_key = ''.join((tag_key, scope_override or '', str(count)))
         entries = self.tag_loader.load_from_file(tag_key)
 
         if not entries:
             # Fix 11: Better error messages - provide helpful feedback for missing wildcards
             error_msg = f"[WILDCARD_NOT_FOUND: {tag_key}]"
-            print(f"[UmiAI Lite] WARNING: Wildcard file '{tag_key}' not found or is empty.")
+            info = getattr(self.tag_loader, 'last_loaded_file_info', None) or {}
+            if info.get('error'):
+                reason = f'Wildcard "{tag_key}" could not be read: {info["error"]}'
+            elif info.get('empty_match'):
+                reason = f'Wildcard "{tag_key}" contains no usable candidates (check blank/comment lines or YAML Prompts).'
+            else:
+                reason = f'Wildcard "{tag_key}" could not be found in the configured wildcard folders.'
+            if reason not in self.diagnostics:
+                self.diagnostics.append(reason)
+            logging.warning(f"[UmiAI Lite] {reason}")
+            self._record_wildcard_trace(
+                wildcard=tag_key,
+                scope=scope_override,
+                mode="missing",
+                count=0,
+                values=[],
+                result=error_msg,
+                error=error_msg,
+                diagnostic=reason,
+            )
             if self.is_failfast_enabled():
                 return f"<<ERROR_WILDCARD_NOT_FOUND:{tag_key}>>"
             return error_msg
 
-        if tag_key in self.seeded_values and not logic_filter and not sequential:
-            return self.seeded_values[tag_key]
-
-        # Phase 6: Sequential selection - use seed to pick same index
-        if sequential and entries:
-            if self.rng_streams_enabled:
-                idx = self.get_scoped_index(scope_override or tag_key, len(entries))
-            else:
-                idx = self.seed % len(entries)
-            selected_entry = entries[idx]
-            result = selected_entry['value']
-            self.seeded_values[tag_key] = result
-            if self.is_debug_enabled():
-                self.variables['debug_last_type'] = "wildcard"
-                self.variables['debug_last_source'] = tag_key
-                self.variables['debug_last_pick'] = str(result)
-            self.set_trace_info({
-                "trace_last_type": "wildcard",
-                "trace_last_source": tag_key,
-                "trace_last_pick": str(result),
-            })
-            return result
+        if cache_key in self.seeded_values and not logic_filter and not sequential:
+            self._record_wildcard_trace(
+                wildcard=tag_key,
+                scope=scope_override,
+                mode="cached",
+                count=1,
+                values=[self.seeded_values[cache_key]],
+                result=self.seeded_values[cache_key],
+            )
+            return self.seeded_values[cache_key]
 
         # Phase 5: Filter entries by logic expression if provided
         if logic_filter:
@@ -528,26 +617,65 @@ class TagSelector(TagSelectorBase):
 
             if not filtered_entries:
                 error_msg = f"[NO_MATCHES: {logic_filter} in {tag_key}]"
-                print(f"[UmiAI Lite] WARNING: No entries in '{tag_key}' matched logic '{logic_filter}'.")
+                logging.warning(f"[UmiAI Lite] No entries in '{tag_key}' matched logic '{logic_filter}'.")
                 if self.is_failfast_enabled():
                     return f"<<ERROR_NO_MATCHES:{logic_filter} in {tag_key}>>"
+                self._record_wildcard_trace(
+                    wildcard=tag_key,
+                    scope=scope_override,
+                    mode="logic",
+                    logic_filter=logic_filter,
+                    count=0,
+                    values=[],
+                    result=error_msg,
+                    error=error_msg,
+                )
                 return error_msg
 
             entries = filtered_entries
 
+        # A scope-qualified request avoids values this file already handed to
+        # another scope, so sibling variables differ where the pool allows.
+        # When the pool cannot cover the request it recycles.
+        if scope_override is not None and not logic_filter and not sequential:
+            emitted = getattr(self, 'emitted_values', None)
+            if emitted is None:
+                emitted = self.emitted_values = {}
+            seen = emitted.setdefault(tag_key, set())
+            fresh = [e for e in entries if e['value'] not in seen]
+            if len(fresh) >= count:
+                entries = fresh
+            elif fresh or seen:
+                seen.clear()
+
         # Fix 13: Weighted selection - use weights if present
         has_weights = any(entry.get('weight', 1.0) != 1.0 for entry in entries)
 
-        if has_weights:
+        if sequential:
+            # Apply filters first, then walk the eligible pool by seed.
+            # Use the shared metadata path for YAML decorations and CSV columns.
+            idx = self.seed % len(entries)
+            take = max(0, min(count, len(entries)))
+            selected_entries = [entries[(idx + offset) % len(entries)] for offset in range(take)]
+            mode = "sequential"
+        elif has_weights:
             # Weighted random selection
             selected_entries = self._weighted_sample(entries, min(count, len(entries)), rng=rng)
+            mode = "weighted"
         else:
             # Normal random selection
             selected_entries = rng.sample(entries, min(count, len(entries)))
+            mode = "random"
 
         result_parts = []
+        selected_indices = []
+        selected_tags = []
+        selected_weights = []
         for entry in selected_entries:
             result_parts.append(entry['value'])
+            selected_indices.append(self._entry_index(entries, entry))
+            selected_tags.append(entry.get('tags', []))
+            selected_weights.append(entry.get('weight', 1.0))
 
             if entry.get('prefix'):
                 self.prefixes.append(entry['prefix'])
@@ -591,74 +719,110 @@ class TagSelector(TagSelectorBase):
             "trace_last_source": tag_key,
             "trace_last_pick": result,
         })
-        self.seeded_values[tag_key] = result
+        if not logic_filter and not sequential:
+            self.seeded_values[cache_key] = result
+        if scope_override is not None and not logic_filter and not sequential:
+            self.emitted_values.setdefault(tag_key, set()).update(result_parts)
+        self._record_wildcard_trace(
+            wildcard=tag_key,
+            scope=scope_override,
+            mode="sequential" if sequential else ("logic" if logic_filter else mode),
+            logic_filter=logic_filter,
+            count=len(selected_entries),
+            available_count=len(entries),
+            selected_indices=selected_indices,
+            values=result_parts,
+            tags=selected_tags,
+            weights=selected_weights,
+            result=result,
+        )
         return result
 
     def select_by_tags(self, logic_expression):
         cache_key = f"logic_{logic_expression}"
         if cache_key in self.seeded_values:
+            self._record_wildcard_trace(
+                type="yaml",
+                wildcard=logic_expression,
+                mode="cached",
+                count=1,
+                values=[self.seeded_values[cache_key]],
+                result=self.seeded_values[cache_key],
+            )
             return self.seeded_values[cache_key]
 
         evaluator = LogicEvaluator(logic_expression, self.variables)
         rng = self.get_rng(logic_expression)
 
         # Debug logging - VERBOSE
+        debug_enabled = UMI_SETTINGS.get('enable_debug_output', False)
         total_tags = len(GLOBAL_INDEX_LITE['entries'])
-        umi_debug_print(f"[UmiAI Lite DEBUG] select_by_tags('{logic_expression}'): {total_tags} tags indexed, GLOBAL_INDEX_LITE['built']={GLOBAL_INDEX_LITE['built']}")
-        umi_debug_print(f"[UmiAI Lite DEBUG] GLOBAL_INDEX_LITE id: {id(GLOBAL_INDEX_LITE)}, entries id: {id(GLOBAL_INDEX_LITE['entries'])}")
-        if total_tags > 0:
-            umi_debug_print(f"[UmiAI Lite DEBUG] Available tags: {list(GLOBAL_INDEX_LITE['entries'].keys())[:20]}")
-        else:
-            umi_debug_print(f"[UmiAI Lite DEBUG] WARNING: entries dict is EMPTY! umi_tags has {len(GLOBAL_INDEX_LITE.get('tags', set()))} items")
-        import sys
-        sys.stdout.flush()
+        if debug_enabled:
+            umi_debug_print(f"[UmiAI Lite DEBUG] select_by_tags('{logic_expression}'): {total_tags} tags indexed, GLOBAL_INDEX_LITE['built']={GLOBAL_INDEX_LITE['built']}")
+            umi_debug_print(f"[UmiAI Lite DEBUG] GLOBAL_INDEX_LITE id: {id(GLOBAL_INDEX_LITE)}, entries id: {id(GLOBAL_INDEX_LITE['entries'])}")
+            if total_tags > 0:
+                umi_debug_print(f"[UmiAI Lite DEBUG] Available tags: {list(GLOBAL_INDEX_LITE['entries'].keys())[:20]}")
+            else:
+                umi_debug_print(f"[UmiAI Lite DEBUG] WARNING: entries dict is EMPTY! umi_tags has {len(GLOBAL_INDEX_LITE.get('tags', set()))} items")
 
         matching_entries = []
+        seen_matches = set()
         debug_count = 0
         total_entries_checked = 0
         for tag_lower, entry_list in GLOBAL_INDEX_LITE['entries'].items():
             total_entries_checked += len(entry_list)
             for entry_info in entry_list:
                 entry_data = entry_info['data']
-                entry_tags = entry_data.get('Tags', [])
-
-                if not isinstance(entry_tags, list):
-                    entry_tags = [str(entry_tags)]
-
-                tag_dict = {str(t).strip().lower(): True for t in entry_tags}
+                entry_tags = yaml_text_list(entry_data, 'Tags')
+                tag_dict = {t.lower(): True for t in entry_tags}
 
                 # Debug: show first few evaluations
                 result = evaluator.evaluate(tag_dict)
-                if debug_count < 5:
+                if debug_enabled and debug_count < 5:
                     umi_debug_print(f"[UmiAI Lite DEBUG] Checking entry '{entry_info.get('entry_key', 'unknown')}': tag_dict={tag_dict}, expression='{logic_expression}', result={result}")
                     debug_count += 1
                     
                 if result:
-                    prompts = entry_data.get('Prompts', [])
-                    if isinstance(prompts, str):
-                        prompts = [prompts]
+                    prompts = yaml_text_list(entry_data, 'Prompts')
 
                     for prompt in prompts:
+                        dedupe_key = (
+                            entry_info.get('file'),
+                            str(entry_info.get('entry_key')),
+                            str(prompt),
+                        )
+                        if dedupe_key in seen_matches:
+                            continue
+                        seen_matches.add(dedupe_key)
                         matching_entries.append({
                             'value': prompt,
-                            'prefix': entry_data.get('Prefix', [''])[0] if isinstance(entry_data.get('Prefix'), list) else '',
-                            'suffix': entry_data.get('Suffix', [''])[0] if isinstance(entry_data.get('Suffix'), list) else '',
-                            'neg_prefix': entry_data.get('Neg_Prefix', [''])[0] if isinstance(entry_data.get('Neg_Prefix'), list) else '',
-                            'neg_suffix': entry_data.get('Neg_Suffix', [''])[0] if isinstance(entry_data.get('Neg_Suffix'), list) else '',
+                            'prefix': yaml_joined(entry_data, 'Prefix'),
+                            'suffix': yaml_joined(entry_data, 'Suffix'),
+                            'neg_prefix': yaml_joined(entry_data, 'Neg_Prefix'),
+                            'neg_suffix': yaml_joined(entry_data, 'Neg_Suffix'),
                             'entry_key': entry_info.get('entry_key'),
                             'tags': entry_tags,
-                            'description': entry_data.get('Description', [''])[0] if isinstance(entry_data.get('Description'), list) else entry_data.get('Description', ''),
+                            'description': yaml_joined(entry_data, 'Description'),
                         })
 
         if not matching_entries:
             # Fix 11: Better error messages - show which logic expression failed to match
             error_msg = f"[NO_MATCHES: {logic_expression}]"
             umi_debug_print(f"[UmiAI Lite DEBUG] Loop complete: checked {total_entries_checked} entries, found {len(matching_entries)} matches for '{logic_expression}'")
-            print(f"[UmiAI Lite] WARNING: No YAML entries matched logic expression '{logic_expression}'.")
-            sys.stdout.flush()
+            logging.warning(f"[UmiAI Lite] No YAML entries matched logic expression '{logic_expression}'.")
             if self.is_failfast_enabled():
                 error_msg = f"<<ERROR_NO_MATCHES:{logic_expression}>>"
             self.seeded_values[cache_key] = error_msg
+            self._record_wildcard_trace(
+                type="yaml",
+                wildcard=logic_expression,
+                mode="no_matches",
+                count=0,
+                values=[],
+                result=error_msg,
+                error=error_msg,
+                available_count=0,
+            )
             return error_msg
 
         selected = rng.choice(matching_entries)
@@ -690,6 +854,18 @@ class TagSelector(TagSelectorBase):
 
         result = selected['value']
         self.seeded_values[cache_key] = result
+        self._record_wildcard_trace(
+            type="yaml",
+            wildcard=logic_expression,
+            mode="logic_tags",
+            count=1,
+            available_count=len(matching_entries),
+            selected_indices=[self._entry_index(matching_entries, selected)],
+            entry_key=selected.get('entry_key'),
+            values=[result],
+            tags=[selected.get('tags', [])],
+            result=result,
+        )
         return result
 
     def get_prefixes_and_suffixes(self):
@@ -710,55 +886,81 @@ class TagReplacer(TagReplacerBase):
 
     def replace(self, text):
         # Escape mechanism: Replace \__ and \{ with placeholders to preserve literal syntax
-        ESCAPED_WILDCARD = "___ESCAPED_WILDCARD___"
-        ESCAPED_CHOICE = "___ESCAPED_CHOICE___"
+        ESCAPED_WILDCARD = "\u0000UMI_ESC_WILDCARD\u0000"
+        ESCAPED_CHOICE = "\u0000UMI_ESC_CHOICE\u0000"
 
         text = text.replace(r'\__', ESCAPED_WILDCARD)
         text = text.replace(r'\{', ESCAPED_CHOICE)
 
-        pattern = r'__(\d+)-(\d+)\$\$([^_]+)__'
+        def _is_error_result(result):
+            return (
+                result.startswith("[WILDCARD_NOT_FOUND:")
+                or result.startswith("[NO_MATCHES:")
+                or result.startswith("[PROMPT_FILE_NOT_FOUND:")
+                or result.startswith("[PROMPT_FILE_ERROR:")
+                or result.startswith("<<ERROR_")
+            )
 
-        def range_replacer(match):
-            min_val = int(match.group(1))
-            max_val = int(match.group(2))
-            tag_key = match.group(3)
+        def _resolve_wildcard_spec(spec):
+            try:
+                if spec.kind == "yaml_logic":
+                    result = self.tag_selector.select_by_tags(spec.logic)
+                elif spec.kind == "file_logic":
+                    result = self.tag_selector.select(spec.key, count=1, logic_filter=spec.logic, sequential=spec.sequential)
+                elif spec.kind == "range":
+                    scope_key = spec.key
+                    if scope_key.startswith('@') and ':' in scope_key:
+                        scope_key = scope_key[1:].split(':', 1)[0].strip()
+                    rng = self.tag_selector.get_rng(scope_key)
+                    count = rng.randint(spec.count_min, spec.count_max)
+                    result = self.tag_selector.select(spec.key, count, sequential=spec.sequential)
+                elif spec.kind == "prompt_file":
+                    file_content = self.tag_selector.tag_loader.load_prompt_file(spec.key)
+                    result = file_content if file_content else f"[PROMPT_FILE_NOT_FOUND: {spec.key}]"
+                else:
+                    result = self.tag_selector.select(spec.key, sequential=spec.sequential)
+            except Exception as e:
+                result = f"[PROMPT_FILE_ERROR: {spec.key}: {str(e)}]" if spec.kind == "prompt_file" else f"<<ERROR_WILDCARD:{spec.key}:{str(e)}>>"
 
-            scope_key = tag_key
-            if tag_key.startswith('@') and ':' in tag_key:
-                scope_key = tag_key[1:].split(':', 1)[0].strip()
-            rng = self.tag_selector.get_rng(scope_key)
-            count = rng.randint(min_val, max_val)
-            return self.tag_selector.select(tag_key, count)
+            if spec.fallback and _is_error_result(result):
+                return spec.fallback
+            return result
 
-        text = re.sub(pattern, range_replacer, text)
+        wildcard_specs = parse_wildcard_specs(text)
+        if wildcard_specs:
+            parts = []
+            cursor = 0
+            for spec in wildcard_specs:
+                if spec.span.start < cursor:
+                    continue
+                parts.append(text[cursor:spec.span.start])
+                parts.append(_resolve_wildcard_spec(spec))
+                cursor = spec.span.end
+            parts.append(text[cursor:])
+            text = "".join(parts)
 
-        pattern_logic = r'__\[([^\]]+)\]__'
-
-        def logic_replacer(match):
-            logic_expr = match.group(1)
-            return self.tag_selector.select_by_tags(logic_expr)
-
-        text = re.sub(pattern_logic, logic_replacer, text)
-
-        pattern_angle = r'<\[([^\]]+)\]>'
-
-        def angle_replacer(match):
-            expression = match.group(1)
+        def _resolve_angle_yaml_spec(spec):
+            expression = spec.key
             expression_lower = expression.lower()
             
             # Check if expression is a direct entry name (Option A: make strings work)
             if expression_lower in GLOBAL_INDEX_LITE['entry_names']:
                 entry_info = GLOBAL_INDEX_LITE['entry_names'][expression_lower]
                 entry_data = entry_info['data']
-                prompts = entry_data.get('Prompts', [])
-                
-                # Convert prompts to list if it's a string
-                if isinstance(prompts, str):
-                    prompts = [prompts]
-                
+                prompts = yaml_text_list(entry_data, 'Prompts')
+
                 if prompts:
                     rng = self.tag_selector.get_rng(expression)
                     selected_prompt = rng.choice(prompts)
+                    for field, sink in (
+                        ('Prefix', self.tag_selector.prefixes),
+                        ('Suffix', self.tag_selector.suffixes),
+                        ('Neg_Prefix', self.tag_selector.neg_prefixes),
+                        ('Neg_Suffix', self.tag_selector.neg_suffixes),
+                    ):
+                        text = yaml_joined(entry_data, field)
+                        if text:
+                            sink.append(text)
                     umi_debug_print(f"[UmiAI Lite DEBUG] <[{expression}]> matched entry name, selected prompt: {selected_prompt[:50]}")
                     return selected_prompt
                 else:
@@ -769,63 +971,42 @@ class TagReplacer(TagReplacerBase):
             umi_debug_print(f"[UmiAI Lite DEBUG] <[{expression}]> not a direct entry name, treating as logic filter")
             return self.tag_selector.select_by_tags(expression)
 
-        text = re.sub(pattern_angle, angle_replacer, text)
+        angle_yaml_specs = parse_angle_yaml_specs(text)
+        if angle_yaml_specs:
+            parts = []
+            cursor = 0
+            for spec in angle_yaml_specs:
+                if spec.span.start < cursor:
+                    continue
+                parts.append(text[cursor:spec.span.start])
+                parts.append(_resolve_angle_yaml_spec(spec))
+                cursor = spec.span.end
+            parts.append(text[cursor:])
+            text = "".join(parts)
 
-        # Phase 5: Support __filename[logic]__ syntax for .txt wildcards with logic
-        pattern_file_logic = r'__([a-zA-Z0-9_-]+)\[([^\]]+)\]__'
+        # If a user accidentally writes "__wildcard____ text", the valid wildcard
+        # resolves first and leaves "__ text"; do not let that malformed opener
+        # consume everything until the next wildcard on a later pass.
+        #
+        # Only lines whose delimiters are genuinely unbalanced are touched. The
+        # same pattern matches the *closing* "__" of a valid wildcard, so
+        # collapsing unconditionally corrupted anything a nested expansion
+        # revealed: a wildcard file containing "__a__ tail" became "__a tail"
+        # and then resolved to nothing at all.
+        def _collapse_dangling(line):
+            if line.count("__") % 2 == 0:
+                return line
+            return re.sub(r'__\s+(?=[A-Za-z0-9])', ' ', line)
 
-        def file_logic_replacer(match):
-            filename = match.group(1)
-            logic_expr = match.group(2)
-            return self.tag_selector.select(filename, count=1, logic_filter=logic_expr)
-
-        text = re.sub(pattern_file_logic, file_logic_replacer, text)
-
-        # Phase 6: Support __@filename__ syntax to load full file content as prompt
-        pattern_prompt_file = r'__@([a-zA-Z0-9_-]+)__'
-
-        def prompt_file_replacer(match):
-            filename = match.group(1)
-            try:
-                file_content = self.tag_selector.tag_loader.load_prompt_file(filename)
-                if file_content:
-                    return file_content
-                else:
-                    return f"[PROMPT_FILE_NOT_FOUND: {filename}]"
-            except Exception as e:
-                return f"[PROMPT_FILE_ERROR: {filename}: {str(e)}]"
-
-        text = re.sub(pattern_prompt_file, prompt_file_replacer, text)
-
-        pattern_simple = r'__([^_]+)__'
-
-        def simple_replacer(match):
-            tag_key = match.group(1)
-            # Phase 6: Support ~sequential prefix
-            sequential = False
-            if tag_key.startswith('~'):
-                sequential = True
-                tag_key = tag_key[1:]
-            # Phase 6: Support @prompt file prefix
-            if tag_key.startswith('@') and ':' not in tag_key:
-                try:
-                    file_content = self.tag_selector.tag_loader.load_prompt_file(tag_key[1:])
-                    if file_content:
-                        return file_content
-                    else:
-                        return f"[PROMPT_FILE_NOT_FOUND: {tag_key[1:]}]"
-                except Exception as e:
-                    return f"[PROMPT_FILE_ERROR: {tag_key[1:]}: {str(e)}]"
-            return self.tag_selector.select(tag_key, sequential=sequential)
-
-        text = re.sub(pattern_simple, simple_replacer, text)
+        text = "\n".join(_collapse_dangling(line) for line in text.split("\n"))
 
         # Process function tags ([shuffle:], [clean:])
         text = self.replace_functions(text)
 
-        # Restore escaped syntax
-        text = text.replace(ESCAPED_WILDCARD, '__')
-        text = text.replace(ESCAPED_CHOICE, '{')
+        # Keep escaped syntax escaped across multi-pass prompt expansion. The
+        # node restores the literal characters after expansion is complete.
+        text = text.replace(ESCAPED_WILDCARD, r'\__')
+        text = text.replace(ESCAPED_CHOICE, r'\{')
 
         return text
 
@@ -932,12 +1113,58 @@ class LoRAHandler(LoRAHandlerBase):
     def __init__(self):
         super().__init__()
         self._cache_dir = os.path.dirname(__file__)
+        self.load_trace = []
+
+    def _resolve_lora_path(self, lora_name):
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+
+        if lora_path is None:
+            all_loras = folder_paths.get_filename_list("loras")
+            for lora_file in all_loras:
+                lora_base = os.path.splitext(os.path.basename(lora_file))[0]
+                if lora_base.lower() == lora_name.lower():
+                    lora_path = folder_paths.get_full_path("loras", lora_file)
+                    break
+
+        return lora_path
+
+    def _lora_weights_cache_key(self, lora_path):
+        try:
+            stat = os.stat(lora_path)
+            return f"weights_v2|{lora_path}|{stat.st_mtime_ns}|{stat.st_size}"
+        except OSError:
+            return f"weights_v2|{lora_path}"
+
+    def _load_lora_weights(self, lora_path, cache_limit):
+        with PROMPT_CACHE_LOCK:
+            return self._load_lora_weights_locked(lora_path, cache_limit)
+
+    def _load_lora_weights_locked(self, lora_path, cache_limit):
+        cache_key = self._lora_weights_cache_key(lora_path)
+
+        if cache_limit > 0 and cache_key in LORA_MEMORY_CACHE_LITE:
+            LORA_MEMORY_CACHE_LITE.move_to_end(cache_key)
+            return LORA_MEMORY_CACHE_LITE[cache_key], True
+
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+
+        if cache_limit > 0:
+            LORA_MEMORY_CACHE_LITE[cache_key] = lora
+            LORA_MEMORY_CACHE_LITE.move_to_end(cache_key)
+
+            while len(LORA_MEMORY_CACHE_LITE) > cache_limit:
+                oldest_key = next(iter(LORA_MEMORY_CACHE_LITE))
+                del LORA_MEMORY_CACHE_LITE[oldest_key]
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        return lora, False
 
     def _load_json_file(self, path):
         if not os.path.exists(path):
             return None
         try:
-            with open(path, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8-sig') as f:
                 return json.load(f)
         except Exception:
             return None
@@ -952,7 +1179,7 @@ class LoRAHandler(LoRAHandlerBase):
                 sidecar = base + ext
                 if os.path.exists(sidecar):
                     try:
-                        with open(sidecar, 'r', encoding='utf-8') as f:
+                        with open(sidecar, 'r', encoding='utf-8-sig') as f:
                             data = json.load(f)
                             # Look for common tag keys
                             tags = data.get("activation text") or data.get("trainedWords") or data.get("tags")
@@ -960,18 +1187,6 @@ class LoRAHandler(LoRAHandlerBase):
                                 return tags if isinstance(tags, str) else ", ".join(tags)
                     except: continue
             return None
-
-    def _get_civitai_info_tags(self, lora_path):
-        civitai_info_path = os.path.splitext(lora_path)[0] + ".civitai.info"
-        civitai_info = self._load_json_file(civitai_info_path) or {}
-        activation_text = civitai_info.get("activation text", "")
-        if not activation_text:
-            return []
-        return [t.strip() for t in activation_text.split(",") if t.strip()]
-
-    def _get_civitai_cache_tags(self, lora_path):
-            """Deprecated global cache lookup. Now redirects to local sidecar logic."""
-            return self._get_override_tags(lora_path)
 
     def get_activation_tags(self, lora_name, lora_path, max_tags=5):
             """Lite Version: Prioritize local sidecar files."""
@@ -985,132 +1200,121 @@ class LoRAHandler(LoRAHandlerBase):
                     with safe_open(lora_path, framework="pt", device="cpu") as f:
                         metadata = f.metadata()
                         if metadata and "ss_tag_frequency" in metadata:
-                            return ["(Metadata tags found)"], "safetensors"
+                            return [], "safetensors"
                 except:
                     pass
             return [], "none"
     
     def extract_and_load(self, text, model, clip, lora_behavior, cache_limit):
-        lora_pattern = r'<lora:([^:>]+):([0-9.]+)>'
-        lora_matches = re.findall(lora_pattern, text)
+        self.load_trace = []
+        lora_specs = parse_lora_specs(text)
 
         lora_info_parts = []
+        appended_tags = []
+        prepended_tags = []
 
-        if not lora_matches:
+        if not lora_specs:
             return text, model, clip, ""
 
-        for lora_name, strength_str in lora_matches:
+        for spec in lora_specs:
+            lora_name = spec.name
+            tag_options = spec.options or {}
+
             # Input validation: clamp strength to valid range
-            try:
-                strength = float(strength_str)
-                if strength < 0.0 or strength > 5.0:
-                    print(f"[UmiAI Lite] WARNING: LoRA strength {strength} for '{lora_name}' is out of range. Clamping to [0.0, 5.0].")
-                    strength = max(0.0, min(5.0, strength))
-            except ValueError:
-                print(f"[UmiAI Lite] ERROR: Invalid LoRA strength '{strength_str}' for '{lora_name}'. Using 1.0 as default.")
-                strength = 1.0
+            strength = spec.strength
+            if strength < -5.0 or strength > 5.0:
+                logging.warning(f"[UmiAI Lite] LoRA strength {strength} for '{lora_name}' is out of range. Clamping to [-5.0, 5.0].")
+                strength = max(-5.0, min(5.0, strength))
 
             lora_name = resolve_lora_alias(lora_name, get_all_wildcard_paths())
 
+            trigger_behavior = tag_options.get("triggers") or tag_options.get("trigger") or tag_options.get("tags")
+            effective_behavior = lora_behavior
+            if trigger_behavior in ("off", "none", "false", "0", "disabled", "disable"):
+                effective_behavior = "Disabled"
+            elif trigger_behavior in ("append", "on", "true", "1"):
+                effective_behavior = "Append to Prompt"
+            elif trigger_behavior == "prepend":
+                effective_behavior = "Prepend to Prompt"
+
             if model is not None and clip is not None:
                 model, clip = self.load_lora(model, clip, lora_name, strength, cache_limit)
-                lora_info_parts.append(f"{lora_name}:{strength}")
+                if self.load_trace:
+                    self.load_trace[-1]["trigger_behavior"] = trigger_behavior or ""
+                    self.load_trace[-1]["effective_trigger_behavior"] = effective_behavior
+            else:
+                self.load_trace.append({
+                    "lora": lora_name,
+                    "strength": strength,
+                    "applied": False,
+                    "weights_cache_hit": False,
+                    "path": self._resolve_lora_path(lora_name) or "",
+                    "status": "detected_only",
+                    "trigger_behavior": trigger_behavior or "",
+                    "effective_trigger_behavior": effective_behavior,
+                })
+            lora_info_parts.append(f"{lora_name}:{strength}")
 
-            if lora_behavior == "Disabled":
-                text = re.sub(r'<lora:[^>]+>', '', text)
-            elif lora_behavior == "Append to Prompt":
+            if effective_behavior == "Append to Prompt":
                 lora_tags = self.extract_lora_tags(lora_name)
                 if lora_tags:
-                    text = text + ", " + lora_tags
-                text = re.sub(r'<lora:[^>]+>', '', text)
-            elif lora_behavior == "Prepend to Prompt":
+                    appended_tags.append(lora_tags)
+            elif effective_behavior == "Prepend to Prompt":
                 lora_tags = self.extract_lora_tags(lora_name)
                 if lora_tags:
-                    text = lora_tags + ", " + text
-                text = re.sub(r'<lora:[^>]+>', '', text)
+                    prepended_tags.append(lora_tags)
+
+        text = remove_spans(text, [spec.span for spec in lora_specs])
+        if prepended_tags:
+            text = ", ".join(prepended_tags) + ", " + text
+        if appended_tags:
+            text = text + ", " + ", ".join(appended_tags)
 
         lora_info = ", ".join(lora_info_parts) if lora_info_parts else ""
 
         return text, model, clip, lora_info
 
     def load_lora(self, model, clip, lora_name, strength, cache_limit):
-        cache_key = f"{lora_name}_{strength}"
-
-        # Fix memory leak: skip caching entirely when limit is 0
-        if cache_limit > 0:
-            if cache_key in LORA_MEMORY_CACHE_LITE:
-                LORA_MEMORY_CACHE_LITE.move_to_end(cache_key)
-                cached = LORA_MEMORY_CACHE_LITE[cache_key]
-                return cached['model'], cached['clip']
-
-        lora_path = folder_paths.get_full_path("loras", lora_name)
+        trace_item = {
+            "lora": lora_name,
+            "strength": strength,
+            "applied": False,
+            "weights_cache_hit": False,
+        }
+        lora_path = self._resolve_lora_path(lora_name)
+        trace_item["path"] = lora_path or ""
 
         if lora_path is None:
-            all_loras = folder_paths.get_filename_list("loras")
-            for lora_file in all_loras:
-                lora_base = os.path.splitext(os.path.basename(lora_file))[0]
-                if lora_base.lower() == lora_name.lower():
-                    lora_path = folder_paths.get_full_path("loras", lora_file)
-                    break
-
-        if lora_path is None:
-            print(f"[UmiAI Lite] LoRA not found: {lora_name}")
+            logging.warning(f"[UmiAI Lite] LoRA not found: {lora_name}")
+            trace_item["status"] = "not_found"
+            self.load_trace.append(trace_item)
             return model, clip
 
         try:
-            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            lora, weights_cache_hit = self._load_lora_weights(lora_path, cache_limit)
+            trace_item["weights_cache_hit"] = weights_cache_hit
 
             has_z_image = any('to_k_lora.down.weight' in key for key in lora.keys())
 
             if has_z_image:
-                print(f"[UmiAI Lite] Detected Z-Image format LoRA: {lora_name}. Applying QKV fusion patch...")
+                logging.info(f"[UmiAI Lite] Detected Z-Image format LoRA: {lora_name}. Applying QKV fusion patch...")
                 lora = self.apply_qkv_fusion(lora)
 
             model_patched, clip_patched = comfy.sd.load_lora_for_models(model, clip, lora, strength, strength)
-
-            # Only cache if cache_limit > 0
-            if cache_limit > 0:
-                LORA_MEMORY_CACHE_LITE[cache_key] = {'model': model_patched, 'clip': clip_patched}
-                LORA_MEMORY_CACHE_LITE.move_to_end(cache_key)
-
-                if len(LORA_MEMORY_CACHE_LITE) > cache_limit:
-                    oldest_key = next(iter(LORA_MEMORY_CACHE_LITE))
-                    del LORA_MEMORY_CACHE_LITE[oldest_key]
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            trace_item["status"] = "applied"
+            trace_item["applied"] = True
+            self.load_trace.append(trace_item)
 
             return model_patched, clip_patched
 
         except Exception as e:
-            print(f"[UmiAI Lite] Error loading LoRA {lora_name}: {e}")
+            logging.error(f"[UmiAI Lite] Error loading LoRA {lora_name}: {e}")
+            trace_item["status"] = "error"
+            trace_item["error"] = str(e)
+            self.load_trace.append(trace_item)
             return model, clip
 
-    def apply_qkv_fusion(self, lora_dict):
-        fused_dict = {}
-
-        for key in lora_dict.keys():
-            if 'to_k_lora' in key or 'to_v_lora' in key:
-                continue
-
-            if 'to_q_lora' in key:
-                new_key = key.replace('to_q_lora', 'to_qkv_lora')
-
-                q_weight = lora_dict[key]
-                k_key = key.replace('to_q_lora', 'to_k_lora')
-                v_key = key.replace('to_q_lora', 'to_v_lora')
-
-                k_weight = lora_dict.get(k_key, None)
-                v_weight = lora_dict.get(v_key, None)
-
-                if k_weight is not None and v_weight is not None:
-                    fused_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-                    fused_dict[new_key] = fused_weight
-                else:
-                    fused_dict[key] = q_weight
-            else:
-                fused_dict[key] = lora_dict[key]
-
-        return fused_dict
+    # apply_qkv_fusion is inherited from LoRAHandlerBase.
 
     def extract_lora_tags(self, lora_name):
         lora_path = folder_paths.get_full_path("loras", lora_name)
@@ -1153,99 +1357,164 @@ class LoRAHandler(LoRAHandlerBase):
         except Exception as e:
             return ""
 
+def _exact_int(value):
+    """int() first: going through float rounds seeds above 2**53, so
+    neighbouring seeds collapse onto the same roll."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(float(value))
+
+
 # ==============================================================================
 # MAIN NODE CLASS (LITE VERSION)
 # ==============================================================================
 class UmiAIWildcardNodeLite:
-    def __init__(self):
-        pass
-
     @classmethod
     def INPUT_TYPES(s):
-        # Check settings for conditional features
-        enable_llm = UMI_SETTINGS.get('enable_llm_features', False)
-        enable_danbooru = UMI_SETTINGS.get('enable_danbooru_features', False)
-
-        # Build LLM options if enabled
-        llm_options = ["None"]
-        if enable_llm:
-            from .nodes import DOWNLOADABLE_MODELS
-            llm_files = folder_paths.get_filename_list("llm") if "llm" in folder_paths.folder_names_and_paths else []
-            if not llm_files:
-                llm_path = os.path.join(folder_paths.models_dir, "llm")
-                if os.path.exists(llm_path):
-                    llm_files = [f for f in os.listdir(llm_path) if f.endswith('.gguf')]
-            download_options = list(DOWNLOADABLE_MODELS.keys())
-            llm_options = ["None"] + download_options + llm_files
-
         inputs = {
             "required": {
-                "text": ("STRING", {"multiline": True, "dynamicPrompts": False}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "text": ("STRING", {"multiline": True, "dynamicPrompts": False, "tooltip": "Prompt using UmiAI syntax: __wildcards__, {a|b} choices, $variables, [if ...] conditionals, [neg: ...] negatives, <lora:...> tags. See SYNTAX.md."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Same seed, template, wildcard files and settings reproduce the same expansion. Use the seed control's increment/randomize mode for new rolls; __~name__ cycles by seed."}),
             },
             "optional": {
                 # Standard Connections
-                "model": ("MODEL",),
-                "clip": ("CLIP",),
+                "model": ("MODEL", {"tooltip": "Connect to load inline <lora:...> tags into the model."}),
+                "clip": ("CLIP", {"tooltip": "Connect together with model to load inline <lora:...> tags."}),
 
                 # Basic Settings
-                "lora_tags_behavior": (["Append to Prompt", "Disabled", "Prepend to Prompt"], {"default": "Append to Prompt"}),
-                "lora_cache_limit": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1}),
-                "width": ("INT", {"default": 1024, "min": 64, "max": 8192}),
-                "height": ("INT", {"default": 1024, "min": 64, "max": 8192}),
-                "input_negative": ("STRING", {"multiline": True, "forceInput": True}),
+                "lora_tags_behavior": (["Append to Prompt", "Disabled", "Prepend to Prompt"], {"default": "Append to Prompt", "tooltip": "Where to inject LoRA trigger/activation tags into the prompt."}),
+                "lora_cache_limit": ("INT", {"default": 5, "min": 0, "max": 50, "step": 1, "tooltip": "How many loaded LoRA weight sets to keep cached in RAM. 0 disables caching."}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "tooltip": "Default width output. Overridden by @@width=...@@ in the prompt."}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "tooltip": "Default height output. Overridden by @@height=...@@ in the prompt."}),
+                "input_negative": ("STRING", {"multiline": True, "forceInput": True, "tooltip": "Optional incoming negative prompt. Wildcards/variables are expanded; extracted negatives are appended to it."}),
             }
         }
 
-        # Add LLM/Vision features if enabled
-        if enable_llm:
-            inputs["optional"]["image"] = ("IMAGE",)
-            inputs["optional"]["update_llama_cpp"] = ("BOOLEAN", {"default": False, "label_on": "UPDATE & RESTART", "label_off": "Update Disabled"})
-            inputs["optional"]["vision_model"] = (llm_options, {"default": "None"})
-            inputs["optional"]["refiner_model"] = (llm_options, {"default": "None"})
-            inputs["optional"]["vision_temperature"] = ("FLOAT", {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.01})
-            inputs["optional"]["refiner_temperature"] = ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01})
-            inputs["optional"]["max_tokens"] = ("INT", {"default": 800, "min": 100, "max": 4096})
-            inputs["optional"]["custom_system_prompt"] = ("STRING", {"multiline": True, "default": "", "placeholder": "Default: You are an AI image prompt assistant. Rewrite the following into detailed natural language."})
-
-        # Add Danbooru features if enabled
-        if enable_danbooru:
-            inputs["optional"]["danbooru_threshold"] = ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05})
-            inputs["optional"]["danbooru_max_tags"] = ("INT", {"default": 15, "min": 1, "max": 50})
-
         # Add bypass phrases for conditional bypass nodes
         inputs["optional"]["bypass_phrase"] = ("STRING", {"default": "", "multiline": False, "hidden": True})
-        inputs["optional"]["bypass_phrases"] = ("STRING", {"default": "", "multiline": False, "placeholder": "simple, test, auto"})
+        inputs["optional"]["bypass_phrases"] = ("STRING", {"default": "", "multiline": False, "placeholder": "simple, test, auto", "tooltip": "Comma-separated phrases matched as whole words, ignoring case, against the processed prompt. Results come out of bypass_matches for Umi Bypass nodes."})
+
+        inputs["optional"]["prompt_profile"] = (list_prompt_profiles(), {"default": "None", "tooltip": "Model-family defaults and lint rules from prompt_profiles.yaml."})
+        inputs["optional"]["prompt_preset"] = (["none"] + list_prompt_presets(), {"default": "none", "tooltip": "Named prompt fragment from prompt_presets.yaml applied to this prompt."})
+        inputs["optional"]["preset_placement"] = (["append", "prepend", "replace"], {"default": "append", "tooltip": "How the selected preset combines with the prompt text."})
+        inputs["optional"]["section_order"] = ("STRING", {"default": "", "multiline": False, "placeholder": "quality, character, style, scene", "tooltip": "Comma-separated order for [section:name] blocks in the prompt."})
+        inputs["optional"]["dry_run"] = ("BOOLEAN", {"default": False, "tooltip": "Expand the prompt and report LoRA info without actually loading LoRAs."})
+        if get_anima_extension() is not None:
+            inputs["optional"]["anima_prompt_mode"] = (
+                ["off", "ordered tags", "cohesive prompt"],
+                {
+                    "default": "off",
+                    "tooltip": (
+                        "After wildcard expansion, optionally order Anima tags or compose "
+                        "the resolved fragments into deterministic visual sentences."
+                    ),
+                },
+            )
+            inputs["optional"]["anima_artist_mode"] = (
+                ["keep in prompt", "split for artist mixer"],
+                {
+                    "default": "keep in prompt",
+                    "tooltip": (
+                        "Split @artist fragments into the artist_chain output for "
+                        "Anima Artist Mixer, preventing artist interference in the base prompt."
+                    ),
+                },
+            )
+
+
+        # Pin carriers for the frozen-reuse path. These MUST stay last.
+        # ComfyUI serialises widget values as a positional array, so adding an
+        # input anywhere above shifts every later value in every saved
+        # workflow. That is exactly how dry_run's False once arrived as
+        # _frozen_text and anima_artist_mode's string arrived as _frozen_seed.
+        inputs["optional"]["_frozen_text"] = ("STRING", {"default": "", "multiline": True, "tooltip": "Set by the node's Pin button. When present, this exact expansion is reused instead of rolling."})
+        inputs["optional"]["_frozen_negative"] = ("STRING", {"default": "", "multiline": True, "tooltip": "Negative half of a pinned roll."})
+        # Deliberately STRING, not INT: a workflow saved against an older or
+        # mis-ordered definition can carry anything in this slot, and a strict
+        # type makes the frontend refuse to queue the graph at all. Accepting
+        # anything and coercing server-side turns a hard block into a no-op.
+        inputs["optional"]["_frozen_seed"] = ("STRING", {"default": "", "multiline": False, "tooltip": "Seed captured with a pinned roll. Empty means nothing is pinned."})
 
         return inputs
 
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING", "INT", "INT", "STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("model", "clip", "text", "negative_text", "width", "height", "lora_info", "input_text", "input_negative", "bypass_matches")
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING", "INT", "INT", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("model", "clip", "text", "negative_text", "width", "height", "lora_info", "input_text", "input_negative", "bypass_matches", "explain_json", "prompt_diff", "artist_chain")
     FUNCTION = "process"
     CATEGORY = "UmiAI"
     COLOR = "#47325e"
 
     @classmethod
     def IS_CHANGED(cls, text, seed, **kwargs):
-        return f"{seed}_{text}"
+        watched = {
+            "text": text,
+            "seed": seed,
+            "width": kwargs.get("width"),
+            "height": kwargs.get("height"),
+            "input_negative": kwargs.get("input_negative"),
+            "lora_tags_behavior": kwargs.get("lora_tags_behavior"),
+            "lora_cache_limit": kwargs.get("lora_cache_limit"),
+            "bypass_phrase": kwargs.get("bypass_phrase"),
+            "bypass_phrases": kwargs.get("bypass_phrases"),
+            "prompt_profile": kwargs.get("prompt_profile"),
+            "prompt_preset": kwargs.get("prompt_preset"),
+            "preset_placement": kwargs.get("preset_placement"),
+            "section_order": kwargs.get("section_order"),
+            "dry_run": kwargs.get("dry_run"),
+            "anima_prompt_mode": kwargs.get("anima_prompt_mode"),
+            "anima_artist_mode": kwargs.get("anima_artist_mode"),
+            "settings": {k: UMI_SETTINGS.get(k) for k in sorted(UMI_SETTINGS)},
+        }
+        watched["wildcards"] = scan_wildcard_files(get_all_wildcard_paths())
+        # ComfyUI keeps this value per node; the file listing alone can be
+        # hundreds of KiB for a large collection.
+        return hashlib.sha256(json.dumps(watched, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
 
     def extract_settings(self, text):
-        settings_regex = re.compile(r'@@(.*?)@@')
-        matches = settings_regex.findall(text)
         settings = {'width': -1, 'height': -1}
-        for match in matches:
-            text = text.replace(f"@@{match}@@", "")
-            pairs = match.split(',')
-            for pair in pairs:
-                if '=' in pair:
-                    key, val = pair.split('=', 1)
-                    key = key.strip().lower()
-                    val = val.strip()
-                    try:
-                        if key == 'width': settings['width'] = int(val)
-                        if key == 'height': settings['height'] = int(val)
-                    except ValueError: pass
-        return text, settings
+        spans = find_settings_spans(text)
+        for span in spans:
+            for key, val in parse_key_value_csv(span.content).items():
+                try:
+                    if key == 'width':
+                        settings['width'] = int(val)
+                    if key == 'height':
+                        settings['height'] = int(val)
+                except ValueError:
+                    pass
+        text = remove_spans(text, spans)
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\s+([,])', r'\1', text)
+        return text.strip(), settings
+
+    def _clamp_dimension(self, value):
+        """Hold @@width=...@@ to the same 64-8192 range the widgets enforce.
+
+        An out-of-range value used to pass straight through to the sampler,
+        where 99999 is not a slow generation but an allocation failure.
+        """
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return 1024
+        return max(64, min(8192, value))
+
+    def _match_bypass(self, prompt, bypass_phrase="", bypass_phrases=""):
+        # Matched without regard to case. "SIMPLE portrait" not matching the
+        # phrase "simple" reads as the feature being broken, and a prompt's
+        # capitalisation is usually incidental. Whole words only, so "cat"
+        # does not match "category".
+        haystack = str(prompt or "")
+
+        def found(phrase):
+            return re.search(r'(?<!\w)' + re.escape(phrase) + r'(?!\w)', haystack, re.IGNORECASE) is not None
+
+        bypass_matched = bool(bypass_phrase) and found(str(bypass_phrase))
+        bypass_list = []
+        if bypass_phrases:
+            phrases = [p.strip() for p in str(bypass_phrases).split(",") if p.strip()]
+            bypass_list = [found(phrase) for phrase in phrases]
+        return bypass_matched, bypass_list, json.dumps(bypass_list)
 
     def get_val(self, kwargs, key, default, value_type=None):
         val = kwargs.get(key, default)
@@ -1256,14 +1525,12 @@ class UmiAIWildcardNodeLite:
         if value_type:
             try:
                 if value_type == int:
-                    return int(float(val))
+                    return _exact_int(val)
                 if value_type == float:
                     return float(val)
                 if value_type == str:
-                    if isinstance(val, (int, float)):
-                        return str(val)
                     return str(val)
-            except:
+            except (TypeError, ValueError, OverflowError):
                 return default
 
         return val
@@ -1276,8 +1543,6 @@ class UmiAIWildcardNodeLite:
         - Removes commas before and after BREAK
         - Ensures one space before and after BREAK
         """
-        import re
-
         if not text:
             return ""
 
@@ -1296,134 +1561,43 @@ class UmiAIWildcardNodeLite:
 
         return " BREAK ".join(cleaned_parts)
 
-    def preview_bypass_matched(
-        self,
-        text,
-        seed,
-        bypass_phrase,
-        bypass_phrases,
-        input_negative="",
-        width=1024,
-        height=1024,
-        image_input=None,
-        vision_model="None",
-        refiner_model="None",
-        vision_temperature=0.6,
-        refiner_temperature=0.7,
-        max_tokens=800,
-        custom_system_prompt="",
-        danbooru_threshold=0.70,
-        danbooru_max_tags=15,
-    ):
-        """Compute bypass_matched using the same prompt expansion logic without loading LoRAs."""
-        auto_clean = UMI_SETTINGS.get('auto_clean', True)
-        error_lint = UMI_SETTINGS.get('error_lint', False)
-        use_folder_paths = UMI_SETTINGS.get('use_folder_paths', False)
+    def format_prompt(self, text, auto_clean=None):
+        if auto_clean is None:
+            auto_clean = UMI_SETTINGS.get('auto_clean', True)
+        def format_segment(segment):
+            if auto_clean:
+                return self.clean_prompt(segment)
+            return re.sub(r'\s+', ' ', re.sub(r',\s*,', ',', segment)).strip().strip(',')
+        if UMI_SETTINGS.get('preserve_newlines', False):
+            return '\n'.join(format_segment(line) for line in text.replace('\r\n', '\n').replace('\r', '\n').split('\n')).strip()
+        return format_segment(text)
 
-        # Strip comments: // toggles comment mode until newline or another //
-        text = strip_prompt_comments(text)
-
-        options = {
-            'verbose': False,
-            'seed': seed,
-            'use_folder_paths': use_folder_paths,
-            'rng_streams': UMI_SETTINGS.get('rng_streams', False),
-        }
-
-        all_wildcard_paths = get_all_wildcard_paths()
-        tag_loader = TagLoader(all_wildcard_paths, options)
-
+    def _expand_prompt_core(self, text, tag_loader, options, seed, error_lint=False,
+                            auto_clean=True, base_variables=None):
         tag_selector = TagSelector(tag_loader, options)
         neg_gen = NegativePromptGenerator()
-
         tag_replacer = TagReplacer(tag_selector)
         dynamic_replacer = DynamicPromptReplacer(seed)
         conditional_replacer = ConditionalReplacer()
         variable_replacer = VariableReplacer()
 
-        # Initialize optional replacers based on settings
-        if UMI_SETTINGS.get('enable_llm_features', False):
-            from .nodes import VisionReplacer, LLMReplacer
-            vision_replacer = VisionReplacer(self, vision_model, refiner_model, vision_temperature, refiner_temperature, max_tokens, image_input)
-            llm_replacer = LLMReplacer(self, refiner_model, refiner_temperature, max_tokens, custom_system_prompt)
-        else:
-            vision_replacer = None
-            llm_replacer = None
-
-        if UMI_SETTINGS.get('enable_danbooru_features', False):
-            from .nodes import DanbooruReplacer
-            danbooru_replacer = DanbooruReplacer(options)
-        else:
-            danbooru_replacer = None
-
-        # Load globals
         globals_dict = tag_loader.load_globals()
         variable_replacer.load_globals(globals_dict)
+        if base_variables:
+            variable_replacer.variables.update(base_variables)
+        tag_selector.update_variables(variable_replacer.variables)
 
-        # Inject error_lint setting as failfast variable in both variable_replacer and tag_selector
         if error_lint:
             variable_replacer.variables['fail_fast'] = '1'
             variable_replacer.variables['failfast'] = '1'
             tag_selector.variables['fail_fast'] = '1'
             tag_selector.variables['failfast'] = '1'
 
-        prompt = text
-        previous_prompt = ""
-        iterations = 0
-        prompt_history = []  # Track prompts for cycle detection
-        tag_selector.clear_seeded_values()
+        prompt, iterations, core_warnings = self._expand_loop(
+            text, tag_loader, tag_selector, tag_replacer, dynamic_replacer,
+            conditional_replacer, variable_replacer,
+        )
 
-        # Main processing loop
-        while previous_prompt != prompt and iterations < 50:
-            # Cycle detection: check if we've seen this exact prompt before
-            if prompt in prompt_history:
-                print(f"[UmiAI Lite] WARNING: Cycle detected in prompt processing. Breaking loop to prevent infinite recursion.")
-                print(f"[UmiAI Lite] Problematic prompt fragment: {prompt[:100]}...")
-                break
-
-            prompt_history.append(prompt)
-            previous_prompt = prompt
-
-            # Pre-expand prompt files so variables apply in the same pass
-            prompt = expand_prompt_files(prompt, tag_loader)
-
-            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
-            tag_selector.update_variables(variable_replacer.variables)
-            prompt = variable_replacer.replace_variables(prompt)
-
-            masked_prompt, if_blocks = conditional_replacer.mask_conditionals(prompt)
-
-            # Process Vision and LLM tags if enabled (skip conditional blocks)
-            if vision_replacer:
-                masked_prompt = vision_replacer.replace(masked_prompt)
-            if llm_replacer:
-                masked_prompt = llm_replacer.replace(masked_prompt)
-
-            masked_prompt = CharacterReplacer.replace(masked_prompt)  # @@character:outfit:emotion@@
-            masked_prompt = tag_replacer.replace(masked_prompt)
-            masked_prompt = dynamic_replacer.replace(masked_prompt)
-
-            # Process Danbooru tags if enabled
-            if danbooru_replacer:
-                masked_prompt = danbooru_replacer.replace(masked_prompt, danbooru_threshold, danbooru_max_tags)
-
-            prompt = conditional_replacer.unmask_conditionals(masked_prompt, if_blocks)
-            prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
-
-            # Capture assignments revealed by conditionals in the same iteration
-            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
-            tag_selector.update_variables(variable_replacer.variables)
-            prompt = variable_replacer.replace_variables(prompt)
-            iterations += 1
-
-        # Warn if we hit the iteration limit
-        if iterations >= 50:
-            umi_debug_print(f"[UmiAI Lite] WARNING: Reached maximum processing iterations (50). Possible recursive wildcards or variables.")
-
-        # Apply conditional logic (in case any remain after loop)
-        prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
-
-        # Add prefixes and suffixes
         additions = tag_selector.get_prefixes_and_suffixes()
         if additions['prefixes']:
             prompt = ", ".join(additions['prefixes']) + ", " + prompt
@@ -1437,48 +1611,142 @@ class UmiAIWildcardNodeLite:
         if tag_selector.scoped_negatives:
             neg_gen.add_list(tag_selector.scoped_negatives)
 
-        # Strip negative tags from prompt
-        prompt = neg_gen.strip_negative_tags(prompt)
+        prompt = neg_gen.strip_negative_tags(prompt, variable_replacer.variables)
 
-        # Cleanup (enhanced with BREAK handling if auto_clean enabled)
-        if auto_clean:
-            prompt = self.clean_prompt(prompt)
-        else:
-            prompt = re.sub(r',\s*,', ',', prompt)
-            prompt = re.sub(r'\s+', ' ', prompt).strip().strip(',')
+        prompt = self.format_prompt(prompt, auto_clean)
 
         if tag_selector.is_trace_enabled():
             prompt = append_trace_summary(prompt, variable_replacer.variables)
         if tag_selector.is_debug_enabled():
             prompt = append_debug_summary(prompt, variable_replacer.variables)
 
-        bypass_matched = bool(bypass_phrase) and bypass_phrase in prompt
-        bypass_list = []
-        if bypass_phrases:
-            phrases = [p.strip() for p in bypass_phrases.split(",") if p.strip()]
-            bypass_list = [phrase in prompt for phrase in phrases]
-        return bypass_matched, prompt, bypass_list
+
+        return {
+            "prompt": prompt,
+            "iterations": iterations,
+            "warnings": list(dict.fromkeys(core_warnings + tag_selector.diagnostics)),
+            "negative_generator": neg_gen,
+            "tag_selector": tag_selector,
+            "variable_replacer": variable_replacer,
+        }
+
+    def _expand_loop(self, prompt, tag_loader, tag_selector, tag_replacer, dynamic_replacer,
+                     conditional_replacer, variable_replacer):
+        """Expand until the text stops changing. Returns (prompt, iterations, warnings)."""
+        warnings = []
+        previous_prompt = ""
+        iterations = 0
+        prompt_history = []
+        tag_selector.clear_seeded_values()
+        conditional_replacer.set_value_replacers(tag_replacer, dynamic_replacer)
+
+        iteration_limit = _processing_limit('max_expansion_iterations', 50, 1, 200)
+        while previous_prompt != prompt and iterations < iteration_limit:
+            _check_prompt_size(prompt)
+            if prompt in prompt_history:
+                warnings.append(
+                    f"Cycle detected during prompt expansion; stopped early near: {prompt[:80]}"
+                )
+                logging.warning(f"[UmiAI Lite] Cycle detected in prompt expansion; stopped near: {prompt[:100]}")
+                break
+
+            prompt_history.append(prompt)
+            previous_prompt = prompt
+            prompt = expand_prompt_files(prompt, tag_loader)
+            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
+            tag_selector.update_variables(variable_replacer.variables)
+            prompt = variable_replacer.replace_variables(prompt)
+
+            masked_prompt, if_blocks = conditional_replacer.mask_conditionals(prompt)
+            masked_prompt = CharacterReplacer.replace(masked_prompt)
+            masked_prompt = tag_replacer.replace(masked_prompt)
+            masked_prompt = dynamic_replacer.replace(masked_prompt)
+
+            prompt = conditional_replacer.unmask_conditionals(masked_prompt, if_blocks)
+            prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
+            # $@name worked only inside a conditional branch; at top level the
+            # assignment was left in the prompt as literal text. Applied after
+            # conditionals so a branch that was not taken cannot leak its
+            # locals out.
+            prompt = conditional_replacer.apply_local_vars(prompt, variable_replacer.variables)
+            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
+            tag_selector.update_variables(variable_replacer.variables)
+            prompt = variable_replacer.replace_variables(prompt)
+            iterations += 1
+            _check_prompt_size(prompt)
+
+        if iterations >= iteration_limit and previous_prompt != prompt:
+            warnings.append(
+                f"Reached maximum prompt expansion iterations ({iteration_limit}); possible recursive wildcards or variables."
+            )
+
+        # A wildcard file that refers to itself is a fixed point, not a cycle:
+        # the text stops changing, so the loop exits normally and the history
+        # check above never fires. The raw "__name__" then goes to the model
+        # verbatim with nothing said about it. Anything left at this point is
+        # unresolved, whatever the reason, so report it. A lone "__" (as in
+        # ^__^ or a LoRA file name) is not wildcard syntax.
+        checked = remove_spans(prompt, find_lora_spans(prompt))
+        unresolved = [span for span in find_wildcard_spans(checked) if not checked[:span.start].endswith("\\")]
+        if unresolved:
+            at = unresolved[0].start
+            warnings.append(
+                "Prompt still contains unresolved wildcard syntax after expansion "
+                "(a wildcard file may refer to itself, or the file may be missing). "
+                "Near: " + checked[at:at + 80]
+            )
+
+        prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
+        prompt = prompt.replace(r'\__', '__').replace(r'\{', '{')
+        return prompt, iterations, warnings
+
+    def _process_negative_input(self, negative_text, tag_loader, options, seed, base_variables, warnings):
+        """Expand wildcards/variables in the negative input without affecting positive prompt state."""
+        negative_text = strip_prompt_comments(negative_text or "")
+        if not negative_text.strip():
+            return ""
+
+        neg_selector = TagSelector(tag_loader, options)
+        variable_replacer = VariableReplacer()
+        variable_replacer.variables.update(base_variables or {})
+        neg_selector.update_variables(variable_replacer.variables)
+
+        prompt, _, loop_warnings = self._expand_loop(
+            negative_text, tag_loader, neg_selector, TagReplacer(neg_selector),
+            DynamicPromptReplacer(seed), ConditionalReplacer(), variable_replacer,
+        )
+        warnings.extend(f"Negative prompt: {message}" for message in loop_warnings + neg_selector.diagnostics)
+        return self.format_prompt(prompt)
 
     def process(self, **kwargs):
-        # Check if auto-update was requested (LLM feature)
-        if UMI_SETTINGS.get('enable_llm_features', False):
-            do_update = kwargs.get("update_llama_cpp", False)
-            if do_update:
-                from .nodes import perform_library_update
-                success = perform_library_update()
-                if success:
-                    raise Exception("Auto-Update Complete! Please Restart ComfyUI now.")
-                else:
-                    raise Exception("Auto-Update Failed! Check console for errors.")
+        # HTTP wildcard refreshes can run independently of Comfy's execution
+        # queue. Hold one re-entrant lock for the complete expansion so a
+        # refresh can never clear an index while this node is reading it.
+        with PROMPT_CACHE_LOCK:
+            return self._process_locked(**kwargs)
 
+    def _process_locked(self, **kwargs):
         # Check for frozen text from auto-requeue (bypass wildcard processing)
+        # Coerced rather than trusted: a positionally misaligned workflow can
+        # deliver a bool here and a string in the seed, and a crash mid-graph is
+        # a far worse outcome than ignoring an unusable pin.
         frozen_text = kwargs.get("_frozen_text", None)
+        if not isinstance(frozen_text, str) or not frozen_text.strip():
+            frozen_text = None
         frozen_negative = kwargs.get("_frozen_negative", None)
+        if not isinstance(frozen_negative, str):
+            frozen_negative = None
         frozen_seed = kwargs.get("_frozen_seed", None)
+        if isinstance(frozen_seed, str) and not frozen_seed.strip():
+            frozen_seed = None
+        if frozen_seed is not None:
+            try:
+                frozen_seed = _exact_int(frozen_seed)
+            except (TypeError, ValueError, OverflowError):
+                frozen_seed = None
 
         if frozen_text:
-            print(f"[UmiAI Lite] Using FROZEN prompt from auto-requeue (skipping wildcard processing)")
-            print(f"[UmiAI Lite] Frozen text: {frozen_text[:100]}...")
+            umi_debug_print("[UmiAI Lite] Using frozen prompt (skipping wildcard expansion)")
 
             # Get basic parameters
             model = kwargs.get("model", None)
@@ -1489,45 +1757,88 @@ class UmiAIWildcardNodeLite:
             lora_cache_limit = self.get_val(kwargs, "lora_cache_limit", 5, int)
             bypass_phrase = kwargs.get("bypass_phrase", "")
             bypass_phrases = kwargs.get("bypass_phrases", "")
+            anima_extension = get_anima_extension()
+            anima_artist_mode = self.get_val(kwargs, "anima_artist_mode", "keep in prompt", str)
 
             # Use frozen values
             prompt = frozen_text
             final_negative = frozen_negative if frozen_negative else ""
-            seed = frozen_seed if frozen_seed is not None else self.get_val(kwargs, "seed", 0, int)
+            seed = frozen_seed if (frozen_seed is not None and frozen_seed >= 0) else self.get_val(kwargs, "seed", 0, int)
+            artist_chain = ""
+            if anima_extension is not None:
+                prompt, artist_chain = anima_extension.split_artist_chain(
+                    prompt,
+                    remove=anima_artist_mode.lower().startswith("split"),
+                )
+
+            # Matched before LoRA extraction, as an unpinned run does, so pinning
+            # a roll cannot flip a downstream bypass.
+            bypass_matched, bypass_list, bypass_matches = self._match_bypass(prompt, bypass_phrase, bypass_phrases)
 
             # Still need to extract LoRAs from the frozen prompt
             lora_handler = LoRAHandler()
+            prompt_before_lora = prompt
             prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(
                 prompt, model, clip, lora_tags_behavior, lora_cache_limit
             )
 
-            # Calculate bypass_matched and bypass_matches
-            bypass_matched = bool(bypass_phrase) and bypass_phrase in prompt
-            bypass_list = []
-            if bypass_phrases:
-                phrases = [p.strip() for p in bypass_phrases.split(",") if p.strip()]
-                bypass_list = [phrase in prompt for phrase in phrases]
-            bypass_matches = json.dumps(bypass_list)
-
             # Extract settings
             prompt, settings = self.extract_settings(prompt)
-            final_width = settings['width'] if settings['width'] > 0 else width
-            final_height = settings['height'] if settings['height'] > 0 else height
+            final_width = self._clamp_dimension(settings['width'] if settings['width'] > 0 else width)
+            final_height = self._clamp_dimension(settings['height'] if settings['height'] > 0 else height)
+            prompt = self.format_prompt(prompt)
 
-            # Log to history
-            log_prompt_to_history(prompt, final_negative, seed)
+            prompt_diff = json.dumps(build_prompt_diff(frozen_text, prompt), indent=2, ensure_ascii=False)
+            explain = {
+                "schema_version": "umi.run_explain.v1",
+                "dry_run": False,
+                "frozen": True,
+                "seed": seed,
+                "input_prompt": frozen_text,
+                "processed_prompt_before_lora": prompt_before_lora,
+                "final_prompt": prompt,
+                "phases": {
+                    "input": frozen_text,
+                    "before_lora": prompt_before_lora,
+                    "after_lora": prompt,
+                    "final": prompt,
+                },
+                "negative_prompt": final_negative,
+                "warnings": [],
+                "artist_chain": artist_chain,
+                "lora_info": lora_info,
+                "lora_load_trace": list(getattr(lora_handler, "load_trace", [])),
+                "bypass_matches": bypass_list,
+                "settings": {
+                    "width": final_width,
+                    "height": final_height,
+                    "auto_clean": UMI_SETTINGS.get('auto_clean', True),
+                },
+            }
+            explain_json = json.dumps(explain, indent=2, ensure_ascii=False, default=str)
+
+            if UMI_SETTINGS.get("persist_prompt_history", False):
+                log_prompt_to_history(prompt, final_negative, seed)
+            if UMI_SETTINGS.get("persist_run_inspector", False):
+                try:
+                    _write_run_inspector_cache({
+                        "explain": explain,
+                        "prompt_diff": json.loads(prompt_diff),
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    })
+                except Exception:
+                    pass
 
             # Return immediately with frozen values
-            print(f"[UmiAI Lite] Returning frozen prompt (bypass_matched={bypass_matched})")
-            return (final_model, final_clip, prompt, final_negative, final_width, final_height, lora_info, frozen_text, frozen_negative, bypass_matches)
+            umi_debug_print(f"[UmiAI Lite] Returning frozen prompt (bypass_matched={bypass_matched})")
+            return (final_model, final_clip, prompt, final_negative, final_width, final_height, lora_info, frozen_text, frozen_negative or "", bypass_matches, explain_json, prompt_diff, artist_chain)
 
         text = self.get_val(kwargs, "text", "", str)
         seed = self.get_val(kwargs, "seed", 0, int)
+        original_text = text
 
         model = kwargs.get("model", None)
         clip = kwargs.get("clip", None)
-        image_input = kwargs.get("image", None) if UMI_SETTINGS.get('enable_llm_features', False) else None
-
         width = self.get_val(kwargs, "width", 1024, int)
         height = self.get_val(kwargs, "height", 1024, int)
 
@@ -1543,40 +1854,39 @@ class UmiAIWildcardNodeLite:
         error_lint = UMI_SETTINGS.get('error_lint', False)
         use_folder_paths = UMI_SETTINGS.get('use_folder_paths', False)
         input_negative = self.get_val(kwargs, "input_negative", "", str)
+        original_negative = input_negative
+        prompt_profile = self.get_val(kwargs, "prompt_profile", "None", str)
+        prompt_preset = self.get_val(kwargs, "prompt_preset", "none", str)
+        preset_placement = self.get_val(kwargs, "preset_placement", "append", str)
+        section_order = self.get_val(kwargs, "section_order", "", str)
+        dry_run = bool(kwargs.get("dry_run", False))
+        anima_prompt_mode = self.get_val(
+            kwargs, "anima_prompt_mode", "off", str
+        )
+        anima_artist_mode = self.get_val(
+            kwargs, "anima_artist_mode", "keep in prompt", str
+        )
 
-        # Debug: Show what settings are being read
-        if UMI_SETTINGS.get('enable_debug_output', False):
-            from .nodes import umi_debug_print
-            umi_debug_print(f"[UmiAI Lite] Processing with: auto_clean={auto_clean}, error_lint={error_lint}")
-
-        # LLM/Vision parameters (if enabled)
-        if UMI_SETTINGS.get('enable_llm_features', False):
-            vision_model = self.get_val(kwargs, "vision_model", "None", str)
-            refiner_model = self.get_val(kwargs, "refiner_model", "None", str)
-            vision_temperature = self.get_val(kwargs, "vision_temperature", 0.6, float)
-            refiner_temperature = self.get_val(kwargs, "refiner_temperature", 0.7, float)
-            max_tokens = self.get_val(kwargs, "max_tokens", 800, int)
-            custom_system_prompt = self.get_val(kwargs, "custom_system_prompt", "", str)
-        else:
-            vision_model = refiner_model = "None"
-            vision_temperature = refiner_temperature = 0.7
-            max_tokens = 800
-            custom_system_prompt = ""
-
-        # Danbooru parameters (if enabled)
-        if UMI_SETTINGS.get('enable_danbooru_features', False):
-            danbooru_threshold = self.get_val(kwargs, "danbooru_threshold", 0.70, float)
-            danbooru_max_tags = self.get_val(kwargs, "danbooru_max_tags", 15, int)
-        else:
-            danbooru_threshold = 0.70
-            danbooru_max_tags = 15
+        umi_debug_print(f"[UmiAI Lite] Processing with: auto_clean={auto_clean}, error_lint={error_lint}")
 
         # ============================================================
         # CORE PROCESSING
         # ============================================================
 
+        preset_warnings = []
+        phases = {"input": original_text}
+        text = expand_prompt_presets(text)
+        text, input_negative, preset_warnings = apply_prompt_preset(text, input_negative, prompt_preset, preset_placement)
+        phases["after_presets"] = text
+
+        # Recompose named sections before normal wildcard processing.
+        text, section_info = apply_prompt_sections(text, section_order)
+        phases["after_sections"] = text
+
+        boundary_warnings = lint_prompt_join_boundaries(text)
         # Strip comments: // toggles comment mode until newline or another //
         text = strip_prompt_comments(text)
+        phases["after_comments"] = text
 
         options = {
             'verbose': False,
@@ -1588,160 +1898,334 @@ class UmiAIWildcardNodeLite:
         all_wildcard_paths = get_all_wildcard_paths()
         tag_loader = TagLoader(all_wildcard_paths, options)
 
-        tag_selector = TagSelector(tag_loader, options)
-        neg_gen = NegativePromptGenerator()
-
-        tag_replacer = TagReplacer(tag_selector)
-        dynamic_replacer = DynamicPromptReplacer(seed)
-        conditional_replacer = ConditionalReplacer()
-        variable_replacer = VariableReplacer()
         lora_handler = LoRAHandler()
 
-        # Initialize optional replacers based on settings
-        if UMI_SETTINGS.get('enable_llm_features', False):
-            from .nodes import VisionReplacer, LLMReplacer
-            vision_replacer = VisionReplacer(self, vision_model, refiner_model, vision_temperature, refiner_temperature, max_tokens, image_input)
-            llm_replacer = LLMReplacer(self, refiner_model, refiner_temperature, max_tokens, custom_system_prompt)
-        else:
-            vision_replacer = None
-            llm_replacer = None
+        expanded = self._expand_prompt_core(
+            text,
+            tag_loader,
+            options,
+            seed,
+            error_lint=error_lint,
+            auto_clean=auto_clean,
+        )
+        prompt = expanded["prompt"]
+        phases["after_core_expansion"] = prompt
+        iterations = expanded["iterations"]
+        neg_gen = expanded["negative_generator"]
+        tag_selector = expanded["tag_selector"]
+        variable_replacer = expanded["variable_replacer"]
 
-        if UMI_SETTINGS.get('enable_danbooru_features', False):
-            from .nodes import DanbooruReplacer
-            danbooru_replacer = DanbooruReplacer(options)
-        else:
-            danbooru_replacer = None
+        negative_warnings = []
+        input_negative = self._process_negative_input(
+            input_negative,
+            tag_loader,
+            options,
+            seed,
+            variable_replacer.variables,
+            warnings=negative_warnings,
+        )
 
-        # Load globals
-        globals_dict = tag_loader.load_globals()
-        variable_replacer.load_globals(globals_dict)
+        if prompt_profile != "None":
+            # Profile warnings are computed once below via lint_prompt_profile,
+            # after negatives and LoRA info are final.
+            prompt, input_negative, _, prompt_profile = apply_named_prompt_profile(prompt_profile, prompt, input_negative)
+        phases["after_profile"] = prompt
 
-        # Inject error_lint setting as failfast variable in both variable_replacer and tag_selector
-        if error_lint:
-            variable_replacer.variables['fail_fast'] = '1'
-            variable_replacer.variables['failfast'] = '1'
-            tag_selector.variables['fail_fast'] = '1'
-            tag_selector.variables['failfast'] = '1'
-
-        prompt = text
-        previous_prompt = ""
-        iterations = 0
-        prompt_history = []  # Track prompts for cycle detection
-        tag_selector.clear_seeded_values()
-
-        # Main processing loop
-        while previous_prompt != prompt and iterations < 50:
-            # Cycle detection: check if we've seen this exact prompt before
-            if prompt in prompt_history:
-                print(f"[UmiAI Lite] WARNING: Cycle detected in prompt processing. Breaking loop to prevent infinite recursion.")
-                print(f"[UmiAI Lite] Problematic prompt fragment: {prompt[:100]}...")
-                break
-
-            prompt_history.append(prompt)
-            previous_prompt = prompt
-
-            # Pre-expand prompt files so variables apply in the same pass
-            prompt = expand_prompt_files(prompt, tag_loader)
-
-            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
-            tag_selector.update_variables(variable_replacer.variables)
-            prompt = variable_replacer.replace_variables(prompt)
-
-            masked_prompt, if_blocks = conditional_replacer.mask_conditionals(prompt)
-
-            # Process Vision and LLM tags if enabled (skip conditional blocks)
-            if vision_replacer:
-                masked_prompt = vision_replacer.replace(masked_prompt)
-            if llm_replacer:
-                masked_prompt = llm_replacer.replace(masked_prompt)
-
-            masked_prompt = CharacterReplacer.replace(masked_prompt)  # @@character:outfit:emotion@@
-            masked_prompt = tag_replacer.replace(masked_prompt)
-            masked_prompt = dynamic_replacer.replace(masked_prompt)
-
-            # Process Danbooru tags if enabled
-            if danbooru_replacer:
-                masked_prompt = danbooru_replacer.replace(masked_prompt, danbooru_threshold, danbooru_max_tags)
-
-            prompt = conditional_replacer.unmask_conditionals(masked_prompt, if_blocks)
-            prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
-
-            # Capture assignments revealed by conditionals in the same iteration
-            prompt = variable_replacer.store_variables(prompt, tag_replacer, dynamic_replacer)
-            tag_selector.update_variables(variable_replacer.variables)
-            prompt = variable_replacer.replace_variables(prompt)
-            iterations += 1
-
-        # Warn if we hit the iteration limit
-        if iterations >= 50:
-            umi_debug_print(f"[UmiAI Lite] WARNING: Reached maximum processing iterations (50). Possible recursive wildcards or variables.")
-
-        # Apply conditional logic (in case any remain after loop)
-        prompt = conditional_replacer.replace(prompt, variable_replacer.variables)
-
-        # Add prefixes and suffixes
-        additions = tag_selector.get_prefixes_and_suffixes()
-        if additions['prefixes']:
-            prompt = ", ".join(additions['prefixes']) + ", " + prompt
-        if additions['suffixes']:
-            prompt = prompt + ", " + ", ".join(additions['suffixes'])
-
-        if additions['neg_prefixes']:
-            neg_gen.add_list(additions['neg_prefixes'])
-        if additions['neg_suffixes']:
-            neg_gen.add_list(additions['neg_suffixes'])
-        if tag_selector.scoped_negatives:
-            neg_gen.add_list(tag_selector.scoped_negatives)
-
-        # Strip negative tags from prompt
-        prompt = neg_gen.strip_negative_tags(prompt)
-
-        # Cleanup (enhanced with BREAK handling if auto_clean enabled)
-        if auto_clean:
-            prompt = self.clean_prompt(prompt)
-        else:
-            prompt = re.sub(r',\s*,', ',', prompt)
-            prompt = re.sub(r'\s+', ' ', prompt).strip().strip(',')
-
-        if tag_selector.is_trace_enabled():
-            prompt = append_trace_summary(prompt, variable_replacer.variables)
-        if tag_selector.is_debug_enabled():
-            prompt = append_debug_summary(prompt, variable_replacer.variables)
+        anima_extension = get_anima_extension()
+        artist_chain = ""
+        anima_composition = {}
+        if anima_extension is not None:
+            prompt, artist_chain, anima_composition = anima_extension.compose_wildcard_prompt(
+                prompt,
+                wildcard_trace=getattr(tag_selector, "wildcard_trace", []),
+                mode=anima_prompt_mode,
+                artist_mode=anima_artist_mode,
+            )
+        phases["after_anima_composition"] = prompt
 
         # Calculate bypass_matched for conditional bypass nodes before LoRA extraction
         bypass_phrase = kwargs.get("bypass_phrase", "")
         bypass_phrases = kwargs.get("bypass_phrases", "")
-        bypass_matched = bool(bypass_phrase) and bypass_phrase in prompt
-        bypass_list = []
-        if bypass_phrases:
-            phrases = [p.strip() for p in bypass_phrases.split(",") if p.strip()]
-            bypass_list = [phrase in prompt for phrase in phrases]
-        bypass_matches = json.dumps(bypass_list)
+        bypass_matched, bypass_list, bypass_matches = self._match_bypass(prompt, bypass_phrase, bypass_phrases)
 
-        # Extract and load LoRAs
-        prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(prompt, model, clip, lora_tags_behavior, lora_cache_limit)
+        prompt_before_lora = prompt
+        phases["before_lora"] = prompt_before_lora
+        if dry_run:
+            # Detect LoRAs and apply their trigger-tag behaviour exactly as a
+            # real run would, but pass no model/clip so weights are never read
+            # or applied.  The old regex-only removal made Preview Roll drift
+            # from execution and meant a pinned preview lost every LoRA tag.
+            prompt, _, _, detected_loras = lora_handler.extract_and_load(
+                prompt, None, None, lora_tags_behavior, lora_cache_limit
+            )
+            final_model, final_clip = model, clip
+            lora_info = f"DRY_RUN: {detected_loras}" if detected_loras else "DRY_RUN"
+            prompt = self.format_prompt(prompt, auto_clean)
+        else:
+            prompt, final_model, final_clip, lora_info = lora_handler.extract_and_load(prompt, model, clip, lora_tags_behavior, lora_cache_limit)
+            prompt = self.format_prompt(prompt, auto_clean)
+        phases["after_lora"] = prompt
 
-        # Generate final negative prompt
-        generated_negatives = neg_gen.get_negative_string()
+        # Generated terms already in the incoming negative (typed or from a
+        # profile) are dropped; the incoming text itself is kept verbatim.
+        existing_negatives = {term.lower() for term in _split_prompt_tags(input_negative)}
+        generated_negatives = ", ".join(
+            term for term in _dedupe_keep_order(_split_prompt_tags(neg_gen.get_negative_string()))
+            if term.lower() not in existing_negatives
+        )
         final_negative = input_negative
         if generated_negatives:
             final_negative = f"{final_negative}, {generated_negatives}" if final_negative else generated_negatives
         if final_negative:
             final_negative = re.sub(r',\s*,', ',', final_negative).strip()
 
+        profile_warnings = lint_prompt_profile(prompt_profile, prompt, final_negative, lora_info)
+        expansion_warnings = expanded.get("warnings", [])
+        all_warnings = list(dict.fromkeys(boundary_warnings + preset_warnings + profile_warnings + expansion_warnings + negative_warnings))
+
         # Extract settings
         prompt, settings = self.extract_settings(prompt)
-        final_width = settings['width'] if settings['width'] > 0 else width
-        final_height = settings['height'] if settings['height'] > 0 else height
+        prompt = self.format_prompt(prompt, auto_clean)
+        final_width = self._clamp_dimension(settings['width'] if settings['width'] > 0 else width)
+        final_height = self._clamp_dimension(settings['height'] if settings['height'] > 0 else height)
+        phases["final"] = prompt
 
-        # Phase 8: Log prompt to history
-        log_prompt_to_history(prompt, final_negative, seed)
+        if UMI_SETTINGS.get("persist_prompt_history", False):
+            log_prompt_to_history(prompt, final_negative, seed)
 
-        if UMI_SETTINGS.get('enable_debug_output', False):
-            if bypass_phrase:
-                umi_debug_print(f"[Wildcard] Bypass phrase '{bypass_phrase}' {'FOUND' if bypass_matched else 'NOT FOUND'} in prompt")
+        if bypass_phrase:
+            umi_debug_print(f"[Wildcard] Bypass phrase '{bypass_phrase}' {'FOUND' if bypass_matched else 'NOT FOUND'} in prompt")
 
-        return (final_model, final_clip, prompt, final_negative, final_width, final_height, lora_info, text, input_negative, bypass_matches)
+        prompt_diff = json.dumps(build_prompt_diff(original_text, prompt), indent=2, ensure_ascii=False)
+        explain = {
+            "schema_version": "umi.run_explain.v1",
+            "dry_run": dry_run,
+            "profile": prompt_profile,
+            "seed": seed,
+            "iterations": iterations,
+            "input_prompt": original_text,
+            "section_order": section_info.get("order", []),
+            "sections": section_info.get("sections", {}),
+            "processed_prompt_before_lora": prompt_before_lora,
+            "final_prompt": prompt,
+            "phases": phases,
+            "negative_prompt": final_negative,
+            "lora_info": lora_info,
+            "lora_load_trace": list(getattr(lora_handler, "load_trace", [])),
+            "bypass_matches": bypass_list,
+            "variables": dict(variable_replacer.variables),
+            "wildcard_resolutions": dict(tag_selector.seeded_values),
+            "wildcard_trace": list(getattr(tag_selector, "wildcard_trace", [])),
+            "anima_composition": anima_composition,
+            "artist_chain": artist_chain,
+            "warnings": all_warnings,
+            "prompt_preset": prompt_preset,
+            "settings": {"width": final_width, "height": final_height, "auto_clean": auto_clean},
+        }
+        explain_json = json.dumps(explain, indent=2, ensure_ascii=False, default=str)
+        if UMI_SETTINGS.get("persist_run_inspector", False):
+            try:
+                _write_run_inspector_cache({
+                    "explain": explain,
+                    "prompt_diff": json.loads(prompt_diff),
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                })
+            except Exception:
+                pass
+
+        return (final_model, final_clip, prompt, final_negative, final_width, final_height, lora_info, original_text, original_negative, bypass_matches, explain_json, prompt_diff, artist_chain)
+
+
+# ==============================================================================
+# PROMPT PROFILE HELPER NODE
+# ==============================================================================
+class UmiPromptProfile:
+    @classmethod
+    def INPUT_TYPES(s):
+        optional = {
+            "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+        }
+        if get_anima_extension() is not None:
+            optional["style_preset"] = ([
+                "none", "anime illustration", "clean lineart", "painterly",
+                "official art", "flat color", "high detail"
+            ], {"default": "none"})
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                "profile": (list_prompt_profiles(), {"default": "None"}),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("prompt", "negative_prompt", "warnings", "profile")
+    FUNCTION = "run"
+    CATEGORY = "UmiAI/prompt"
+    COLOR = "#47325e"
+
+    def run(self, prompt, profile="None", negative_prompt="", style_preset="none"):
+        prompt, negative_prompt, warnings, resolved_profile = apply_named_prompt_profile(
+            profile, prompt, negative_prompt, style_preset=style_preset
+        )
+        return (prompt, negative_prompt, "\n".join(warnings), resolved_profile)
+
+
+# ==============================================================================
+# PROMPT INSPECTOR NODE
+# ==============================================================================
+class UmiPromptInspector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "input_prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                "processed_prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                "profile": (list_prompt_profiles(), {"default": "None"}),
+            },
+            "optional": {
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "lora_info": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("diff_json", "lint_warnings", "sections_json")
+    FUNCTION = "run"
+    CATEGORY = "UmiAI/prompt"
+    COLOR = "#47325e"
+
+    def run(self, input_prompt, processed_prompt, profile="None", negative_prompt="", lora_info=""):
+        diff = build_prompt_diff(input_prompt, processed_prompt)
+        warnings = lint_prompt_profile(profile, processed_prompt, negative_prompt, lora_info)
+        sections = apply_prompt_sections(input_prompt, "")[1]
+        return (
+            json.dumps(diff, indent=2, ensure_ascii=False),
+            "\n".join(warnings),
+            json.dumps(sections, indent=2, ensure_ascii=False),
+        )
+
+
+# ==============================================================================
+# PROMPT SYNTAX LINT NODE
+# ==============================================================================
+class UmiPromptSyntaxLint:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+            },
+            "optional": {
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "profile": (list_prompt_profiles(), {"default": "None"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("errors", "warnings", "report_json")
+    FUNCTION = "run"
+    CATEGORY = "UmiAI/prompt"
+    COLOR = "#47325e"
+
+    def run(self, prompt, negative_prompt="", profile="None"):
+        report = lint_prompt_syntax(
+            prompt, negative_prompt, profile, wildcard_paths=get_all_wildcard_paths()
+        )
+        return (
+            "\n".join(report.get("errors", [])),
+            "\n".join(report.get("warnings", []) + report.get("notes", [])),
+            json.dumps(report, indent=2, ensure_ascii=False),
+        )
+
+
+# ==============================================================================
+# PROMPT PRESET HELPER NODE
+# ==============================================================================
+class UmiPromptPreset:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "preset": (list_prompt_presets(), {"default": list_prompt_presets()[0]}),
+                "placement": (["append", "prepend", "replace"], {"default": "append"}),
+            },
+            "optional": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("prompt", "negative_prompt", "notes")
+    FUNCTION = "run"
+    CATEGORY = "UmiAI/prompt"
+    COLOR = "#47325e"
+
+    def run(self, preset, placement="append", prompt="", negative_prompt=""):
+        prompt, negative_prompt, notes = apply_prompt_preset(prompt, negative_prompt, preset, placement)
+        return (prompt, negative_prompt, "\n".join(notes))
+
+
+# ==============================================================================
+# ANIMA PROMPT HELPER NODE
+# ==============================================================================
+class UmiAnimaPromptHelper:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
+                "mode": (["profile", "order_only", "natural_language"], {"default": "profile"}),
+                "style_preset": ([
+                    "none", "anime illustration", "clean lineart", "painterly",
+                    "official art", "flat color", "high detail"
+                ], {"default": "none"}),
+                "add_default_negative": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("prompt", "negative_prompt", "warnings")
+    FUNCTION = "run"
+    CATEGORY = "UmiAI/prompt"
+    COLOR = "#47325e"
+
+    def run(self, prompt, mode="profile", style_preset="none", add_default_negative=True, negative_prompt=""):
+        anima_extension = get_anima_extension()
+        if anima_extension is None:
+            raise RuntimeError("The C-UMI Anima/edit overlay is not installed")
+        if mode == "natural_language":
+            expanded = anima_extension.expand_natural_language(prompt)
+            processed_prompt, processed_negative, warnings = anima_extension.apply_profile(
+                expanded,
+                negative_prompt,
+                mode="profile" if add_default_negative else "prefix",
+                style_preset=style_preset,
+            )
+        elif mode == "order_only":
+            processed_prompt = anima_extension.order_prompt(prompt, style_preset=style_preset, add_prefix=False)
+            processed_negative = negative_prompt or ""
+            _, profile_negative, warnings = anima_extension.apply_profile(
+                processed_prompt,
+                processed_negative,
+                mode="negative" if add_default_negative else "order",
+                style_preset="none",
+            )
+            if add_default_negative:
+                processed_negative = profile_negative
+        else:
+            processed_prompt, processed_negative, warnings = anima_extension.apply_profile(
+                prompt,
+                negative_prompt,
+                mode="profile" if add_default_negative else "prefix",
+                style_preset=style_preset,
+            )
+
+        return (processed_prompt, processed_negative, "\n".join(warnings))
 
 
 # ==============================================================================
@@ -1757,6 +2241,7 @@ class UmiTextBypass:
             "optional": {
                 "matched_list": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
                 "match_index": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1}),
+                "matched": ("BOOLEAN", {"default": True}),
                 "image": ("IMAGE",),
                 "latent": ("LATENT",),
                 "conditioning": ("CONDITIONING",),
@@ -1772,22 +2257,21 @@ class UmiTextBypass:
     CATEGORY = "UmiAI"
 
     def run(self, passthrough_type, matched_list=None, match_index=0,
-            image=None, latent=None, conditioning=None, model=None, clip=None, string=None):
+            matched=True, image=None, latent=None, conditioning=None, model=None, clip=None, string=None):
 
-        effective_matched = False
+        effective_matched = bool(matched)
         if matched_list:
             try:
                 parsed = matched_list
                 if isinstance(matched_list, str):
                     parsed = json.loads(matched_list)
-                if isinstance(parsed, list) and 0 <= int(match_index) < len(parsed):
-                    effective_matched = bool(parsed[int(match_index)])
+                if isinstance(parsed, list):
+                    effective_matched = False
+                    if 0 <= int(match_index) < len(parsed):
+                        effective_matched = bool(parsed[int(match_index)])
             except Exception:
                 pass
 
-        print(f"[UmiTextBypass BACKEND] Executing!")
-        print(f"[UmiTextBypass BACKEND] matched input: (effective={effective_matched})")
-        print(f"[UmiTextBypass BACKEND] passthrough_type: {passthrough_type}")
 
         blocker_cls = _get_execution_blocker_class()
         backend_controls = blocker_cls is not None
@@ -1802,9 +2286,9 @@ class UmiTextBypass:
                 "umi_bypass_precheck",
                 {"matched": effective_matched, "check_state": True},
             )
-            print(f"[UmiTextBypass BACKEND] Sent precheck signal: matched={effective_matched}")
+            umi_debug_print(f"[UmiTextBypass] Sent precheck signal: matched={effective_matched}")
         except Exception as e:
-            print(f"[UmiTextBypass BACKEND] Failed to send precheck: {e}")
+            logging.warning(f"[UmiTextBypass] Failed to send precheck: {e}")
 
         # Send matched status to frontend immediately
         try:
@@ -1813,14 +2297,18 @@ class UmiTextBypass:
                 "umi_bypass_signal",
                 {"matched": effective_matched, "backend_controls": backend_controls, "needs_restart": needs_restart},
             )
-            print(f"[UmiTextBypass BACKEND] Sent bypass signal: matched={effective_matched}, backend_controls={backend_controls}")
+            umi_debug_print(f"[UmiTextBypass] Sent bypass signal: matched={effective_matched}, backend_controls={backend_controls}")
         except Exception as e:
-            print(f"[UmiTextBypass BACKEND] Failed to send signal: {e}")
+            logging.warning(f"[UmiTextBypass] Failed to send signal: {e}")
 
         # If ExecutionBlocker is available, stop downstream execution immediately
         if not effective_matched and blocker_cls is not None:
-            blocker = blocker_cls()
-            print("[UmiTextBypass BACKEND] Blocking downstream execution via ExecutionBlocker")
+            try:
+                # ComfyUI's ExecutionBlocker takes a message; None blocks silently.
+                blocker = blocker_cls(None)
+            except TypeError:
+                blocker = blocker_cls()
+            umi_debug_print("[UmiTextBypass] Blocking downstream execution via ExecutionBlocker")
             return (blocker, blocker, blocker, blocker, blocker, blocker)
 
         # Always pass through - the matched boolean is informational only
@@ -1845,16 +2333,51 @@ class UmiTextBypass:
             out_string = string
 
         status = "MATCHED" if effective_matched else "NOT MATCHED"
-        print(f"[UmiTextBypass BACKEND] {status} - passing through {passthrough_type}")
+        umi_debug_print(f"[UmiTextBypass] {status} - passing through {passthrough_type}")
         if blocker_cls is None:
-            print("[UmiTextBypass BACKEND] Note: ExecutionBlocker unavailable - frontend bypass may be used")
+            umi_debug_print("[UmiTextBypass] Note: ExecutionBlocker unavailable - frontend bypass may be used")
         return (out_image, out_latent, out_conditioning, out_model, out_clip, out_string)
 
-NODE_CLASS_MAPPINGS = {
-    "UmiAIWildcardNodeLite": UmiAIWildcardNodeLite,
-    "UmiAIWildcardNode": UmiAIWildcardNodeLite  # Unified node - both names map to same class
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "UmiAIWildcardNodeLite": "UmiAI Wildcard Processor",
-    "UmiAIWildcardNode": "UmiAI Wildcard Processor"  # Same display name for both
-}
+
+class UmiBypassModelSwitch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "matched_list": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
+                "match_index": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1}),
+            },
+            "optional": {
+                "base_model": ("MODEL", {"lazy": True}),
+                "reference_model": ("MODEL", {"lazy": True}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "run"
+    CATEGORY = "UmiAI"
+
+    @staticmethod
+    def _is_matched(matched_list=None, match_index=0):
+        if not matched_list:
+            return False
+        try:
+            parsed = json.loads(matched_list) if isinstance(matched_list, str) else matched_list
+            if isinstance(parsed, list) and 0 <= int(match_index) < len(parsed):
+                return bool(parsed[int(match_index)])
+        except Exception:
+            pass
+        return False
+
+    def check_lazy_status(self, matched_list=None, match_index=0, base_model=None, reference_model=None):
+        if self._is_matched(matched_list, match_index):
+            return ["reference_model"] if reference_model is None else []
+        return ["base_model"] if base_model is None else []
+
+    def run(self, matched_list=None, match_index=0, base_model=None, reference_model=None):
+        if self._is_matched(matched_list, match_index):
+            return (reference_model,)
+        return (base_model,)
+
+# Node registration lives in the package __init__.py (CORE_NODE_CLASS_MAPPINGS).

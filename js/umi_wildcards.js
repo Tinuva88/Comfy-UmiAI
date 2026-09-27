@@ -1,4 +1,5 @@
-import { app } from "../../scripts/app.js";
+﻿import { app } from "../../scripts/app.js";
+import { ensureUmiTheme, T } from "./umi_theme.js";
 
 // =============================================================================
 // PART 1: AUTOCOMPLETE LOGIC (Enhanced with Fuzzy Search & Context Awareness)
@@ -8,20 +9,23 @@ class AutoCompletePopup {
     constructor() {
         this.element = document.createElement("div");
         Object.assign(this.element.style, {
-            position: "absolute",
+            position: "fixed",
             display: "none",
-            backgroundColor: "#1e1e1e",
-            border: "1px solid #61afef",
+            backgroundColor: T.ground,
+            border: `1px solid ${T.rule}`,
             zIndex: "10001",
             maxHeight: "250px",
             overflowY: "auto",
-            color: "#e0e0e0",
+            color: T.ink,
             fontFamily: "'Consolas', 'Monaco', monospace",
             fontSize: "13px",
             borderRadius: "4px",
-            boxShadow: "0 10px 25px rgba(0,0,0,0.8)",
-            minWidth: "250px"
+            boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
+            boxSizing: "border-box",
+            minWidth: "min(250px, calc(100vw - 16px))",
+            maxWidth: "min(520px, calc(100vw - 16px))"
         });
+        ensureUmiTheme();
         document.body.appendChild(this.element);
 
         this.visible = false;
@@ -31,20 +35,53 @@ class AutoCompletePopup {
         this.listItems = []; // Store references to list item elements
     }
 
-    show(x, y, options, onSelect) {
+    // anchor is a viewport-space caret box: {left, top, bottom}. The popup
+    // opens below the caret when there is room and above it when there is not,
+    // so typing near the bottom of a tall textarea no longer covers the text.
+    show(anchor, options, onSelect) {
         this.items = options;
         this.onSelectCallback = onSelect;
         this.selectedIndex = 0;
         this.visible = true;
 
-        this.element.style.left = x + "px";
-        this.element.style.top = y + "px";
+        const GAP = 4;
+        const MARGIN = 8;
+        const viewportH = window.innerHeight;
+        const viewportW = window.innerWidth;
+
+        // Measure at natural height before deciding, with the cap lifted.
+        this.element.style.maxHeight = "none";
+        this.element.style.visibility = "hidden";
         this.element.style.display = "block";
+        this.element.style.top = "0px";
+        this.element.style.left = "0px";
         this.render();
+
+        const natural = this.element.offsetHeight;
+        const width = this.element.offsetWidth;
+        const spaceBelow = viewportH - anchor.bottom - GAP - MARGIN;
+        const spaceAbove = anchor.top - GAP - MARGIN;
+
+        const openUp = spaceBelow < Math.min(natural, 120) && spaceAbove > spaceBelow;
+        const room = Math.max(80, openUp ? spaceAbove : spaceBelow);
+        const height = Math.min(natural, room, 250);
+
+        this.element.style.maxHeight = height + "px";
+        this.element.style.top = (openUp ? anchor.top - GAP - height : anchor.bottom + GAP) + "px";
+
+        // Keep long wildcard names from pushing the list off-screen.
+        const left = Math.max(MARGIN, Math.min(anchor.left, viewportW - width - MARGIN));
+        this.element.style.left = left + "px";
+
+        this.element.style.visibility = "visible";
+        this.openedUpward = openUp;
     }
 
     hide() {
+        this.onSelectCallback = null;
+        this.owner = null;
         this.element.style.display = "none";
+        this.element.style.visibility = "visible";
         this.visible = false;
         this.items = [];
         this.listItems = [];
@@ -58,15 +95,15 @@ class AutoCompletePopup {
         // Update old item styles
         if (this.listItems[oldIndex]) {
             this.listItems[oldIndex].style.backgroundColor = "transparent";
-            this.listItems[oldIndex].style.color = "#e0e0e0";
+            this.listItems[oldIndex].style.color = T.ink;
             this.listItems[oldIndex].style.borderLeft = "3px solid transparent";
         }
 
         // Update new item styles
         if (this.listItems[newIndex]) {
-            this.listItems[newIndex].style.backgroundColor = "#2d4f6c";
-            this.listItems[newIndex].style.color = "#fff";
-            this.listItems[newIndex].style.borderLeft = "3px solid #61afef";
+            this.listItems[newIndex].style.backgroundColor = T.accent_soft;
+            this.listItems[newIndex].style.color = T.ink_strong;
+            this.listItems[newIndex].style.borderLeft = `3px solid ${T.accent}`;
         }
 
         // Auto-scroll to selected item
@@ -92,8 +129,8 @@ class AutoCompletePopup {
         // Header
         const header = document.createElement("div");
         Object.assign(header.style, {
-            padding: "4px 8px", fontSize: "11px", color: "#888",
-            borderBottom: "1px solid #333", backgroundColor: "#252525"
+            padding: "4px 8px", fontSize: "11px", color: T.ink_3,
+            borderBottom: `1px solid ${T.rule}`, backgroundColor: T.surface_alt
         });
         header.innerText = this.items.length > 50
             ? `Showing 50 of ${this.items.length} matches...`
@@ -103,17 +140,46 @@ class AutoCompletePopup {
         // List Items (Limit to 50 for performance)
         this.items.slice(0, 50).forEach((opt, index) => {
             const div = document.createElement("div");
-            div.innerText = opt;
+
+            const category = getSuggestionCategory(opt);
+            const categoryColor = TAG_CATEGORY_COLORS[category];
+            const count = opt && typeof opt === "object" ? opt.count : undefined;
+
+            if (categoryColor || count !== undefined) {
+                // Name in its category colour, occurrence count trailing and
+                // dimmed, so the two read as separate pieces of information.
+                const name = document.createElement("span");
+                name.innerText = getSuggestionValue(opt);
+                if (categoryColor) name.style.color = categoryColor;
+                if (category !== null && TAG_CATEGORY_NAMES[category]) {
+                    div.title = `${getSuggestionValue(opt)} — ${TAG_CATEGORY_NAMES[category]}`
+                        + (count !== undefined ? ` — ${count} posts` : "");
+                }
+                div.appendChild(name);
+
+                if (count !== undefined) {
+                    const badge = document.createElement("span");
+                    badge.innerText = formatTagCount(count);
+                    Object.assign(badge.style, {
+                        float: "right", color: T.ink_3, fontSize: "11px",
+                        marginLeft: "10px", paddingTop: "1px",
+                    });
+                    div.appendChild(badge);
+                }
+            } else {
+                div.innerText = getSuggestionDisplayText(opt);
+            }
 
             Object.assign(div.style, {
                 cursor: "pointer", padding: "6px 10px",
-                borderBottom: "1px solid #2a2a2a", transition: "background 0.05s"
+                borderBottom: `1px solid ${T.rule}`, transition: "background 0.05s",
+                overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis",
             });
 
             if (index === this.selectedIndex) {
-                div.style.backgroundColor = "#2d4f6c";
-                div.style.color = "#fff";
-                div.style.borderLeft = "3px solid #61afef";
+                div.style.backgroundColor = T.accent_soft;
+                div.style.borderLeft = `3px solid ${T.accent}`;
+                if (!categoryColor) div.style.color = T.ink_strong;
             } else {
                 div.style.backgroundColor = "transparent";
                 div.style.borderLeft = "3px solid transparent";
@@ -153,7 +219,7 @@ class AutoCompletePopup {
     }
 
     triggerSelection() {
-        if (this.visible && this.items[this.selectedIndex] && this.onSelectCallback) {
+        if (this.visible && this.items[this.selectedIndex] !== undefined && this.onSelectCallback) {
             this.onSelectCallback(this.items[this.selectedIndex]);
             this.hide();
         }
@@ -181,17 +247,17 @@ const HELP_STYLES = `
         padding: 22px 40px; border-bottom: 1px solid rgba(97, 175, 239, 0.25);
         display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
     }
-    .umi-help-header h2 { margin: 0; color: #fff; font-size: 26px; font-weight: 600; letter-spacing: 0.5px; text-shadow: 0 2px 4px rgba(0,0,0,0.3); }
-    .umi-help-header .version { font-size: 12px; color: #98c379; font-weight: 600; margin-left: 12px; background: rgba(152, 195, 121, 0.15); padding: 4px 10px; border-radius: 6px; border: 1px solid rgba(152, 195, 121, 0.3); }
+    .umi-help-header h2 { margin: 0; color: var(--umi-ink-strong); font-size: 26px; font-weight: 600; letter-spacing: 0.5px; text-shadow: 0 2px 4px rgba(0,0,0,0.3); }
+    .umi-help-header .version { font-size: 12px; color: var(--umi-ok); font-weight: 600; margin-left: 12px; background: rgba(152, 195, 121, 0.15); padding: 4px 10px; border-radius: 6px; border: 1px solid rgba(152, 195, 121, 0.3); }
     .umi-help-close {
-        background: linear-gradient(135deg, #e06c75 0%, #be5046 100%); color: white; border: none; padding: 10px 24px;
+        background: linear-gradient(135deg, var(--umi-danger) 0%, var(--umi-danger) 100%); color: white; border: none; padding: 10px 24px;
         border-radius: 8px; cursor: pointer; font-weight: 600; transition: all 0.2s ease;
         box-shadow: 0 2px 8px rgba(224, 108, 117, 0.3);
     }
     .umi-help-close:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(224, 108, 117, 0.4); }
     .umi-help-body {
-        padding: 40px; overflow-y: auto; color: #ccc; line-height: 1.7;
-        scrollbar-width: thin; scrollbar-color: #444 #181818;
+        padding: 40px; overflow-y: auto; color: var(--umi-ink-2); line-height: 1.7;
+        scrollbar-width: thin; scrollbar-color: var(--umi-rule-strong) var(--umi-ground);
     }
     
     /* Layout */
@@ -199,935 +265,197 @@ const HELP_STYLES = `
     .umi-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 20px; }
     
     /* Typography */
-    h3 { color: #61afef; border-bottom: 1px solid #333; padding-bottom: 10px; margin-top: 0; font-size: 20px; font-weight: 600; display: flex; align-items: center; }
-    h4 { color: #e5c07b; margin-bottom: 8px; margin-top: 20px; font-size: 15px; font-weight: 600; }
-    p { margin-top: 0; font-size: 14px; color: #abb2bf; }
+    .umi-help-body h3 { color: var(--umi-accent); border-bottom: 1px solid var(--umi-rule); padding-bottom: 10px; margin-top: 0; font-size: 20px; font-weight: 600; display: flex; align-items: center; }
+    .umi-help-body h4 { color: var(--umi-warn); margin-bottom: 8px; margin-top: 20px; font-size: 15px; font-weight: 600; }
+    .umi-help-body p { margin-top: 0; font-size: 14px; color: var(--umi-ink); }
     
     /* Components */
     .umi-code {
-        background: #282c34; padding: 2px 6px; border-radius: 4px; 
-        font-family: "Consolas", "Monaco", monospace; color: #98c379; border: 1px solid #3e4451; font-size: 0.9em;
+        background: var(--umi-surface-alt); padding: 2px 6px; border-radius: 4px; 
+        font-family: "Consolas", "Monaco", monospace; color: var(--umi-ok); border: 1px solid var(--umi-rule-strong); font-size: 0.9em;
     }
     .umi-block {
-        background: #282c34; padding: 15px; border-radius: 6px; 
-        font-family: "Consolas", "Monaco", monospace; color: #abb2bf; border-left: 4px solid #61afef;
+        background: var(--umi-surface-alt); padding: 15px; border-radius: 6px; 
+        font-family: "Consolas", "Monaco", monospace; color: var(--umi-ink); border-left: 4px solid var(--umi-accent);
         margin: 10px 0; white-space: pre-wrap; font-size: 12px; overflow-x: auto;
     }
-    .umi-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 15px; border: 1px solid #333; }
-    .umi-table th { text-align: left; background: #252525; border-bottom: 1px solid #444; padding: 10px; color: #fff; }
-    .umi-table td { border-bottom: 1px solid #333; padding: 10px; color: #bbb; background: #1e1e1e; }
+    .umi-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 15px; border: 1px solid var(--umi-rule); }
+    .umi-table th { text-align: left; background: var(--umi-surface-alt); border-bottom: 1px solid var(--umi-rule-strong); padding: 10px; color: var(--umi-ink-strong); }
+    .umi-table td { border-bottom: 1px solid var(--umi-rule); padding: 10px; color: var(--umi-ink-3); background: var(--umi-ground); }
     .umi-table tr:last-child td { border-bottom: none; }
     
     /* Callouts */
-    .callout { padding: 15px; border-radius: 6px; margin-top: 20px; font-size: 13px; border-left: 4px solid; }
-    .callout-info { background: #1c242c; border-color: #61afef; color: #d1d9e6; }
-    .callout-warn { background: #2c2222; border-color: #e06c75; color: #e6d1d1; }
-    .callout-success { background: #1e2620; border-color: #98c379; color: #d1e6d6; }
+    .umi-help-body .callout { padding: 15px; border-radius: 6px; margin-top: 20px; font-size: 13px; border-left: 4px solid; }
+    .umi-help-body .callout-info { background: var(--umi-accent-wash); border-color: var(--umi-accent); color: var(--umi-ink); }
+    .umi-help-body .callout-warn { background: var(--umi-crit-wash); border-color: var(--umi-danger); color: var(--umi-danger); }
+    .umi-help-body .callout-success { background: var(--umi-ok-wash); border-color: var(--umi-ok); color: var(--umi-ok); }
     
     /* Wiring Diagram Style */
-    .step-list { margin: 0; padding: 0; list-style: none; counter-reset: step; }
-    .step-list li { position: relative; padding-left: 30px; margin-bottom: 10px; font-size: 14px; }
-    .step-list li::before { 
+    .umi-help-body .step-list { margin: 0; padding: 0; list-style: none; counter-reset: step; }
+    .umi-help-body .step-list li { position: relative; padding-left: 30px; margin-bottom: 10px; font-size: 14px; }
+    .umi-help-body .step-list li::before {
         counter-increment: step; content: counter(step); 
         position: absolute; left: 0; top: 0; width: 20px; height: 20px; 
-        background: #333; color: #fff; border-radius: 50%; 
+        background: var(--umi-rule); color: var(--umi-ink-strong); border-radius: 50%; 
         text-align: center; line-height: 20px; font-size: 11px; font-weight: bold;
     }
 
     /* Details/Summary */
-    details { background: #21252b; border-radius: 6px; padding: 10px; margin-bottom: 10px; border: 1px solid #333; transition: 0.2s; }
-    details[open] { background: #282c34; border-color: #444; }
-    summary { cursor: pointer; font-weight: 600; color: #e0e0e0; outline: none; list-style: none; display: flex; justify-content: space-between; align-items: center; }
-    summary::after { content: "+"; color: #61afef; font-weight: bold; font-size: 16px; }
-    details[open] summary::after { content: "−"; }
-    details[open] summary { margin-bottom: 15px; border-bottom: 1px solid #3e4451; padding-bottom: 10px; }
+    .umi-help-body details { background: var(--umi-surface); border-radius: 6px; padding: 10px; margin-bottom: 10px; border: 1px solid var(--umi-rule); transition: 0.2s; }
+    .umi-help-body details[open] { background: var(--umi-surface-alt); border-color: var(--umi-rule-strong); }
+    .umi-help-body summary { cursor: pointer; font-weight: 600; color: var(--umi-ink); outline: none; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+    .umi-help-body summary::after { content: "+"; color: var(--umi-accent); font-weight: bold; font-size: 16px; }
+    .umi-help-body details[open] summary::after { content: "−"; }
+    .umi-help-body details[open] summary { margin-bottom: 15px; border-bottom: 1px solid var(--umi-rule-strong); padding-bottom: 10px; }
 `;
 
 const HELP_HTML = `
     <div class="umi-section">
-        <h3>🔌 Setup & Wiring (The "Passthrough")</h3>
-        <p>The UmiAI node acts as the "Central Brain". You must pass your <strong>Model</strong> and <strong>CLIP</strong> through it so it can apply LoRAs automatically.</p>
-
-        <div class="umi-grid-2">
-            <div class="callout callout-success" style="margin-top: 0;">
-                <h4 style="margin-top:0">Step 1: The Main Chain</h4>
-                <ul class="step-list">
-                    <li>Connect <strong>Checkpoint Loader</strong> (Model & CLIP) &#10142; <strong>UmiAI Node</strong> (Inputs).</li>
-                    <li>Connect <strong>UmiAI Node</strong> (Model & CLIP Outputs) &#10142; <strong>KSampler</strong> or <strong>Text Encode</strong> nodes.</li>
-                </ul>
-                <p style="margin-top:10px; font-size:12px; opacity:0.8"><em>This "Passthrough" connection allows the node to inject LoRAs on the fly.</em></p>
-            </div>
-
-            <div class="callout callout-info" style="margin-top: 0;">
-                <h4 style="margin-top:0">Step 2: Prompts & Auto-Reload</h4>
-                <ul class="step-list">
-                    <li>Connect <strong>Text/Negative</strong> outputs to your CLIP Text Encodes.</li>
-                    <li><strong>🔥 Auto-Reload:</strong> Files auto-reload when edited! Just save and generate - no manual refresh needed.</li>
-                    <li><strong>Manual Refresh:</strong> Use the <strong>"🔄 Refresh"</strong> button in the Wildcards tab to force reload all files.</li>
-                </ul>
-            </div>
-        </div>
-
-         <div class="callout callout-warn">
-            <strong>⚠️ Note on Batch Size:</strong><br>
-            Use the <strong>"Queue Batch"</strong> setting in the ComfyUI Extra Options menu (checkboxes on the right menu) to generate variations. Do not use the widget batch size on the Latent node, or you will get identical duplicates.
-        </div>
-    </div>
-
-    <div class="umi-section">
-        <h3>⚡ Syntax Cheat Sheet</h3>
-        <div class="umi-grid-2">
-            <div>
-                <h4 style="margin-top:0">🎲 Dynamic Prompts</h4>
-                <table class="umi-table">
-                    <tr><td><span class="umi-code">{a|b}</span></td><td>Random choice.</td></tr>
-                    <tr><td><span class="umi-code">{25%A|75%B}</span></td><td><strong>Weighted:</strong> 25% A, 75% B.</td></tr>
-                    <tr><td><span class="umi-code">{a|b} ... {1|2}</span></td><td><strong>Sync:</strong> 2 lists of equal size will always match indices.</td></tr>
-                    <tr><td><span class="umi-code">{2$$a|b|c}</span></td><td>Pick 2 unique.</td></tr>
-                    <tr><td><span class="umi-code">__*__</span></td><td><strong>Wildcard:</strong> Pick from ANY file.</td></tr>
-                    <tr><td><span class="umi-code">&lt;[Tag]&gt;</span></td><td><strong>Tag Aggregation:</strong> Pick from any entry with this tag.</td></tr>
-                </table>
-            </div>
-            <div>
-                <h4 style="margin-top:0">🎛️ Tools & Logic</h4>
-                <table class="umi-table">
-                    <tr><td><span class="umi-code">$var={...}</span></td><td>Define variable.</td></tr>
-                    <tr><td><span class="umi-code">[if K : A | B]</span></td><td>Logic Gate.</td></tr>
-                    <tr><td><span class="umi-code">[if K : A elif K2 : B else: C]</span></td><td>Elif chain.</td></tr>
-                    <tr><td><span class="umi-code">in / contains / matches / startswith / endswith</span></td><td>String operators.</td></tr>
-                    <tr><td><span class="umi-code">[shuffle: a, b]</span></td><td>Randomize order.</td></tr>
-                    <tr><td><span class="umi-code">[clean: a, , b]</span></td><td>Fix bad formatting.</td></tr>
-                    <tr><td><span class="umi-code">text --neg: bad</span></td><td>Scoped Negative.</td></tr>
-                    <tr><td><span class="umi-code">&lt;lora:name:1.0&gt;</span></td><td>Load LoRA (Auto).</td></tr>
-                    <tr><td><span class="umi-code">@@width=768...@@</span></td><td>Set Resolution.</td></tr>
-                </table>
-            </div>
-        </div>
-    </div>
-
-    <div class="umi-section">
-        <h3>Logic Quick Test</h3>
-        <div class="umi-block" style="font-size:12px">$style={retro_film|modern_clean|vintage_35mm}
-[if $style startswith "retro" : film grain, chromatic aberration
- elif $style contains "clean" : clean lines, minimal noise
- elif $style matches "35mm$" : halation, soft highlights
- else: neutral]
-$style</div>
-    </div>
-
-    <div class="umi-section">
-        <h3>✨ Editor Features</h3>
-        <p>The prompt editor includes powerful features to help you write and debug prompts faster!</p>
-
-        <div class="umi-grid-2">
-            <div>
-                <h4 style="margin-top:0">🎨 Syntax Highlighting</h4>
-                <p style="font-size:12px">Real-time color coding for all UmiAI syntax elements:</p>
-                <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                    <li><span style="color:#98c379">__wildcards__</span> - Green</li>
-                    <li><span style="color:#61afef">&lt;[tags]&gt;</span> - Blue</li>
-                    <li><span style="color:#e5c07b">{choices}</span> - Yellow</li>
-                    <li><span style="color:#ffd43b">__2-4$$range__</span> - Gold</li>
-                    <li><span style="color:#c678dd">$variables</span> - Purple</li>
-                    <li><span style="color:#ff922b">&lt;lora:name&gt;</span> - Orange</li>
-                    <li><span style="color:#56b6c2">[conditionals]</span> - Cyan</li>
-                    <li><span style="color:#20c997">[functions]</span> - Teal</li>
-                    <li><span style="color:#ff79c6">BREAK</span> - Magenta</li>
-                </ul>
-            </div>
-            <div>
-                <h4 style="margin-top:0">🔍 Prompt Linting</h4>
-                <p style="font-size:12px">Automatic error detection shows issues at the bottom:</p>
-                <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                    <li>Unclosed brackets <code>{</code> <code>[</code> <code>(</code></li>
-                    <li>Unclosed wildcards <code>__name</code></li>
-                    <li>Missing wildcard files</li>
-                    <li>Missing LoRA files</li>
-                </ul>
-                <p style="font-size:11px; color:#888">Click the lint bar to expand error details</p>
-            </div>
-        </div>
-
-        <div class="umi-grid-2" style="margin-top:15px">
-            <div>
-                <h4 style="margin-top:0">🔧 Fix & Clean Tools</h4>
-                <p style="font-size:12px">Automate prompt cleanup:</p>
-                <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                    <li><strong>Fix:</strong> Repair broken brackets, wildcards, YAML tags</li>
-                    <li><strong>Auto-Clean:</strong> Toggle to clean spaces, commas, BREAK formatting</li>
-                    <li><strong>Ctrl+Shift+B:</strong> Keyboard shortcut for fix</li>
-                </ul>
-            </div>
-            <div>
-                <h4 style="margin-top:0">👁️ Wildcard Preview</h4>
-                <p style="font-size:12px">Hover over any <code>__wildcard__</code> to see its contents!</p>
-                <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                    <li>Shows first 15 entries</li>
-                    <li>Works with .txt, .yaml, .csv</li>
-                    <li>Cached for performance</li>
-                </ul>
-            </div>
-        </div>
-    </div>
-
-    <div class="umi-section">
-        <h3>🔋 LoRA Loading (Internal)</h3>
-        <p>The node now patches the Model and CLIP for you. You do not need any external LoRA Loader nodes.</p>
-
-        <div class="umi-block">// Syntax: &lt;lora:Filename:Strength&gt;
-
-// Basic usage (Strength defaults to 1.0)
-&lt;lora:pixel_art_v2&gt;
-
-// With Strength (Range: 0.0 to 5.0)
-&lt;lora:add_detail:0.5&gt;
-&lt;lora:strong_effect:3.5&gt;
-
-// Inside logic or variables!
-$style={ &lt;lora:anime:1.0&gt; | &lt;lora:realistic:0.8&gt; }
-A photo of a cat, $style</div>
-
-        <div class="callout callout-warn" style="margin-top:15px">
-            <strong>⚡ Strength Range:</strong> 0.0 to 5.0 (extended for fringe cases). Out-of-range values are automatically clamped. Invalid formats default to 1.0.
-        </div>
-
+        <h3>What this node does</h3>
+        <p>The Wildcard Processor takes one prompt template and expands it into a
+        finished prompt: wildcard files, inline choices, variables, conditionals,
+        negatives, LoRA tags and size hints. The same seed always produces the
+        same result.</p>
         <div class="callout callout-info">
-            <h4 style="margin-top:0">🔍 New: LoRA Tag Inspector & Injector</h4>
-            <p>Don't know the trigger words for your LoRA? The node can now read the .safetensors metadata.</p>
-            <div class="umi-grid-2" style="margin-bottom:0; gap:15px; margin-top:10px;">
-                <div style="background: #151515; padding: 10px; border-radius: 6px;">
-                    <strong>👁️ See the Tags</strong><br>
-                    <span style="font-size:12px; color:#888;">Connect the new <strong>lora_info</strong> output string to a "Show Text" or "Preview Text" node. It will list every loaded LoRA and their top training tags.</span>
-                </div>
-                <div style="background: #151515; padding: 10px; border-radius: 6px;">
-                    <strong>💉 Auto-Inject</strong><br>
-                    <span style="font-size:12px; color:#888;">Use the <strong>lora_tags_behavior</strong> widget to automatically <em>Append</em> or <em>Prepend</em> the most common training tags to your prompt.</span>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <div class="umi-section">
-        <h3>📂 Creating & Using Wildcards</h3>
-        <p>You can create your own lists in the <code>wildcards/</code> folder or <code>models/wildcards/</code>.</p>
-
-        <div class="umi-grid-2">
-            <div>
-                <h4>1. Simple Text Lists (.txt)</h4>
-                <p>Create a file named <code>colors.txt</code>:</p>
-                <div class="umi-block">Red
-Blue
-Green</div>
-                <p><strong>Usage:</strong></p>
-                <div class="umi-block">A __colors__ dress.</div>
-            </div>
-
-            <div>
-                <h4>2. YAML Files (Tag-Based Selection)</h4>
-                <div class="umi-block">FireKnight:
-  Prompts: ["knight in flame armor"]
-  Tags: [Fire, Warrior, Heavy]
-
-IceMage:
-  Prompts: ["ice wizard"]
-  Tags: [Ice, Mage, Light]</div>
-                <p style="font-size:12px"><strong>Tag-based:</strong> <code>&lt;[Fire]&gt;</code> (any entry with 'Fire' tag)</p>
-                <p style="font-size:12px"><strong>Specific entry:</strong> <code>&lt;FireKnight&gt;</code> or <code>&lt;filename:FireKnight&gt;</code></p>
-                <p style="font-size:12px"><strong>Logic:</strong> <code>&lt;[Fire AND Warrior]&gt;</code>, <code>&lt;[Ice OR Fire]&gt;</code>, <code>&lt;[NOT Heavy]&gt;</code></p>
-            </div>
-        </div>
-
-        <details style="margin-top:20px">
-            <summary style="cursor:pointer; font-weight:600; font-size:14px; color:#61afef">🧠 Boolean Logic Engine (YAML Tags)</summary>
-            <p style="margin-top:10px">Use boolean logic to select YAML entries based on complex tag combinations!</p>
-
-            <table class="umi-table" style="margin-top:10px">
-                <tr><th>Operator</th><th>Syntax</th><th>Meaning</th></tr>
-                <tr><td><strong>AND</strong></td><td><code>&&</code> or <code>AND</code></td><td>Both conditions must be true</td></tr>
-                <tr><td><strong>OR</strong></td><td><code>||</code> or <code>OR</code></td><td>Either condition must be true</td></tr>
-                <tr><td><strong>XOR</strong></td><td><code>^</code> or <code>XOR</code></td><td>Exactly one condition must be true</td></tr>
-                <tr><td><strong>NOT</strong></td><td><code>!</code> or <code>NOT</code></td><td>Inverts the condition</td></tr>
-                <tr><td><strong>NAND</strong></td><td><code>NAND</code></td><td>NOT (both conditions true)</td></tr>
-                <tr><td><strong>NOR</strong></td><td><code>NOR</code></td><td>NOT (either condition true)</td></tr>
-                <tr><td><strong>Grouping</strong></td><td><code>( )</code></td><td>Control precedence</td></tr>
-            </table>
-
-            <div style="margin-top:15px">
-                <h4 style="margin:10px 0 5px 0; font-size:13px">Examples:</h4>
-                <div class="umi-block" style="font-size:12px">// YAML File
-FireKnight:
-  Prompts: ["knight in flame armor"]
-  Tags: [Fire, Warrior, Heavy]
-
-IceMage:
-  Prompts: ["ice wizard"]
-  Tags: [Ice, Mage, Light]
-
-// Logic Expressions
-&lt;[Fire AND Warrior]&gt;          → FireKnight
-&lt;[Ice OR Fire]&gt;               → Either one
-&lt;[(Fire OR Ice) AND Mage]&gt;    → IceMage only
-&lt;[NOT Heavy]&gt;                 → IceMage only
-&lt;[Fire XOR Heavy]&gt;            → Nothing (both are true)</div>
-            </div>
-
-            <div class="callout callout-info" style="margin-top:10px">
-                <strong>💡 Precedence:</strong> NOT (highest) → AND → OR/XOR/NAND/NOR (lowest). Use parentheses for clarity!
-            </div>
-
-            <div style="margin-top:15px; border-top:1px solid #444; padding-top:10px">
-                <h4 style="margin:10px 0 5px 0; font-size:13px">🆕 Logic with .txt Wildcards</h4>
-                <p style="font-size:12px">You can add tags to .txt file entries and filter them with logic!</p>
-                <div class="umi-block" style="font-size:12px">// colors.txt with tags
-Red::Fire,Warm,Bright
-Blue::Ice,Cool,Calm
-Green::Nature,Earth
-
-// Usage with logic filter
-__colors[Fire OR Ice]__       → Red or Blue only
-__colors[NOT Warm]__          → Blue or Green
-__colors[Bright AND Fire]__   → Red only</div>
-
-                <p style="font-size:12px; margin-top:10px"><strong>Syntax formats:</strong></p>
-                <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                    <li><code>text::tag1,tag2</code> - Entry with tags</li>
-                    <li><code>__file[logic]__</code> - Filter by logic expression</li>
-                </ul>
-            </div>
-
-            <div style="margin-top:15px; border-top:1px solid #444; padding-top:10px">
-                <h4 style="margin:10px 0 5px 0; font-size:13px">🔀 Variable Comparisons</h4>
-                <p style="font-size:12px">Logic expressions now support variable comparisons!</p>
-                <div class="umi-block" style="font-size:12px">// globals.yaml
-$theme: cyberpunk
-$mood: dark
-
-// YAML with conditional logic
-CyberKnight:
-  Prompts: ["neon knight"]
-  Tags: [Cyberpunk, Dark]
-
-// Usage
-&lt;[$theme==cyberpunk AND Dark]&gt;  → CyberKnight
-&lt;[$mood==happy OR Light]&gt;       → Won't match CyberKnight</div>
-
-                <p style="font-size:12px; margin-top:10px"><strong>Comparison operators:</strong></p>
-                <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                    <li><code>$var==value</code> - Check if variable equals value</li>
-                    <li><code>$var</code> - Check if variable is truthy</li>
-                    <li>Works with all boolean operators (AND, OR, NOT, etc.)</li>
-                </ul>
-            </div>
-        </details>
-    </div>
-
-    <div class="umi-section">
-        <h3>🎲 Advanced Features</h3>
-
-        <details>
-            <summary>⚖️ Weighted Wildcards (NEW)</summary>
-            <p>Control selection probability by adding weights to entries. Higher weights = more likely to appear.</p>
-            <div class="umi-block">// colors.txt with weights
-vibrant red:10
-deep blue:5
-soft pink:1</div>
-            <p>Result: "vibrant red" is 10x more likely than "soft pink"</p>
-            <table class="umi-table" style="margin-top:15px">
-                <tr><th>Syntax</th><th>Meaning</th></tr>
-                <tr><td><code>text:5</code></td><td>Weight of 5 (5x more likely than weight 1)</td></tr>
-                <tr><td><code>text:0.5</code></td><td>Half probability (decimals supported)</td></tr>
-                <tr><td><code>text</code></td><td>Default weight = 1.0</td></tr>
-            </table>
-            <div class="callout callout-info" style="margin-top:10px">
-                <strong>💡 Tip:</strong> Weights are parsed from the last colon. Text like "time: 3pm:2.0" works correctly (value="time: 3pm", weight=2.0).
-            </div>
-        </details>
-
-        <details>
-            <summary>🔗 Nested Variable Resolution (NEW)</summary>
-            <p>Variables can now reference other variables for cascading theme systems!</p>
-            <div class="umi-block">// globals.yaml
-$theme: cyberpunk
-$theme_color: neon $theme
-$theme_outfit: futuristic $theme attire
-
-// Prompt
-A portrait with $theme_outfit
-// Output: A portrait with futuristic cyberpunk attire</div>
-            <div class="callout callout-success" style="margin-top:10px">
-                <strong>✨ Cascading Updates:</strong> Change <code>$theme</code> to "steampunk" and all dependent variables update automatically!
-            </div>
-            <p style="margin-top:10px; font-size:13px"><strong>Features:</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li>Up to 10 levels of nesting</li>
-                <li>Infinite loop protection</li>
-                <li>Works with variable methods in Full version (.upper, .clean, etc.)</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>🛡️ Escape Mechanism (NEW)</summary>
-            <p>Need to write literal wildcard syntax? Use backslash escaping!</p>
-            <table class="umi-table">
-                <tr><th>Input</th><th>Output</th></tr>
-                <tr><td><code>\__colors__</code></td><td><code>__colors__</code> (not processed)</td></tr>
-                <tr><td><code>\{red|blue}</code></td><td><code>{red|blue}</code> (not processed)</td></tr>
-                <tr><td><code>\&lt;lora:model:1&gt;</code></td><td><code>&lt;lora:model:1&gt;</code> (not processed)</td></tr>
-            </table>
-            <p style="margin-top:10px; font-size:13px"><strong>Use Cases:</strong> Documentation, tutorials, or showing syntax examples in prompts.</p>
-        </details>
-
-        <details>
-            <summary>🚨 Improved Error Messages (NEW)</summary>
-            <p>Clear, actionable feedback when things go wrong!</p>
-            <table class="umi-table">
-                <tr><th>Error Type</th><th>Meaning</th></tr>
-                <tr><td><code>[WILDCARD_NOT_FOUND: filename]</code></td><td>File doesn't exist or is empty</td></tr>
-                <tr><td><code>[NO_MATCHES: expression]</code></td><td>No YAML entries matched the logic</td></tr>
-                <tr><td><code>[GLOB_NO_MATCHES: pattern]</code></td><td>Glob pattern found nothing</td></tr>
-            </table>
-            <p style="margin-top:10px; font-size:13px">Console warnings guide you to fix issues with clear error messages.</p>
-        </details>
-
-        <details>
-            <summary>♻️ Auto-Reload & Deduplication (NEW)</summary>
-            <div class="umi-grid-2" style="margin-bottom:0">
-                <div>
-                    <h4 style="margin-top:0">📝 File Auto-Reload</h4>
-                    <p style="font-size:13px">Wildcard files now reload automatically when modified! Edit your files and generate - changes appear immediately.</p>
-                </div>
-                <div>
-                    <h4 style="margin-top:0">🧹 Negative Deduplication</h4>
-                    <p style="font-size:13px">Negative prompts automatically remove duplicates (case-insensitive) while preserving order. "blurry, BLURRY" becomes just "blurry".</p>
-                </div>
-            </div>
-        </details>
-    </div>
-
-    <div class="umi-section">
-        <h3>👤 Character Consistency System</h3>
-        <p style="font-size:12px; margin-top:4px; color:#a9c7ff">Requires the <code>umi_utilities</code> custom node.</p>
-        <p>Maintain consistent characters across generations with YAML profiles!</p>
-
-        <div class="umi-grid-2">
-            <div>
-                <h4 style="margin-top:0">Character Syntax</h4>
-                <table class="umi-table">
-                    <tr><td><span class="umi-code">@@name@@</span></td><td>Character only</td></tr>
-                    <tr><td><span class="umi-code">@@name:outfit@@</span></td><td>With outfit</td></tr>
-                    <tr><td><span class="umi-code">@@name:outfit:emotion@@</span></td><td>Full syntax</td></tr>
-                </table>
-            </div>
-            <div>
-                <h4 style="margin-top:0">Character Nodes</h4>
-                <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                    <li><strong>Character Manager</strong> - Single character builder</li>
-                    <li><strong>Character Batch</strong> - Generate all variations</li>
-                    <li><strong>Sprite Export</strong> - Organized image output</li>
-                    <li><strong>Character Info</strong> - Debug profiles</li>
-                </ul>
-            </div>
-        </div>
-
-        <div class="callout callout-info" style="margin-top:10px">
-            <strong>💡 Create profiles in:</strong> <code>umi_utilities/characters/name/profile.yaml</code>
+            <strong>Cannot tell what a template will produce?</strong> That is the
+            point of it &mdash; press <span class="umi-code">Preview roll</span> on the
+            node to expand it with the current seed without running the graph.
         </div>
     </div>
 
     <div class="umi-section">
-        <h3>🎬 Power Features</h3>
-
-        <details>
-            <summary>📷 Camera Control</summary>
-            <p>Generate camera angle prompts for multi-angle LoRAs!</p>
-            <div class="umi-grid-2">
-                <div>
-                    <h4 style="margin-top:0">Camera Control Node</h4>
-                    <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                        <li>Azimuth: 0-360° (snaps to 45°)</li>
-                        <li>Elevation: -30° to 60°</li>
-                        <li>Distance: close-up, medium, wide</li>
-                        <li>Configurable trigger word</li>
-                    </ul>
-                </div>
-                <div>
-                    <h4 style="margin-top:0">Visual Camera Control</h4>
-                    <p style="font-size:12px">Interactive canvas widget - drag to set camera angle!</p>
-                </div>
-            </div>
-        </details>
-
-        <details>
-            <summary>🎭 Pose Library & Expression Mixer</summary>
-            <p>Pre-built poses and emotion blending!</p>
-            <div class="umi-grid-2">
-                <div>
-                    <h4 style="margin-top:0">Pose Library</h4>
-                    <p style="font-size:12px">30+ poses: standing, sitting, action, expressive, lying, kneeling</p>
-                    <p style="font-size:12px">Edit <code>umi_utilities/presets/poses.yaml</code> to add custom poses!</p>
-                </div>
-                <div>
-                    <h4 style="margin-top:0">Expression Mixer</h4>
-                    <p style="font-size:12px">40+ emotions with weighted blending</p>
-                    <p style="font-size:12px">Example: happy:60% + excited:40%</p>
-                </div>
-            </div>
-        </details>
-
-        <details>
-            <summary>🎨 Scene Composer</summary>
-            <p>Combine backgrounds, lighting, and atmosphere presets!</p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                <li>50+ backgrounds (studio, outdoor, indoor, fantasy, sci-fi)</li>
-                <li>11 lighting styles (natural, dramatic, neon, cinematic)</li>
-                <li>10 atmosphere presets (cheerful, mysterious, romantic)</li>
-            </ul>
-            <p style="font-size:12px">Edit <code>umi_utilities/presets/scenes.yaml</code> to add custom scenes!</p>
-        </details>
-
-        <details>
-            <summary>📊 LoRA Dataset Export</summary>
-            <p>Generate training data for LoRA fine-tuning!</p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:12px">
-                <li><strong>Kohya-compatible</strong> folder structure</li>
-                <li>Auto-generated captions</li>
-                <li>Flip augmentation support</li>
-                <li>Caption nodes for processing external captioner output</li>
-            </ul>
-        </details>
-    </div>
-
-    <div class="umi-section">
-        <h3>📦 Bundled Wildcards</h3>
-        <p>Ready-to-use wildcards in the <code>wildcards/</code> folder:</p>
+        <h3>Wildcards</h3>
         <table class="umi-table">
-            <tr><td><span class="umi-code">__poses__</span></td><td>40+ character poses</td></tr>
-            <tr><td><span class="umi-code">__emotions__</span></td><td>45+ facial expressions</td></tr>
-            <tr><td><span class="umi-code">__backgrounds__</span></td><td>40+ environments</td></tr>
-            <tr><td><span class="umi-code">__lighting__</span></td><td>30+ lighting setups</td></tr>
+            <tr><th>Syntax</th><th>Meaning</th></tr>
+            <tr><td><span class="umi-code">__name__</span></td><td>One random line from <span class="umi-code">wildcards/name.txt</span>.</td></tr>
+            <tr><td><span class="umi-code">__name|fallback__</span></td><td>Use the fallback text if the file is missing.</td></tr>
+            <tr><td><span class="umi-code">__1-3$$name__</span></td><td>Pick one to three lines, comma joined.</td></tr>
+            <tr><td><span class="umi-code">__~name__</span></td><td>Sequential: line <span class="umi-code">seed % lines</span>. Set the seed to increment to walk the file.</td></tr>
+            <tr><td><span class="umi-code">__@name__</span></td><td>Insert a whole prompt file, not one line.</td></tr>
+            <tr><td><span class="umi-code">__name[tag AND tag]__</span></td><td>Only lines matching the tag logic. Supports AND, OR, NOT, XOR, parentheses.</td></tr>
+            <tr><td><span class="umi-code">&lt;[Entry Name]&gt;</span></td><td>Pull a prompt from a YAML entry.</td></tr>
+            <tr><td><span class="umi-code">\__name__</span></td><td>Escaped: kept as literal text.</td></tr>
         </table>
     </div>
 
     <div class="umi-section">
-        <h3>🎨 Browser & Tools</h3>
-
-        <details>
-            <summary>📦 LoRA Browser (Ctrl+L)</summary>
-            <p>Visual browser for all your LoRAs with CivitAI integration!</p>
-
-            <div class="umi-block">Press Ctrl+L to open the LoRA Browser
-
-Features:
-• Grid view with preview images
-• Search by name or tags
-• Adjustable strength slider (0-5)
-• One-click insert into Umi node
-• Right-click or Edit button to customize
-
-Click any LoRA card to insert:
-&lt;lora:model_name:strength&gt; + activation tags</div>
-
-            <p style="margin-top:10px; font-size:13px"><strong>CivitAI Integration (v1.5):</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li><strong>Batch Fetch:</strong> "Fetch All" with progress bar</li>
-                <li><strong>Per-Card Fetch:</strong> 🌐 button on each LoRA card</li>
-                <li>Exact match only (hash or name)</li>
-                <li>Shows preview images, trigger words, base model</li>
-                <li>Purple border = has CivitAI data</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>🖼️ Image Browser (Ctrl+I)</summary>
-            <p>Booru-style gallery for browsing generated images with metadata extraction!</p>
-
-            <div class="umi-block">Press Ctrl+I to open Image Browser
-
-Features:
-• Full-screen grid gallery
-• Sort by newest/oldest/name
-• Pagination (50 per page)
-• Search prompts
-• Click image to copy prompt to Umi node
-• Extracts metadata from PNG/JPG/WebP
-
-Metadata Support:
-✓ ComfyUI workflow JSON
-✓ A1111 parameters
-✓ Custom Umi tags
-✓ EXIF data</div>
-
-            <p style="margin-top:10px; font-size:13px"><strong>Quick Actions:</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li>Click image → Copy prompt + negative to active node</li>
-                <li>Search bar → Filter by prompt content</li>
-                <li>ESC or click outside → Close browser</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>📝 Sequential Wildcards (__~file__)</summary>
-            <p>Deterministic selection based on seed - same seed, same result!</p>
-
-            <div class="umi-block">// characters.txt
-Alice
-Bob
-Charlie
-Dave
-
-// Usage
-__~characters__
-
-Seed 0 → Alice
-Seed 1 → Bob
-Seed 2 → Charlie
-Seed 3 → Dave
-Seed 4 → Alice (cycles)
-
-Same seed always picks same entry!</div>
-
-            <div class="callout callout-info" style="margin-top:10px">
-                <strong>💡 Use Case:</strong> Perfect for creating consistent character series or batch generations with predictable variation.
-            </div>
-        </details>
-
-        <details>
-            <summary>📄 Prompt File Loader (__@file__)</summary>
-            <p>Load entire .txt file content as a prompt - perfect for mega-prompts!</p>
-
-            <div class="umi-block">// mega_prompt.txt
-masterpiece, best quality, highly detailed,
-professional photography, studio lighting,
-bokeh, depth of field, sharp focus,
-vibrant colors, perfect composition,
-award winning, trending on artstation
-
-// Usage
-__@mega_prompt__, portrait of a woman
-
-Result: Full file content + your addition
-No parsing - raw content loaded</div>
-
-            <p style="margin-top:10px; font-size:13px"><strong>Benefits:</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li>Manage complex prompts in separate files</li>
-                <li>Reuse quality tag collections</li>
-                <li>Better organization and readability</li>
-                <li>Easy to edit and maintain</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>🏷️ LoRA Tag Control</summary>
-            <p>Fine-tune how many tags are automatically added from LoRAs!</p>
-
-            <div class="umi-block">Node Parameter: lora_max_tags
-Default: 5 tags
-Range: 0-20 tags
-
-0 = No automatic tags
-5 = Balanced (default)
-20 = All available tags
-
-Tags come from:
-1. CivitAI trigger words (if available)
-2. SafeTensors metadata (fallback)</div>
-
-            <div class="callout callout-success" style="margin-top:10px">
-                <strong>✨ Smart Selection:</strong> Most relevant tags are picked first (usually trigger words or character-specific tags).
-            </div>
-        </details>
+        <h3>Repeating a wildcard</h3>
+        <p>This one surprises people, so it is worth being explicit.</p>
+        <table class="umi-table">
+            <tr><th>Written as</th><th>Result</th></tr>
+            <tr><td><span class="umi-code">__color__ shirt, __color__ pants</span></td><td><strong>Same</strong> colour. Bare repeats agree with each other.</td></tr>
+            <tr><td><span class="umi-code">$top={__color__}<br>$skirt={__color__}</span></td><td><strong>Different</strong> colours. Separate variables are separate requests.</td></tr>
+            <tr><td><span class="umi-code">$c={__color__}, $c ... $c</span></td><td>Same colour. A variable holds one resolved value.</td></tr>
+            <tr><td><span class="umi-code">__@a:color__ / __@b:color__</span></td><td>Different colours, without variables. <span class="umi-code">@name:</span> gives an occurrence its own scope.</td></tr>
+        </table>
+        <div class="callout callout-info">
+            Scoped and variable picks are drawn <em>without replacement</em>, so they
+            differ wherever the file has enough lines to go around. Once the pool runs
+            out it starts reusing values rather than failing &mdash; three variables on a
+            two&#8209;line file give two distinct values and one repeat.
+        </div>
     </div>
 
     <div class="umi-section">
-        <h3>🔧 Workflow & Productivity</h3>
-
-        <details>
-            <summary>💾 Preset Manager (Ctrl+P)</summary>
-            <p>Save and load complete node configurations instantly!</p>
-
-            <div class="umi-block">Press Ctrl+P to open Preset Manager
-
-Save a preset:
-1. Configure your Umi node perfectly
-2. Ctrl+P → "Save Current Node as Preset"
-3. Enter name: "Anime Portrait"
-4. Enter description (optional)
-
-Load a preset:
-1. Ctrl+P
-2. Click any preset card
-3. All settings restored instantly!
-
-Saves everything:
-• Prompts (positive & negative)
-• Seed, dimensions
-• LoRA settings
-• LLM/Vision settings
-• All other parameters</div>
-
-            <p style="margin-top:10px; font-size:13px"><strong>Use Cases:</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li>"Anime Style" - Quick switch to anime workflow</li>
-                <li>"Realistic Portrait" - Professional photo settings</li>
-                <li>"Landscape" - Wide format with specific LoRAs</li>
-                <li>"Character Batch" - Consistent settings for series</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>📜 Prompt History (Ctrl+H)</summary>
-            <p>Never lose a successful prompt again - automatic tracking with search!</p>
-
-            <div class="umi-block">Press Ctrl+H to open History Browser
-
-Features:
-• Auto-logs every prompt (both Full & Lite nodes)
-• Search across all prompts
-• Pagination (20 per page)
-• One-click restore to active node
-• Export entire history to JSON
-• Clear all with confirmation
-
-Tracked data:
-✓ Positive prompt
-✓ Negative prompt
-✓ Seed value
-✓ Timestamp
-
-Storage: Last 500 entries (auto-pruned)</div>
-
-            <p style="margin-top:10px; font-size:13px"><strong>Workflow:</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li>Generate images (history logs automatically)</li>
-                <li>Find that perfect prompt from yesterday</li>
-                <li>Search keywords → Click → Restored!</li>
-                <li>Export for documentation or backup</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>⌨️ Keyboard Shortcuts (Ctrl+?)</summary>
-            <p>Quick reference for all shortcuts and syntax - your built-in cheat sheet!</p>
-
-            <div class="umi-block">Press Ctrl+? or Ctrl+/ to view shortcuts
-
-Browser Panels:
-Ctrl+L → LoRA Browser
-Ctrl+I → Image Browser
-Ctrl+P → Preset Manager
-Ctrl+H → Prompt History
-Ctrl+Shift+Y → YAML Tag Manager
-Ctrl+E → File Editor
-Ctrl+? → This shortcuts panel
-
-Panel Actions:
-ESC → Close any panel
-Click outside → Close panel
-
-Also shows:
-• Wildcard syntax reference
-• Logic operators guide
-• Variable methods
-• All available shortcuts</div>
-
-            <div class="callout callout-info" style="margin-top:10px">
-                <strong>💡 Tip:</strong> Press Ctrl+? anytime while working to refresh your memory on syntax!
-            </div>
-        </details>
-
-        <details>
-            <summary>🎨 Theme Toggle</summary>
-            <p>Switch between dark and light themes for comfortable viewing in any environment!</p>
-
-            <div class="umi-block">Click theme button in menu bar:
-🌙 Dark or ☀️ Light
-
-Features:
-• Instant switching
-• Persists across sessions
-• Applies to ALL Umi panels:
-  - LoRA Browser
-  - Image Browser
-  - Preset Manager
-  - History Browser
-  - Shortcuts Panel
-  - YAML Manager
-  - File Editor
-
-Dark Theme (default):
-• Background: #1e1e1e
-• Blue accents: #61afef
-• Easy on eyes at night
-
-Light Theme:
-• Background: #ffffff
-• Blue accents: #4078c0
-• Better for bright rooms</div>
-        </details>
-
-        <details>
-            <summary>🏷️ YAML Tag Manager (Ctrl+Shift+Y)</summary>
-            <p>Analyze, export, and manage your YAML tags with statistics dashboard!</p>
-
-            <div class="umi-block">Press Ctrl+Shift+Y to open YAML Tag Manager
-
-Statistics Dashboard:
-📝 Total Entries
-🏷️ Unique Tags
-✓ Entries With Tags
-✗ Entries Without Tags
-📊 Average Tags/Entry
-🔥 Top 20 Most-Used Tags
-
-Export Options:
-📥 Export to JSON - Complete data with all entries
-📊 Export to CSV - Simple format for spreadsheets
-
-Perfect for:
-• Documentation
-• Tag analysis
-• Finding unused tags
-• Sharing tag schemas
-• Batch editing preparation</div>
-
-            <p style="margin-top:10px; font-size:13px"><strong>Top Tags View:</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li>Visual bars showing usage percentage</li>
-                <li>Count and percentage for each tag</li>
-                <li>Understand your most common themes</li>
-                <li>Identify organization opportunities</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>📝 File Editor (Ctrl+E)</summary>
-            <p>Edit wildcards and YAML files directly in ComfyUI - no more alt-tabbing!</p>
-
-            <div class="umi-block">Press Ctrl+E to open File Editor
-
-Features:
-• Two-pane layout (sidebar + editor)
-• Browse all .txt and .yaml files
-• Monospace font for readability
-• Syntax-friendly editing
-• Create new files
-• Auto-save indicator
-• Line/word/character counts
-• Ctrl+S to save
-
-Workflow:
-1. Ctrl+E → Open editor
-2. Click file in sidebar
-3. Edit content
-4. Ctrl+S → Save
-5. Changes active immediately!
-
-Security:
-✓ Only edits files in wildcard paths
-✓ No access outside safe directories
-✓ Confirmation on unsaved changes</div>
-
-            <p style="margin-top:10px; font-size:13px"><strong>Perfect For:</strong></p>
-            <ul style="margin:5px 0; padding-left:20px; font-size:13px">
-                <li>Quick typo fixes</li>
-                <li>Adding new wildcard entries</li>
-                <li>Updating YAML tags</li>
-                <li>Creating new wildcard files</li>
-                <li>Iterative prompt development</li>
-            </ul>
-        </details>
-
-        <details>
-            <summary>🔄 Simplified YAML Format</summary>
-            <p>Unified, tag-based YAML system - one format, no confusion!</p>
-
-            <div class="umi-block">Standard YAML Format:
-EntryName:
-  Prompts: ["prompt text"]
-  Tags: [Tag1, Tag2, Tag3]
-  Prefix: ["prefix"]
-  Suffix: ["suffix"]
-
-All keys optional except entry name!
-
-Tag Selection:
-&lt;[tag]&gt;              → Any entry with tag
-&lt;[tag1][tag2]&gt;       → AND (both tags)
-&lt;[tag1|tag2]&gt;        → OR (either tag)
-&lt;[--tag]&gt;            → NOT (exclude tag)
-&lt;file:[tag]&gt;         → Specific file
-
-Full Logic Support:
-&lt;[Fire AND Warrior]&gt;              → Both required
-&lt;[Ice OR Fire]&gt;                   → Either one
-&lt;[(Fire OR Ice) AND Mage]&gt;        → Complex logic
-&lt;[NOT Heavy]&gt;                     → Exclusion
-&lt;[$theme==cyberpunk AND Dark]&gt;   → Variable comparison</div>
-
-            <div class="callout callout-success" style="margin-top:10px">
-                <strong>✨ Simplified:</strong> No more "Umi YAML" vs "Alternative YAML" - just one clean format!
-            </div>
-        </details>
+        <h3>Choices, variables and conditionals</h3>
+        <table class="umi-table">
+            <tr><th>Syntax</th><th>Meaning</th></tr>
+            <tr><td><span class="umi-code">{a|b|c}</span></td><td>One inline option.</td></tr>
+            <tr><td><span class="umi-code">{25%a|b}</span></td><td>Weighted by percentage. Unassigned options split the remainder.</td></tr>
+            <tr><td><span class="umi-code">{2-3$$a|b|c|d}</span></td><td>Pick two or three of the options.</td></tr>
+            <tr><td><span class="umi-code">$hair={red|blue}</span></td><td>Assign a variable, then use <span class="umi-code">$hair</span> anywhere after.</td></tr>
+            <tr><td><span class="umi-code">\${hair|silver}</span></td><td>Use a default when the variable is unset.</td></tr>
+            <tr><td><span class="umi-code">[if $x==a: yes elif $x==b: maybe else: no]</span></td><td>Branch on a variable.</td></tr>
+        </table>
     </div>
 
     <div class="umi-section">
-        <h3>📋 Quick Reference</h3>
+        <h3>Prompt functions</h3>
+        <p>All eighteen are highlighted in the editor. Items split on top-level
+        <span class="umi-code">|</span> only, so pipes inside nested braces stay put.</p>
+        <table class="umi-table">
+            <tr><th>Function</th><th>Meaning</th></tr>
+            <tr><td><span class="umi-code">[choose: a|b]</span></td><td>Exactly one. Supports <span class="umi-code">item:weight</span>.</td></tr>
+            <tr><td><span class="umi-code">[sample 2-3 from: a|b|c]</span></td><td>A fixed or ranged count.</td></tr>
+            <tr><td><span class="umi-code">[and: a|b]</span> <span class="umi-code">[or: a|b]</span> <span class="umi-code">[xor: a|b]</span></td><td>All, a seeded non-empty subset, or exactly one.</td></tr>
+            <tr><td><span class="umi-code">[shuffle: a, b]</span> <span class="umi-code">[clean: a,, b]</span></td><td>Reorder, or tidy comma spacing.</td></tr>
+            <tr><td><span class="umi-code">[preset:name]</span></td><td>Insert a chunk from <span class="umi-code">prompt_presets.yaml</span>.</td></tr>
+            <tr><td><span class="umi-code">[section:name]</span></td><td>Mark a block for reordering via <span class="umi-code">section_order</span>.</td></tr>
+            <tr><td><span class="umi-code">[require:...]</span> <span class="umi-code">[assert:...]</span> <span class="umi-code">[forbid:...]</span> <span class="umi-code">[prefer:...]</span> <span class="umi-code">[warn:...]</span></td><td>Validation helpers. <span class="umi-code">warn</span> only speaks when <span class="umi-code">$debug</span> or <span class="umi-code">$trace</span> is set.</td></tr>
+            <tr><td><span class="umi-code">[lora:alias:0.8]</span></td><td>Expands an alias into the angle-bracket form. Angle brackets are what actually loads.</td></tr>
+            <tr><td><span class="umi-code">[anima:...]</span> and friends</td><td>Only present when the Anima overlay is installed.</td></tr>
+        </table>
+    </div>
 
-        <details open>
-            <summary>⌨️ All Keyboard Shortcuts</summary>
-            <table class="umi-table">
-                <tr><th>Shortcut</th><th>Action</th></tr>
-                <tr><td><code>Ctrl+L</code></td><td>Open LoRA Browser</td></tr>
-                <tr><td><code>Ctrl+I</code></td><td>Open Image Browser</td></tr>
-                <tr><td><code>Ctrl+P</code></td><td>Open Preset Manager</td></tr>
-                <tr><td><code>Ctrl+H</code></td><td>Open Prompt History</td></tr>
-                <tr><td><code>Ctrl+Shift+Y</code></td><td>Open YAML Tag Manager</td></tr>
-                <tr><td><code>Ctrl+E</code></td><td>Open File Editor</td></tr>
-                <tr><td><code>Ctrl+?</code> or <code>Ctrl+/</code></td><td>Show Shortcuts Panel</td></tr>
-                <tr><td><code>Ctrl+S</code></td><td>Save File (in editor)</td></tr>
-                <tr><td><code>ESC</code></td><td>Close Active Panel</td></tr>
-            </table>
-        </details>
+    <div class="umi-section">
+        <h3>Negatives</h3>
+        <table class="umi-table">
+            <tr><th>Syntax</th><th>Meaning</th></tr>
+            <tr><td><span class="umi-code">[neg: blurry, bad hands]</span></td><td>Move text to the negative output.</td></tr>
+            <tr><td><span class="umi-code">**watermark**</span></td><td>Shorthand for a single negative tag.</td></tr>
+            <tr><td><span class="umi-code">--neg: "blurry"</span></td><td>CLI-style negative.</td></tr>
+            <tr><td><span class="umi-code">[negative] ... [/negative]</span></td><td>A whole negative block.</td></tr>
+            <tr><td><span class="umi-code">[neg_if:$style==photo]cartoon[/neg_if]</span></td><td>Conditional negative.</td></tr>
+        </table>
+    </div>
 
-        <details>
-            <summary>🎯 Common Workflows</summary>
+    <div class="umi-section">
+        <h3>On the node</h3>
+        <ul class="step-list">
+            <li><strong>Preview roll</strong> &mdash; expand with the current seed and show the
+            result, the seed used, how many wildcards were picked, and how many reused an
+            earlier pick. Nothing is queued. Press it twice and it also shows what changed
+            since the last roll.</li>
+            <li><strong>Pin this roll</strong> &mdash; hold the last previewed expansion and
+            reuse it verbatim, ignoring the seed and the template, until you unpin. Useful
+            for keeping a prompt fixed while changing samplers or models.</li>
+            <li><strong>Live syntax errors</strong> &mdash; the prompt box underlines unknown
+            wildcards and unclosed delimiters as you type. Turn it off in Settings if you
+            would rather not see it.</li>
+            <li><strong>Autocomplete</strong> &mdash; type <span class="umi-code">__</span>,
+            <span class="umi-code">&lt;[</span>, <span class="umi-code">&lt;lora:</span> or
+            <span class="umi-code">$</span> for suggestions. Tags are coloured by category
+            and show how many posts use them. Arrow keys navigate, Enter or Tab accepts.</li>
+        </ul>
+    </div>
 
-            <div style="margin-bottom:15px">
-                <h4 style="margin:10px 0 5px 0; font-size:13px">Style Switching:</h4>
-                <div class="umi-block" style="font-size:12px">1. Configure node for "Anime" style
-2. Ctrl+P → Save as "Anime Style"
-3. Configure for "Realistic" style
-4. Ctrl+P → Save as "Realistic"
-5. Switch anytime: Ctrl+P → Click preset!</div>
-            </div>
+    <div class="umi-section">
+        <h3>Panels</h3>
+        <ul class="step-list">
+            <li><strong>Wildcards</strong> &mdash; browse and edit your wildcard files with
+            their candidate counts. Blank lines and comments are not counted, so a file of
+            comments correctly reads as offering nothing. <span class="umi-code">.yaml</span>
+            files are listed alongside <span class="umi-code">.txt</span> ones and counted by
+            entry rather than by line; saving one that would not parse is refused, with the
+            parse error shown, rather than leaving a file that quietly matches nothing.
+            <strong>Health</strong> reports empty files, single&#8209;candidate files, lines
+            repeated inside a file, and lines duplicated across three or more files.</li>
+            <li><strong>Run Inspector</strong> &mdash; the last run in detail: every wildcard
+            pick with the file it came from, how many candidates it chose between, and
+            whether it rolled or reused an earlier value. Needs run capture switched on;
+            the panel offers a button.</li>
+            <li><strong>Prompt History</strong> &mdash; recent prompts, searchable, with copy
+            and reuse. Kept in memory for the session; saving to disk is opt&#8209;in.</li>
+            <li><strong>Self Check</strong> &mdash; confirms this install is wired correctly:
+            panels registered, routes reachable, theme picked up, node capabilities present.
+            Copy the report if you need to send it to someone.</li>
+        </ul>
+    </div>
 
-            <div style="margin-bottom:15px">
-                <h4 style="margin:10px 0 5px 0; font-size:13px">Prompt Recovery:</h4>
-                <div class="umi-block" style="font-size:12px">1. "I had a great prompt yesterday..."
-2. Ctrl+H → Open history
-3. Search keywords
-4. Click to restore
-5. Generate again!</div>
-            </div>
-
-            <div style="margin-bottom:15px">
-                <h4 style="margin:10px 0 5px 0; font-size:13px">Wildcard Editing:</h4>
-                <div class="umi-block" style="font-size:12px">1. Ctrl+E → Open editor
-2. Click file in sidebar
-3. Edit content
-4. Ctrl+S → Save
-5. Use immediately in prompts!</div>
-            </div>
-
-            <div>
-                <h4 style="margin:10px 0 5px 0; font-size:13px">LoRA Discovery:</h4>
-                <div class="umi-block" style="font-size:12px">1. Ctrl+L → Open LoRA browser
-2. Click "Fetch from CivitAI"
-3. Browse with preview images
-4. Click LoRA → Auto-insert with tags!</div>
-            </div>
-        </details>
+    <div class="umi-section">
+        <h3>Comments and settings</h3>
+        <table class="umi-table">
+            <tr><th>Syntax</th><th>Meaning</th></tr>
+            <tr><td><span class="umi-code"># note</span></td><td>A line starting with # is a comment, in prompts and in wildcard files.</td></tr>
+            <tr><td><span class="umi-code">tag # note</span></td><td>A space then # comments out the rest. <span class="umi-code">deep#blue</span> stays intact.</td></tr>
+            <tr><td><span class="umi-code">// note //</span></td><td>Toggles comment mode until the next // or end of line.</td></tr>
+            <tr><td><span class="umi-code">@@width=832,height=1216@@</span></td><td>Set size from inside the prompt.</td></tr>
+        </table>
+        <div class="callout callout-success">
+            The full syntax reference lives in <span class="umi-code">SYNTAX.md</span>, and
+            <span class="umi-code">Umi Prompt Syntax Lint</span> checks a prompt without
+            expanding any randomness.
+        </div>
     </div>
 `;
 
@@ -1141,15 +469,17 @@ function showHelpModal() {
 
     const modal = document.createElement("div");
     modal.className = "umi-help-modal";
-    modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "UmiAI User Guide");
 
     modal.innerHTML = `
         <div class="umi-help-content">
             <div class="umi-help-header">
                 <div>
-                    <h2>📘 UmiAI Reference Manual <span class="version">v1.5</span></h2>
+                    <h2>UmiAI User Guide <span class="version">lean</span></h2>
                 </div>
-                <button class="umi-help-close" onclick="this.closest('.umi-help-modal').remove()">CLOSE</button>
+                <button class="umi-help-close" type="button">CLOSE</button>
             </div>
             <div class="umi-help-body">
                 ${HELP_HTML}
@@ -1157,17 +487,159 @@ function showHelpModal() {
         </div>
     `;
     document.body.appendChild(modal);
+    const close = () => {
+        document.removeEventListener("keydown", onKeyDown);
+        modal.remove();
+    };
+    const onKeyDown = (event) => {
+        if (event.key === "Escape") {
+            event.preventDefault();
+            close();
+        }
+    };
+    modal.addEventListener("click", (event) => { if (event.target === modal) close(); });
+    modal.querySelector(".umi-help-close")?.addEventListener("click", close);
+    document.addEventListener("keydown", onKeyDown);
+    modal.querySelector(".umi-help-close")?.focus();
 }
+
+window.umiShowHelpModal = showHelpModal;
 
 // =============================================================================
 // PART 3: REGISTRATION & DYNAMIC VISIBILITY
 // =============================================================================
 
+const UMI_WILDCARD_NODE_NAMES = new Set(["UmiAIWildcardNode", "UmiAIWildcardNodeLite"]);
+
+function patchUmiHelpMenu(nodeType) {
+    if (!nodeType?.prototype || nodeType.prototype._umiHelpMenuPatched) return;
+
+    const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+    nodeType.prototype.getExtraMenuOptions = function (_, options) {
+        if (getExtraMenuOptions) getExtraMenuOptions.apply(this, arguments);
+        if (!Array.isArray(options)) return;
+        if (options.some(option => option?.__umiHelpMenu)) return;
+
+        options.push(null);
+        options.push({
+            __umiHelpMenu: true,
+            content: "Open UmiAI User Guide",
+            callback: () => { showHelpModal(); }
+        });
+    };
+
+    nodeType.prototype._umiHelpMenuPatched = true;
+}
+
+function patchRegisteredUmiNodeMenus() {
+    const registered = window.LiteGraph?.registered_node_types || {};
+    for (const [name, nodeType] of Object.entries(registered)) {
+        if (UMI_WILDCARD_NODE_NAMES.has(name) || UMI_WILDCARD_NODE_NAMES.has(nodeType?.type)) {
+            patchUmiHelpMenu(nodeType);
+        }
+    }
+}
+
 // Helper: Custom fuzzy search function for client-side filtering
+function getSuggestionValue(option) {
+    if (option === null || option === undefined) return "";
+    if (typeof option === "string") return option;
+    if (typeof option === "number" || typeof option === "boolean") return String(option);
+
+    if (typeof option === "object") {
+        const preferred = option.value ?? option.tag ?? option.name ?? option.label ?? option.text ?? option.title;
+        if (preferred !== null && preferred !== undefined) return String(preferred);
+
+        const firstString = Object.values(option).find(value => typeof value === "string" && value.trim());
+        if (firstString) return firstString;
+    }
+
+    return "";
+}
+
+function getSuggestionDisplayText(option) {
+    const value = getSuggestionValue(option);
+    if (!value) return "";
+
+    if (option && typeof option === "object" && option.count !== undefined) {
+        return `${value} (${option.count})`;
+    }
+
+    return value;
+}
+
+// Danbooru tag categories, as the CSVs encode them in column 2. The server
+// already returns this per tag; colouring by it is most of what makes a tag
+// list scannable, since an artist and a character read very differently.
+const TAG_CATEGORY_COLORS = {
+    0: T.cat_general,
+    1: T.cat_artist,
+    3: T.cat_copyright,
+    4: T.cat_character,
+    5: T.cat_meta,
+};
+const TAG_CATEGORY_NAMES = {
+    0: "general", 1: "artist", 3: "copyright", 4: "character", 5: "meta",
+};
+
+function getSuggestionCategory(option) {
+    if (!option || typeof option !== "object") return null;
+    const category = option.category;
+    return category === undefined || category === null ? null : Number(category);
+}
+
+function formatTagCount(count) {
+    const n = Number(count);
+    if (!Number.isFinite(n)) return "";
+    if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+    if (n >= 1000) return Math.round(n / 1000) + "k";
+    return String(n);
+}
+
+// Tag lookups scan CSVs on the server, so one request per keystroke is waste --
+// and the input/compositionend listeners needed for paste and IME make it
+// worse. Results are cached by query, and the server is only consulted after a
+// short quiet period. A superseded lookup resolves to null so its caller bails
+// instead of leaving a promise pending forever.
+const TAG_CACHE_LIMIT = 300;
+const TAG_DEBOUNCE_MS = 120;
+const tagQueryCache = new Map();
+let tagDebounceTimer = null;
+let supersedePendingLookup = null;
+
+function rememberTags(query, tags) {
+    tagQueryCache.set(query, tags);
+    while (tagQueryCache.size > TAG_CACHE_LIMIT) {
+        tagQueryCache.delete(tagQueryCache.keys().next().value);
+    }
+    return tags;
+}
+
+function lookupTags(ext, query) {
+    if (tagQueryCache.has(query)) {
+        const hit = tagQueryCache.get(query);
+        tagQueryCache.delete(query);
+        tagQueryCache.set(query, hit);          // move to most-recent
+        return Promise.resolve(hit);
+    }
+
+    if (supersedePendingLookup) supersedePendingLookup();
+    clearTimeout(tagDebounceTimer);
+
+    return new Promise((resolve) => {
+        supersedePendingLookup = () => resolve(null);
+        tagDebounceTimer = setTimeout(async () => {
+            supersedePendingLookup = null;
+            const tags = await ext.fetchAutocompleteTags(query);
+            resolve(rememberTags(query, tags || []));
+        }, TAG_DEBOUNCE_MS);
+    });
+}
+
 function getFuzzyMatches(query, allItems) {
     // FIX: If query is empty, return everything!
     if (!query || query.trim() === "") {
-        return allItems.sort();
+        return allItems.sort((a, b) => getSuggestionValue(a).localeCompare(getSuggestionValue(b)));
     }
 
     // Normalize query
@@ -1175,7 +647,8 @@ function getFuzzyMatches(query, allItems) {
 
     // Score items
     const scored = allItems.map(item => {
-        const lowerItem = item.toLowerCase();
+        const itemText = getSuggestionValue(item);
+        const lowerItem = itemText.toLowerCase();
 
         // 1. Exact Match
         if (lowerItem === lowerQuery) return { item, score: 100 };
@@ -1211,14 +684,181 @@ function getFuzzyMatches(query, allItems) {
         .map(s => s.item);
 }
 
+// Viewport-space box of the text caret inside a textarea/input.
+//
+// Textareas expose selectionStart but no caret geometry, so the standard
+// approach is to render the text up to the caret into a hidden mirror element
+// copying every property that affects wrapping and glyph advance, then read the
+// position of a marker span. Without this the suggestion list can only be
+// placed relative to the field as a whole.
+function caretViewportRect(el) {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2 || 16;
+
+    const mirror = document.createElement("div");
+    const s = mirror.style;
+    [
+        "fontFamily", "fontSize", "fontWeight", "fontStyle", "fontVariant",
+        "letterSpacing", "wordSpacing", "textTransform", "textIndent",
+        "lineHeight", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
+        "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth",
+        "boxSizing", "tabSize",
+    ].forEach((prop) => { s[prop] = style[prop]; });
+
+    s.position = "absolute";
+    s.visibility = "hidden";
+    s.left = "-9999px";
+    s.top = "0px";
+    s.width = style.width;
+    s.height = "auto";
+    s.whiteSpace = style.whiteSpace === "nowrap" ? "pre" : "pre-wrap";
+    s.overflowWrap = "break-word";
+
+    // Two markers: one at the content origin, one at the caret. Measuring the
+    // delta between them sidesteps any question of which edge offsetLeft and
+    // offsetTop are relative to, which differs between the two axes.
+    const origin = document.createElement("span");
+    origin.textContent = "​";
+    const marker = document.createElement("span");
+    marker.textContent = "​";
+
+    const caret = el.selectionStart ?? (el.value ? el.value.length : 0);
+    mirror.appendChild(origin);
+    mirror.appendChild(document.createTextNode((el.value || "").slice(0, caret)));
+    mirror.appendChild(marker);
+    document.body.appendChild(mirror);
+
+    const deltaLeft = marker.offsetLeft - origin.offsetLeft;
+    const deltaTop = marker.offsetTop - origin.offsetTop;
+    document.body.removeChild(mirror);
+
+    const contentLeft = rect.left + parseFloat(style.borderLeftWidth || 0) + parseFloat(style.paddingLeft || 0);
+    const contentTop = rect.top + parseFloat(style.borderTopWidth || 0) + parseFloat(style.paddingTop || 0);
+    const x = contentLeft + deltaLeft - el.scrollLeft;
+    const y = contentTop + deltaTop - el.scrollTop;
+
+    // A caret scrolled out of the field must not drag the popup outside it.
+    const top = Math.min(Math.max(y, rect.top), Math.max(rect.top, rect.bottom - lineHeight));
+    return { left: x, top, bottom: top + lineHeight };
+}
+
+function resolveWidgetInputElement(widget) {
+    if (!widget) return null;
+
+    const candidates = [
+        widget.inputEl,
+        widget.element,
+        widget.domElement,
+        widget.input,
+    ];
+
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        if (candidate instanceof HTMLTextAreaElement || candidate instanceof HTMLInputElement) {
+            return candidate;
+        }
+        if (candidate instanceof HTMLElement) {
+            const input = candidate.querySelector("textarea, input");
+            if (input) return input;
+        }
+    }
+
+    return null;
+}
+
 app.registerExtension({
     name: "UmiAI.WildcardSystem",
     async setup() {
         this.wildcards = [];
         this.loras = [];
         this.globals = {};  // { $varname: "value" }
-        this.characters = [];  // Character names for __@ autocomplete
         this.autocompleteTags = [];  // Tags from CSV files
+        this.settings = {};
+
+        this.fetchSettings = async () => {
+            try {
+                const resp = await fetch("/umiapp/settings");
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.settings = data.settings || {};
+                }
+            } catch (e) {
+                console.error("[UmiAI] Failed to load settings:", e);
+                this.settings = {};
+            }
+            return this.settings;
+        };
+
+        this.setWidgetVisibility = (widget, visible) => {
+            if (!widget) return false;
+
+            if (!widget._umiOriginalType) {
+                widget._umiOriginalType = widget.type;
+            }
+            if (!widget._umiOriginalComputeSize) {
+                widget._umiOriginalComputeSize = widget.computeSize;
+            }
+
+            const nextType = visible ? widget._umiOriginalType : "hidden";
+            const nextHidden = !visible;
+            const nextComputeSize = visible ? widget._umiOriginalComputeSize : (() => [0, -4]);
+            const changed = (
+                widget.type !== nextType
+                || widget.hidden !== nextHidden
+                || widget.computeSize !== nextComputeSize
+            );
+
+            widget.type = nextType;
+            widget.hidden = nextHidden;
+            widget.computeSize = nextComputeSize;
+            return changed;
+        };
+
+        this.resetWidgetToDefault = (widget, defaultValue) => {
+            if (!widget) return false;
+            const changed = widget.value !== defaultValue;
+            widget.value = defaultValue;
+            if (changed && typeof widget.callback === "function") {
+                try {
+                    widget.callback(defaultValue);
+                } catch (e) {
+                    console.warn(`[UmiAI] Failed to run callback for widget ${widget.name}:`, e);
+                }
+            }
+            return changed;
+        };
+
+        this.sanitizeDisabledFeatureValues = (node) => {
+            if (!node?.widgets?.length) return false;
+
+            let changed = false;
+
+            return changed;
+        };
+
+        this.applyFeatureVisibility = async (node) => {
+            if (!node?.widgets?.length) return;
+
+            if (!Object.keys(this.settings || {}).length) {
+                await this.fetchSettings();
+            }
+
+            const rules = [];
+
+            let changed = false;
+            for (const widget of node.widgets) {
+                const rule = rules.find((entry) => entry.names.includes(widget.name));
+                if (rule) {
+                    changed = this.setWidgetVisibility(widget, rule.enabled) || changed;
+                }
+            }
+
+            if (changed) {
+                node.setSize(node.computeSize());
+                app.graph?.setDirtyCanvas?.(true, true);
+            }
+        };
 
         // Define a function we can call later to refresh the lists
         this.fetchWildcards = async () => {
@@ -1230,23 +870,26 @@ app.registerExtension({
 
                     if (Array.isArray(data)) {
                         this.wildcards = data;
+                        this.promptFiles = data;
                         this.loras = [];
                         this.yamlTags = [];
                         this.basenames = {};
                     } else {
                         // New structure: separate txt wildcards from yaml tags
                         this.wildcards = data.wildcards || data.files || [];
+                        this.promptFiles = data.prompt_files || this.wildcards;
                         this.loras = data.loras || [];
-                        this.yamlTags = data.tags || [];           // Tags from YAML for <[
+                        this.yamlTags = [...new Set([...(data.tags || []), ...(data.entry_names || [])])];
                         this.basenames = data.basenames || {};     // Basename -> full path
 
                         // Add basenames to wildcards list for easy lookup
                         // This allows typing just the filename without folder
                         const basenameList = Object.keys(this.basenames);
-                        console.log(`[UmiAI] Loaded ${this.wildcards.length} txt files, ${this.yamlTags.length} yaml tags, ${basenameList.length} basenames`);
+                        console.log(`[UmiAI] Loaded ${this.wildcards.length} wildcard files, ${this.yamlTags.length} YAML tags/entries, ${basenameList.length} basenames`);
                     }
                 } else {
                     this.wildcards = [];
+                    this.promptFiles = [];
                     this.loras = [];
                     this.yamlTags = [];
                     this.basenames = {};
@@ -1254,6 +897,7 @@ app.registerExtension({
             } catch (e) {
                 console.error("[UmiAI] Failed to load wildcards:", e);
                 this.wildcards = [];
+                this.promptFiles = [];
                 this.loras = [];
                 this.yamlTags = [];
                 this.basenames = {};
@@ -1272,21 +916,6 @@ app.registerExtension({
             } catch (e) {
                 console.error("[UmiAI] Failed to load globals:", e);
                 this.globals = {};
-            }
-        };
-
-        // Fetch characters for __@ autocomplete
-        this.fetchCharacters = async () => {
-            try {
-                const resp = await fetch("/umiapp/characters");
-                if (resp.ok) {
-                    const data = await resp.json();
-                    this.characters = data.characters || [];
-                    console.log(`[UmiAI] Loaded ${this.characters.length} characters for __@ autocomplete`);
-                }
-            } catch (e) {
-                console.error("[UmiAI] Failed to load characters:", e);
-                this.characters = [];
             }
         };
 
@@ -1312,12 +941,26 @@ app.registerExtension({
             }
         };
 
-        // Initial fetch
-        await this.fetchWildcards();
-        await this.fetchGlobals();
-        await this.fetchCharacters();
-        await this.fetchAutocompleteTags();
+        // Independent startup reads can happen together.  Settings completes
+        // before the optional tag-index warmup so disabling autocomplete also
+        // avoids its server scan entirely.
+        await Promise.all([this.fetchWildcards(), this.fetchGlobals(), this.fetchSettings()]);
+        if (this.settings.enable_tag_autocomplete !== false) {
+            await this.fetchAutocompleteTags();
+        }
         this.popup = new AutoCompletePopup();
+        patchRegisteredUmiNodeMenus();
+        setTimeout(patchRegisteredUmiNodeMenus, 500);
+        setTimeout(patchRegisteredUmiNodeMenus, 1500);
+
+        window.addEventListener("umi-settings-updated", (event) => {
+            this.settings = event.detail?.settings || {};
+            for (const node of app.graph?._nodes || []) {
+                if (node?.type === "UmiAIWildcardNode" || node?.type === "UmiAIWildcardNodeLite") {
+                    this.applyFeatureVisibility(node);
+                }
+            }
+        });
     },
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
@@ -1325,20 +968,13 @@ app.registerExtension({
         if (nodeData.name !== "UmiAIWildcardNode" && nodeData.name !== "UmiAIWildcardNodeLite") return;
 
         // 1. Add Help Menu
-        const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
-        nodeType.prototype.getExtraMenuOptions = function (_, options) {
-            if (getExtraMenuOptions) getExtraMenuOptions.apply(this, arguments);
-            options.push(null);
-            options.push({
-                content: "📘 Open UmiAI User Guide",
-                callback: () => { showHelpModal(); }
-            });
-        }
+        patchUmiHelpMenu(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             if (onNodeCreated) onNodeCreated.apply(this, arguments);
             const self = this;
+            const ext = app.extensions.find(e => e.name === "UmiAI.WildcardSystem");
 
             // ============================================================
             // DYNAMIC WIDGET VISIBILITY LOGIC
@@ -1356,6 +992,8 @@ app.registerExtension({
                 this.setSize(this.computeSize());
             }
 
+            ext?.applyFeatureVisibility?.(this);
+
             const llmWidgets = ["llm_model", "llm_temperature", "llm_max_tokens", "custom_system_prompt"];
             const triggerName = "llm_prompt_enhancer";
 
@@ -1365,7 +1003,7 @@ app.registerExtension({
                 this.widgets.forEach(w => {
                     if (llmWidgets.includes(w.name)) {
                         w.origType = w.type;
-                        w.origComputeSize = w.origComputeSize;
+                        w.origComputeSize = w.computeSize;
                     }
                 });
 
@@ -1401,19 +1039,40 @@ app.registerExtension({
             // AUTOCOMPLETE LOGIC (WITH ARROW KEYS & FUZZY SEARCH)
             // ============================================================
             const textWidget = this.widgets.find(w => w.name === "text");
-            if (!textWidget || !textWidget.inputEl) return;
+            const inputEl = resolveWidgetInputElement(textWidget);
+            if (!textWidget || !inputEl) return;
 
-            const inputEl = textWidget.inputEl;
-            const ext = app.extensions.find(e => e.name === "UmiAI.WildcardSystem");
 
             if (!ext) {
                 console.error("[UmiAI] Extension not found for autocomplete");
                 return;
             }
 
+            let autocompleteRequestId = 0;
+            let removed = false;
+            let blurTimer;
+            const listeners = [];
+            const listen = (target, name, callback) => {
+                target.addEventListener(name, callback);
+                listeners.push(() => target.removeEventListener(name, callback));
+            };
+            const hideAutocomplete = () => {
+                autocompleteRequestId++;
+                if (ext.popup.owner === inputEl) ext.popup.hide();
+            };
+            const previousRemoved = this.onRemoved;
+            this.onRemoved = function () {
+                removed = true;
+                clearTimeout(blurTimer);
+                listeners.splice(0).forEach(remove => remove());
+                hideAutocomplete();
+                return previousRemoved?.apply(this, arguments);
+            };
+            inputEl.placeholder ||= "Write a prompt with __folder/name__ or {red|blue}. Browse files in the Wildcards panel.";
+
             // 1. INTERCEPT NAVIGATION (Arrow Keys, Enter, Tab)
-            inputEl.addEventListener("keydown", (e) => {
-                if (ext && ext.popup && ext.popup.visible) {
+            listen(inputEl, "keydown", (e) => {
+                if (ext.popup.visible && ext.popup.owner === inputEl) {
                     if (e.key === "ArrowDown") {
                         e.preventDefault();
                         ext.popup.navigate(1); // Next
@@ -1430,16 +1089,26 @@ app.registerExtension({
                         return;
                     }
                     if (e.key === "Escape") {
-                        ext.popup.hide();
+                        hideAutocomplete();
                         return;
                     }
                 }
             });
 
+            listen(inputEl, "blur", () => {
+                clearTimeout(blurTimer);
+                blurTimer = setTimeout(() => {
+                    if (document.activeElement !== inputEl && !ext.popup.element.contains(document.activeElement)) {
+                        hideAutocomplete();
+                    }
+                }, 0);
+            });
+
             // 2. LISTEN FOR TYPING (To show the popup)
-            inputEl.addEventListener("keyup", async (e) => {
+            const handleTyping = async (e) => {
+                if (removed) return;
                 // Ignore nav keys in this listener to prevent flashing
-                if (["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(e.key)) return;
+                if (["ArrowUp", "ArrowDown", "Enter", "Escape", "Tab"].includes(e.key)) return;
 
                 if (!ext || !ext.popup) {
                     console.warn("[UmiAI] Extension or popup not available");
@@ -1449,13 +1118,14 @@ app.registerExtension({
                 const cursor = inputEl.selectionStart;
                 const text = inputEl.value;
                 const beforeCursor = text.substring(0, cursor);
+                const requestId = ++autocompleteRequestId;
 
                 // Regex for __@ (prompt files - full text file as prompt)
-                const matchPromptFile = beforeCursor.match(/__@([a-zA-Z0-9_\/\-\s]*)$/);
+                const matchPromptFile = beforeCursor.match(/__@((?:(?!__)[^\r\n<>|{}])*)$/u);
                 // Regex for __ (wildcards - txt files, picks random line)
-                const matchWildcard = beforeCursor.match(/__([a-zA-Z0-9_\/\-]*)$/);
+                const matchWildcard = beforeCursor.match(/__((?:(?!__)[^\r\n<>|{}])*)$/u);
                 // Regex for <[ (tags from yaml files)
-                const matchTag = beforeCursor.match(/<\[([a-zA-Z0-9_\/\-\s]*)$/);
+                const matchTag = beforeCursor.match(/<\[([^\r\n<>\]]*)$/u);
                 const matchLora = beforeCursor.match(/<lora:([^>]*)$/);
 
                 let options = [];
@@ -1472,8 +1142,8 @@ app.registerExtension({
                     matchIndex = matchPromptFile.index;
 
                     // Use wildcards list for __@ autocomplete (same txt files, but loads full content)
-                    const allWildcards = [...ext.wildcards];
-                    const basenameKeys = Object.keys(ext.basenames || {});
+                    const allWildcards = [...(ext.promptFiles || ext.wildcards)];
+                    const basenameKeys = allWildcards.map(name => name.split('/').pop());
 
                     basenameKeys.forEach(basename => {
                         if (!allWildcards.includes(basename)) {
@@ -1483,7 +1153,7 @@ app.registerExtension({
 
                     options = getFuzzyMatches(query, allWildcards);
                 }
-                // -- Wildcard Logic (__ = txt files only) --
+                // -- Wildcard Logic (__ = TXT, YAML/YML and CSV files) --
                 else if (matchWildcard) {
                     triggerType = "wildcard";
                     opener = "__";
@@ -1536,50 +1206,63 @@ app.registerExtension({
                         options = getFuzzyMatches(query, varNames.map(v => v.replace(/^\$/, '')));
                     }
                     // -- Tag Autocomplete Logic (after comma or space) --
-                    else {
+                    else if (ext.settings?.enable_tag_autocomplete !== false) {
                         // Match tags after comma or space, or at the start
-                        const matchGeneralTag = beforeCursor.match(/(?:^|,\s*|\s+)([a-zA-Z0-9_\-]{2,})$/);
+                        const matchGeneralTag = beforeCursor.match(/(?:^|[,\s]+)([a-zA-Z0-9_\-]{2,})$/);
                         if (matchGeneralTag && matchGeneralTag[1].length >= 2) {
                             triggerType = "generaltag";
                             query = matchGeneralTag[1];
-                            matchIndex = matchGeneralTag.index + (beforeCursor.match(/(?:^|,\s*|\s+)/)[0].length);
+                            matchIndex = beforeCursor.length - query.length;
 
-                            // Fetch tags on-demand from server
-                            const tags = await ext.fetchAutocompleteTags(query);
-                            options = tags || [];
+                            // Debounced and cached; null means a later keystroke
+                            // superseded this lookup.
+                            const tags = await lookupTags(ext, query);
+                            if (tags === null) return;
+                            if (requestId !== autocompleteRequestId || document.activeElement !== inputEl) {
+                                return;
+                            }
+                            options = tags;
                         }
                     }
                 }
 
-                if (triggerType && options.length > 0) {
-                    const rect = inputEl.getBoundingClientRect();
-                    const topOffset = rect.top + 20 + (rect.height / 2); // Approximate pos
+                if (requestId !== autocompleteRequestId || document.activeElement !== inputEl) {
+                    return;
+                }
 
-                    ext.popup.show(rect.left + 20, topOffset, options, (selected) => {
+                if (triggerType && options.length > 0) {
+                    ext.popup.owner = inputEl;
+                    ext.popup.show(caretViewportRect(inputEl), options, (selected) => {
+                        const selectedValue = getSuggestionValue(selected);
+                        if (!selectedValue) {
+                            hideAutocomplete();
+                            return;
+                        }
+
                         let completion = "";
 
                         // Smart Completion based on trigger type
                         if (triggerType === "promptfile") {
                             // Resolve basename to full path if needed
-                            const resolvedPath = ext.basenames?.[selected] || selected;
+                            const resolvedPath = ext.basenames?.[selectedValue] || selectedValue;
                             completion = `__@${resolvedPath}__`;
                         }
                         else if (triggerType === "wildcard") {
                             // Resolve basename to full path if needed
-                            const resolvedPath = ext.basenames?.[selected] || selected;
+                            const resolvedPath = ext.basenames?.[selectedValue] || selectedValue;
                             completion = `__${resolvedPath}__`;
                         }
                         else if (triggerType === "tag") {
-                            completion = `<[${selected}]>`;
+                            completion = `<[${selectedValue}]>`;
                         }
                         else if (triggerType === "lora") {
-                            completion = `<lora:${selected}:1.0>`;
+                            completion = `<lora:${selectedValue}:1.0>`;
                         }
                         else if (triggerType === "variable") {
-                            completion = `$${selected}`;
+                            completion = `$${selectedValue}`;
                         }
                         else if (triggerType === "generaltag") {
-                            completion = selected;
+                            completion = selectedValue;
                         }
 
                         const prefix = text.substring(0, matchIndex);
@@ -1597,18 +1280,54 @@ app.registerExtension({
                         const newCursorPos = (prefix + completion).length;
                         inputEl.setSelectionRange(newCursorPos, newCursorPos);
                         inputEl.focus();
+                        autocompleteRequestId++;
                     });
                 } else {
-                    ext.popup.hide();
+                    hideAutocomplete();
                 }
-            });
+            };
+
+            // keyup alone misses pasted text, middle-click paste and IME commits.
+            listen(inputEl, "keyup", handleTyping);
+            listen(inputEl, "input", handleTyping);
+            listen(inputEl, "compositionend", handleTyping);
 
             // Close on outside click
-            document.addEventListener("mousedown", (e) => {
+            listen(document, "mousedown", (e) => {
                 if (ext && ext.popup && e.target !== ext.popup.element && !ext.popup.element.contains(e.target) && e.target !== inputEl) {
-                    ext.popup.hide();
+                    hideAutocomplete();
                 }
             });
+        };
+
+        const onSerialize = nodeType.prototype.onSerialize;
+        nodeType.prototype.onSerialize = function (info) {
+            if (onSerialize) onSerialize.apply(this, arguments);
+            if (!info) return;
+            if (!info.properties) info.properties = {};
+            const valuesByName = {};
+            for (const widget of this.widgets || []) {
+                if (!widget?.name) continue;
+                valuesByName[widget.name] = widget.value;
+            }
+            info.properties.umi_widget_values_by_name = valuesByName;
+        };
+
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            if (onConfigure) onConfigure.apply(this, arguments);
+            const valuesByName = info?.properties?.umi_widget_values_by_name;
+            if (valuesByName && typeof valuesByName === "object") {
+                for (const widget of this.widgets || []) {
+                    if (!widget?.name || !(widget.name in valuesByName)) continue;
+                    widget.value = valuesByName[widget.name];
+                    if (widget.inputEl) {
+                        widget.inputEl.value = widget.value ?? "";
+                    }
+                }
+            }
+            const ext = app.extensions.find(e => e.name === "UmiAI.WildcardSystem");
+            ext?.applyFeatureVisibility?.(this);
         };
     }
 });
